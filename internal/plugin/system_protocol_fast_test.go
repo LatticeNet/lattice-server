@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -142,7 +144,9 @@ func legacyDecodeStdioJSONV2Frame(data []byte) (stdioJSONV2Frame, error) {
 	default:
 		return f, fmt.Errorf("unknown stdio frame kind %q", f.Kind)
 	}
-	for key := range fields {
+	// Sorted as the decoder now sorts them, so the oracle words a frame
+	// with two invalid members the same way on every run.
+	for _, key := range slices.Sorted(maps.Keys(fields)) {
 		if !allowed[key] {
 			return f, fmt.Errorf("field %q is invalid for %s", key, f.Kind)
 		}
@@ -248,6 +252,19 @@ var fastDecodeCorpus = []string{
 func TestFastFrameDecodeMatchesTheDecodeBeforeIt(t *testing.T) {
 	for _, raw := range fastDecodeCorpus {
 		sameFrameDecode(t, []byte(raw))
+	}
+}
+
+// A frame with two members its kind does not allow is refused naming the
+// same one every time, so the fuzz comparison above cannot flake on it.
+func TestFrameDecodeNamesTheSameInvalidMemberEveryTime(t *testing.T) {
+	raw := []byte(`{"protocol":2,"kind":"host_call","generation":7,"invocation_id":"1","host_call_id":"h1","host_call":{"id":"h1","method":"log.write","params":{}},"hOst_cAll":1,"features":[]}`)
+	for i := 0; i < 50; i++ {
+		_, err := decodeStdioJSONV2Frame(raw)
+		if err == nil || err.Error() != `field "features" is invalid for host_call` {
+			t.Fatalf("run %d: %v", i, err)
+		}
+		sameFrameDecode(t, raw)
 	}
 }
 

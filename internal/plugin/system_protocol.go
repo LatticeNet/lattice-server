@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -242,7 +244,9 @@ func decodeStdioJSONV2Frame(data []byte, limits ...int) (stdioJSONV2Frame, error
 	default:
 		return f, fmt.Errorf("unknown stdio frame kind %q", f.Kind)
 	}
-	for key := range fields {
+	// Keys are checked in sorted order so that a frame with two invalid
+	// members names the same one every time; a map range named either.
+	for _, key := range slices.Sorted(maps.Keys(fields)) {
 		if !allowed[key] {
 			return f, fmt.Errorf("field %q is invalid for %s", key, f.Kind)
 		}

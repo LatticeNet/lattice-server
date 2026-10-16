@@ -9525,9 +9525,11 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		n.HostFacts = hostFacts
 	}
 	n.ProbeMethods, n.ProbeRefusals = normalizeProbeFacts(req.ProbeMethods, req.ProbeRefusals)
-	if facts := normalizeBeaconFacts(req.Beacon, s.now()); facts != nil {
-		s.beacon.noteFacts(n.ID, *facts)
-		n.Beacon = facts
+	// The beacon report is replaced on every hello, as probe_methods are.
+	if n.Beacon = normalizeBeaconFacts(req.Beacon, s.now()); n.Beacon != nil {
+		s.beacon.noteFacts(n.ID, *n.Beacon)
+	} else {
+		s.beacon.forgetFacts(n.ID)
 	}
 	n.LastSeen = time.Now().UTC()
 	cameOnline := !n.Online

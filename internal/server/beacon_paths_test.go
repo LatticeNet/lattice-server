@@ -557,3 +557,36 @@ func readFileString(path string) (string, error) {
 	raw, err := os.ReadFile(path)
 	return string(raw), err
 }
+
+// The agent's report arrives on hello and on every beat, bounded, and a
+// beat without one clears it, as probe_methods are cleared.
+func TestBeaconFactsFlowFromHelloAndHeartbeat(t *testing.T) {
+	handler, st := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	nodeID, token := enrollNode(t, handler, cookies, csrf)
+	hello := `{"node_id":"` + nodeID + `","version":"0.3.11","probe_methods":["tcp","http","icmp","beacon"],"beacon":{"responder":true,"state":"listening","bind":"203.0.113.40","port":45001,"epoch":3,"sources":2,"error":"` + strings.Repeat("e", 300) + `"}}`
+	if rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/hello", hello, token); rec.Code != http.StatusOK {
+		t.Fatalf("hello = %d %s", rec.Code, rec.Body.String())
+	}
+	n, _ := st.Node(nodeID)
+	if n.Beacon == nil || !n.Beacon.Responder || n.Beacon.State != model.BeaconAgentListening || n.Beacon.Port != 45001 || n.Beacon.Epoch != 3 || len(n.Beacon.Error) != beaconErrorMax {
+		t.Fatalf("after hello: %+v", n.Beacon)
+	}
+	if !slices.Contains(n.ProbeMethods, model.MonitorTypeBeacon) {
+		t.Fatalf("the beacon client is not a probe method: %v", n.ProbeMethods)
+	}
+	beat := `{"node_id":"` + nodeID + `","version":"0.3.11","metrics":{},"beacon":{"responder":true,"refusal":"refused_by_node","state":"refused"}}`
+	if rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/metrics", beat, token); rec.Code != http.StatusOK {
+		t.Fatalf("beat = %d %s", rec.Code, rec.Body.String())
+	}
+	if n, _ = st.Node(nodeID); n.Beacon == nil || n.Beacon.Refusal != model.PathReasonRefusedByNode || n.Beacon.State != model.BeaconAgentRefused {
+		t.Fatalf("after a refusing beat: %+v", n.Beacon)
+	}
+	old := `{"node_id":"` + nodeID + `","version":"0.3.9","metrics":{}}`
+	if rec := doAgentRaw(t, handler, http.MethodPost, "/api/agent/metrics", old, token); rec.Code != http.StatusOK {
+		t.Fatalf("old beat = %d %s", rec.Code, rec.Body.String())
+	}
+	if n, _ = st.Node(nodeID); n.Beacon != nil {
+		t.Fatalf("a beat without a report kept %+v", n.Beacon)
+	}
+}

@@ -55,6 +55,12 @@ func (b *beaconRuntime) noteFacts(nodeID string, f model.BeaconFacts) {
 	b.facts[nodeID] = f
 }
 
+func (b *beaconRuntime) forgetFacts(nodeID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.facts, nodeID)
+}
+
 func (b *beaconRuntime) latestFacts(nodeID string) (model.BeaconFacts, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -159,12 +165,20 @@ func beaconFactsDurableChanged(prev, next *model.BeaconFacts) bool {
 	return pb.Sub(pa) >= beaconFactsPersistEvery || pb.Before(pa)
 }
 
-// noteBeaconFacts takes a hello's or heartbeat's report: kept in memory
-// always, written to the node record when it changed durably. A change to
-// a target's listening state arms its pending reachability check.
+// noteBeaconFacts takes a heartbeat's report: kept in memory always,
+// written to the node record when it changed durably. A beat without one
+// (an agent older than M2b, or one downgraded to it) clears the report, as
+// a beat without probe_methods clears those. A change to a target's
+// listening state starts its pending reachability check.
 func (s *Server) noteBeaconFacts(nodeID string, stored *model.BeaconFacts, reported *model.BeaconFacts) {
 	facts := normalizeBeaconFacts(reported, s.now())
 	if facts == nil {
+		s.beacon.forgetFacts(nodeID)
+		if stored != nil {
+			if err := s.store.SetNodeBeaconFacts(nodeID, nil); err != nil {
+				s.logger.Printf("beacon facts for node %s not cleared: %v", nodeID, err)
+			}
+		}
 		return
 	}
 	s.beacon.noteFacts(nodeID, *facts)

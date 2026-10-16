@@ -77,6 +77,12 @@ type subscriptionRefreshAuthority struct {
 	vpnGen uint64
 }
 
+// subscriptionRevalidationVersion is a snapshot's source version, or the
+// hash of its raw when it has none. A fleet-bound record's snapshot has
+// none: the Sub-Store plugin keeps its envelope digest inside raw, because a
+// schema 2 snapshot admits a source version only paired with the manifest
+// it hashes, so it is keyed on the hash of raw, which moves exactly when the
+// envelope does (TestFleetSnapshotIsKeyedOnTheHashOfRaw).
 func subscriptionRevalidationVersion(snapshot model.SubscriptionSnapshot) string {
 	if snapshot.SourceVersion != "" {
 		return snapshot.SourceVersion

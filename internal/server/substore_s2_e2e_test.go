@@ -1192,6 +1192,79 @@ func TestFleetWriteExpiresOnlyDependents(t *testing.T) {
 	}
 }
 
+// TestFleetSnapshotIsKeyedOnTheHashOfRaw: the plugin's fetch reply for a
+// fleet record carries no source_version, because core's schema 2 snapshot
+// admits one only paired with the manifest it hashes, so core stores the
+// snapshot without one and keys revalidation and the body cache on the hash
+// of raw. The envelope's lfe1- digest travels inside raw, and a catalogue
+// change moves raw and with it the key.
+func TestFleetSnapshotIsKeyedOnTheHashOfRaw(t *testing.T) {
+	env := newS2Env(t, 3, 2, 1)
+	env.live(t, fleetRecord("keyed"))
+	share := env.createShare(t, "keyed", "keyed-alice", e2eAliceID)
+	read := func() model.SubscriptionSnapshot {
+		t.Helper()
+		if rec := env.fetch(share, "sing-box"); rec.Code != http.StatusOK {
+			t.Fatalf("fetch: %d refusals=%v", rec.Code, env.refusals(share.ID))
+		}
+		snap, ok := env.st.SubscriptionSnapshot(subStorePluginID, "keyed")
+		if !ok {
+			t.Fatal("no snapshot stored")
+		}
+		if snap.SourceVersion != "" || len(snap.SourceManifest) > 0 {
+			t.Fatalf("a fleet snapshot stored source_version %q; core keys it on the hash of raw", snap.SourceVersion)
+		}
+		if got := subscriptionRevalidationVersion(snap); got != subscriptionContentHash(snap.Raw) {
+			t.Fatalf("revalidation version %q is not the hash of raw", got)
+		}
+		var envelope struct {
+			SourceVersion string `json:"source_version"`
+		}
+		if err := json.Unmarshal([]byte(snap.Raw), &envelope); err != nil || !strings.HasPrefix(envelope.SourceVersion, "lfe1-") {
+			t.Fatalf("the envelope inside raw carries %q (%v)", envelope.SourceVersion, err)
+		}
+		return snap
+	}
+	before := read()
+	node, ok := env.st.Node("node-000")
+	if !ok {
+		t.Fatal("no node-000")
+	}
+	node.Name = "Node 000 renamed"
+	if err := env.st.UpsertNode(node); err != nil {
+		t.Fatal(err)
+	}
+	env.srv.invalidateLineReadModel()
+	env.expire(t)
+	after := read()
+	if after.Raw == before.Raw || subscriptionRevalidationVersion(after) == subscriptionRevalidationVersion(before) {
+		t.Fatal("a catalogue change left raw and its key where they were")
+	}
+}
+
+// TestFleetWriteExpiresARecordEditedSinceTheAnswer: depends_on's answer
+// leaves the provider record out at the epoch core read before asking. An
+// edit to that record moves its epoch, so the next fleet write must expire
+// its share even though the answer still names it independent; the write
+// after that, whose ask read the new epoch, keeps it again.
+func TestFleetWriteExpiresARecordEditedSinceTheAnswer(t *testing.T) {
+	f := newS2ExpiryFixture(t)
+	f.write(t)
+	f.expired(t)
+	// The first write's ask answered the provider record independent at
+	// the epoch core read before asking. The edit moves that epoch.
+	f.env.live(t, map[string]any{"id": "provider", "source": "local", "content": "trojan://provider-secret@198.51.100.9:443#provider-entry-2", "target": "URI"})
+	f.warm(t)
+	f.write(t)
+	if got := f.expired(t); !got["provider"] || !got["fleet"] {
+		t.Fatalf("a fleet write after the provider record's edit expired %v; the answer that left it out predates the edit", got)
+	}
+	f.write(t)
+	if got := f.expired(t); got["provider"] || !got["fleet"] {
+		t.Fatalf("the next write expired %v; its ask read the edited epoch", got)
+	}
+}
+
 // TestFleetWriteExpiry: after a restart core has forgotten which records an
 // earlier answer named, so only the plugin's own answer keeps a legacy graph
 // record in the expiry set; a fleet write after the restart still expires

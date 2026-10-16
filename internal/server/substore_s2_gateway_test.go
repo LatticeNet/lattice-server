@@ -116,6 +116,12 @@ func TestGatewayGatesEveryWriteMethod(t *testing.T) {
 			t.Fatalf("%s is not on the gateway's write list", want)
 		}
 	}
+	for _, method := range writes {
+		gateOnly := method == "reorder" || method == "migrate_record" || method == "discard_staged"
+		if subscriptionWriteInvalidates(method) == gateOnly {
+			t.Fatalf("%s: gate-only is %v, the plan names reorder, migrate_record and discard_staged alone", method, gateOnly)
+		}
+	}
 	for _, read := range []string{"render", "preview", "list", "get", "probe", "depends_on", "fleet_preview", "identities", "export", "publish"} {
 		if subscriptionWriteMethod(read) {
 			t.Fatalf("%s is on the gateway's write list", read)

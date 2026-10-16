@@ -231,3 +231,47 @@ func BenchmarkMonitorPathMatrix(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkPathDegradedEvaluate runs one degraded evaluation over the 600
+// paths of the benchmark fleet while a writer ingests as fast as the store
+// takes it (design 29 D13). "minute" is the evaluation every minute, with
+// the baselines cached; "hour" drops the baseline cache first, as the first
+// evaluation of each hour does. Each reports milliseconds per evaluation and
+// the writer's latency under it; "ingest-only" is the writer alone.
+func BenchmarkPathDegradedEvaluate(b *testing.B) {
+	f := newBenchFleet(b)
+	if pass := f.srv.evaluatePathDegraded(f.now); pass.judged != 600 {
+		b.Fatalf("judged %d paths, want 600", pass.judged)
+	}
+	b.Run("ingest-only", func(b *testing.B) {
+		l := f.startIngest(b)
+		started := time.Now()
+		for b.Loop() {
+			time.Sleep(50 * time.Millisecond)
+		}
+		l.finish(b, time.Since(started))
+	})
+	for _, hour := range []bool{false, true} {
+		name := "minute"
+		if hour {
+			name = "hour"
+		}
+		b.Run(name, func(b *testing.B) {
+			l := f.startIngest(b)
+			started := time.Now()
+			var spent time.Duration
+			for b.Loop() {
+				if hour {
+					f.srv.pathDegraded.baseMu.Lock()
+					f.srv.pathDegraded.bases = nil
+					f.srv.pathDegraded.baseMu.Unlock()
+				}
+				at := time.Now()
+				f.srv.evaluatePathDegraded(f.now)
+				spent += time.Since(at)
+			}
+			b.ReportMetric(float64(spent.Microseconds())/1000/float64(b.N), "ms/eval")
+			l.finish(b, time.Since(started))
+		})
+	}
+}

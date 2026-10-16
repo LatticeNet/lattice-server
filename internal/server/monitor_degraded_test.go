@@ -22,12 +22,13 @@ var degradedBase = time.Date(2026, 10, 16, 12, 50, 0, 0, time.UTC)
 // state-hot.db) with a hand-moved clock, a source and a target node, and
 // the typed notices the incident sweep sends recorded instead of routed.
 type degradedFixture struct {
-	t     *testing.T
-	dir   string
-	srv   *Server
-	st    *store.Store
-	clock *testClock
-	sent  *[]typedNotice
+	t      *testing.T
+	dir    string
+	srv    *Server
+	st     *store.Store
+	clock  *testClock
+	sent   *[]typedNotice
+	closed bool
 }
 
 // writeHotHistory writes results straight into a hot store file before the
@@ -111,10 +112,7 @@ func openDegradedFixture(t *testing.T, dir string, history []store.MonitorResult
 	f := &degradedFixture{t: t, dir: dir, srv: srv, st: st, clock: &testClock{at: degradedBase}}
 	srv.now = f.clock.now
 	f.sent = captureTypedNotices(srv)
-	t.Cleanup(func() {
-		srv.Close(context.Background())
-		st.Close()
-	})
+	t.Cleanup(f.close)
 	for _, n := range []model.Node{
 		{ID: "node-sh", Name: "cd-hs-sh", Online: true, PublicIP: "203.0.113.1", Geo: &model.NodeGeo{Country: "CN"}},
 		{ID: "node-hk", Name: "hk-edge", Online: true, PublicIP: "203.0.113.2", Geo: &model.NodeGeo{Country: "HK"}},
@@ -137,6 +135,16 @@ func (f *degradedFixture) operatorCheck(id, alert string, rule *model.MonitorDeg
 		NodeIDs: sources, Enabled: true, Alert: alert, Degraded: rule, Version: 1}); err != nil {
 		f.t.Fatal(err)
 	}
+}
+
+// close shuts the server and the store, once.
+func (f *degradedFixture) close() {
+	if f.closed {
+		return
+	}
+	f.closed = true
+	f.srv.Close(context.Background())
+	f.st.Close()
 }
 
 func (f *degradedFixture) now() time.Time { return f.clock.now() }
@@ -423,5 +431,60 @@ func TestPathDegradedMethodSwitchStartsANewGate(t *testing.T) {
 	recs, _ := f.st.PathDegradedRecords()
 	if _, held := recs[store.MonitorPair{MonitorID: tcp, NodeID: "node-sh"}]; held || len(recs) != 0 {
 		t.Fatalf("records after the switch = %+v", recs)
+	}
+}
+
+// The evaluator, matrix and series reads, ingest and the incident sweep run
+// at once; the race detector holds the snapshot and the baseline cache to
+// account.
+func TestPathDegradedRunsBesideReads(t *testing.T) {
+	var history []store.MonitorResultRecord
+	for _, id := range []string{"mon-a", "mon-b"} {
+		history = append(history, baselineHistory(id, "node-sh", degradedBase, 168, 40)...)
+		history = append(history, windowRuns(id, "node-sh", degradedBase, slowRuns)...)
+	}
+	f := openDegradedFixture(t, t.TempDir(), history)
+	f.operatorCheck("mon-a", model.MonitorAlertDownAndDegraded, nil, "node-sh")
+	f.operatorCheck("mon-b", "", nil, "node-sh")
+	p := principal{Principal: adminPrincipalForTest()}
+	done := make(chan error, 8)
+	go func() {
+		for i := 0; i < 20; i++ {
+			f.srv.evaluatePathDegraded(degradedBase.Add(time.Duration(i) * time.Minute))
+		}
+		done <- nil
+	}()
+	for g := 0; g < 3; g++ {
+		go func() {
+			for i := 0; i < 20; i++ {
+				at := degradedBase.Add(time.Duration(i) * time.Minute)
+				if _, err := f.srv.pathMatrixFor(p, model.PathWindowHour, at); err != nil {
+					done <- err
+					return
+				}
+				if _, err := f.srv.pathBaselineView(store.MonitorPair{MonitorID: "mon-b", NodeID: "node-sh"}, model.MonitorDegradedRule{}, at); err != nil {
+					done <- err
+					return
+				}
+				f.srv.pendingIncidents(at)
+			}
+			done <- nil
+		}()
+	}
+	go func() {
+		for i := 0; i < 20; i++ {
+			at := degradedBase.Add(time.Duration(i)*time.Minute + time.Second)
+			if _, err := f.st.IngestAgentMonitorResults("node-sh", []model.MonitorResult{{MonitorID: "mon-a", At: at, Success: true, LatencyMs: 100}}, at); err != nil {
+				done <- err
+				return
+			}
+			f.srv.evaluateIncidents(at)
+		}
+		done <- nil
+	}()
+	for i := 0; i < 5; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 }

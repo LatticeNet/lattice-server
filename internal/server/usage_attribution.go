@@ -60,7 +60,6 @@ const (
 	// exactly the agent lane's commit.
 	proxyUsageCollectorStatusStatsOff = "stats_off"
 
-	usageSubStoreRecordsKey    = "subscriptions-v1"
 	usageSubStoreSourceGraph   = "vpn-core-graph"
 	usageSubStoreKVBucket      = "plugin:" + subStorePluginID
 	usageMaxSubStoreRecordsLen = 4 << 20
@@ -150,26 +149,31 @@ type usageSubStoreRecord struct {
 	EntryRoots  []string `json:"entry_roots,omitempty"`
 }
 
-// subStoreGraphRecords reads the Sub-Store plugin's subscription document the
-// same way the plugin does (plugin:latticenet.sub-store / subscriptions-v1)
-// and keeps the vpn-core-graph records that name an identity.
+// subStoreGraphRecords reads the Sub-Store plugin's records the way the
+// plugin stores them since the split store: the index for the list and each
+// record's source, then, for every live vpn-core-graph entry, the record's
+// own document (record-v2-<id>) for the identity it narrows to and the roots
+// it selects, which the index does not carry. It keeps the records that name
+// an identity. A legacy entry whose document is missing or does not decode
+// is skipped with a warning: unknown is never attributed. A migrated record
+// is a fleet record, whose identities hold their lines through bindings, so
+// it contributes nothing here.
 func (s *Server) subStoreGraphRecords() []usageSubStoreRecord {
-	entry, ok := s.store.KVEntry(usageSubStoreKVBucket, usageSubStoreRecordsKey)
-	if !ok || len(entry.Value) == 0 || len(entry.Value) > usageMaxSubStoreRecordsLen {
-		return nil
-	}
-	var doc struct {
-		Records []usageSubStoreRecord `json:"records"`
-	}
-	if err := json.Unmarshal([]byte(entry.Value), &doc); err != nil {
-		return nil
-	}
-	out := make([]usageSubStoreRecord, 0, len(doc.Records))
-	for _, rec := range doc.Records {
-		if rec.Source != usageSubStoreSourceGraph || strings.TrimSpace(rec.VPNIdentity) == "" || strings.TrimSpace(rec.ID) == "" {
+	read := s.subStoreIndexV2()
+	var out []usageSubStoreRecord
+	for _, entry := range read.entries {
+		if entry.Revision == "" || entry.Source != usageSubStoreSourceGraph {
 			continue
 		}
-		out = append(out, rec)
+		doc, ok := s.subStoreRecordDocument(entry.ID)
+		if !ok {
+			s.logger.Printf("usage attribution: sub-store record %q is listed as %s but its document is unreadable; skipping it", entry.ID, usageSubStoreSourceGraph)
+			continue
+		}
+		if doc.Source != usageSubStoreSourceGraph || strings.TrimSpace(doc.VPNIdentity) == "" {
+			continue
+		}
+		out = append(out, usageSubStoreRecord{ID: entry.ID, Source: doc.Source, VPNIdentity: doc.VPNIdentity, EntryRoots: doc.EntryRoots})
 	}
 	return out
 }

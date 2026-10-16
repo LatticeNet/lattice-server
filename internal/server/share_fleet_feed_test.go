@@ -7,7 +7,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // Leak table row 2: a share of a record that reads the identity-less vpn-core
@@ -26,9 +25,7 @@ func TestSharingTheVPNCoreFleetFeedNeedsAnExplicitFlag(t *testing.T) {
 		{"id":"combo-clean","kind":"collection","name":"Clean","members":["provider","alice-only"]},
 		{"id":"clash-file","kind":"file","name":"Clash file","node_source":"combo-tag"}
 	]}`
-	if err := h.srv.store.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: usageSubStoreRecordsKey, Value: doc}); err != nil {
-		t.Fatal(err)
-	}
+	putSubStoreRecords(t, h.srv.store, doc)
 	create := func(slug, record string, flag bool) (int, string) {
 		body := `{"slug":"` + slug + `","source":{"kind":"plugin","plugin_id":"latticenet.sub-store","subscription_id":"` + record + `"}`
 		if flag {
@@ -87,9 +84,7 @@ func TestFleetFeedGuardFailsClosedAndRechecksOnRead(t *testing.T) {
 	h := newRevealHarness(t)
 	putRecords := func(doc string) {
 		t.Helper()
-		if err := h.srv.store.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: usageSubStoreRecordsKey, Value: doc}); err != nil {
-			t.Fatal(err)
-		}
+		putSubStoreRecords(t, h.srv.store, doc)
 	}
 	create := func(slug, record string, flag bool) (int, string) {
 		body := `{"slug":"` + slug + `","source":{"kind":"plugin","plugin_id":"latticenet.sub-store","subscription_id":"` + record + `"}`

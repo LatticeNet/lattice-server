@@ -472,9 +472,7 @@ func TestSubStoreSharesReorder(t *testing.T) {
 func TestSubStoreSharesCreateKeepsFleetFeedGuard(t *testing.T) {
 	h := newSubStoreSvcHarness(t)
 	doc := `{"version":1,"records":[{"id":"fleet","name":"Everyone","source":"vpn-core"}]}`
-	if err := h.st.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: usageSubStoreRecordsKey, Value: doc}); err != nil {
-		t.Fatal(err)
-	}
+	putSubStoreRecords(t, h.st, doc)
 	if _, err := h.call(subStoreSvcAdmin, subStoreSharesService, "create", `{"subscription_id":"fleet","slug":"everyone"}`); subStoreSvcErrStatus(err) != http.StatusBadRequest ||
 		!strings.Contains(subStoreSvcErrBody(err), apiErrorFleetFeedFlagRequired) {
 		t.Fatalf("a fleet feed share without the flag: %v %s", err, subStoreSvcErrBody(err))

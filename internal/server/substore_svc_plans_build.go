@@ -20,7 +20,7 @@ import (
 func (plan subStorePlan) sections() []subStorePlanRecord {
 	primary := subStorePlanRecord{
 		SubscriptionID: plan.SubscriptionID, Kind: plan.RecordKind, Role: plan.Role, FromRevision: plan.FromRevision, ToRevision: plan.ToRevision,
-		MemberRevisions: plan.MemberRevisions, BeforeEmpty: plan.BeforeEmpty, Totals: plan.PrimaryTotals,
+		MemberRevisions: plan.MemberRevisions, BeforeEmpty: plan.BeforeEmpty, Chain: plan.Chain, Totals: plan.PrimaryTotals,
 		Shares: plan.Shares, UnboundShares: plan.UnboundShares, Coverage: plan.Coverage, Identities: plan.Identities,
 	}
 	if primary.Role == "" {
@@ -259,6 +259,11 @@ func (s *Server) subStoreBuildPlan(ctx context.Context, spec subStorePlanSpec, g
 			continue
 		}
 		subStorePlanSectionRows(section, shares[section.SubscriptionID], changes)
+		chain, err := s.subStorePlanSectionChain(*section)
+		if err != nil {
+			return subStorePlan{}, subStorePlanProposeError(err)
+		}
+		section.Chain = chain
 		diffs, err := s.subStorePlanPreviewSection(ctx, *section)
 		if err != nil {
 			return subStorePlan{}, subStorePlanProposeError(err)
@@ -279,7 +284,7 @@ func (s *Server) subStoreBuildPlan(ctx context.Context, spec subStorePlanSpec, g
 	}
 	sort.Strings(plan.Closure)
 	primary := sections[0]
-	plan.RecordKind, plan.Role, plan.MemberRevisions, plan.BeforeEmpty = primary.Kind, primary.Role, primary.MemberRevisions, primary.BeforeEmpty
+	plan.RecordKind, plan.Role, plan.MemberRevisions, plan.BeforeEmpty, plan.Chain = primary.Kind, primary.Role, primary.MemberRevisions, primary.BeforeEmpty, primary.Chain
 	plan.PrimaryTotals, plan.Shares, plan.UnboundShares, plan.Coverage, plan.Identities = primary.Totals, primary.Shares, primary.UnboundShares, primary.Coverage, primary.Identities
 	plan.Records = sections[1:]
 	return plan, nil

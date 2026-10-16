@@ -392,6 +392,10 @@ func newE2EEnv(t *testing.T, reportLive bool) *e2eEnv {
 	// The plugin's index: fleet-1 is a fleet record, doc-1 a provider one, so
 	// an identity share is admitted on fleet-1 alone.
 	putSubStoreRecords(t, cat.st, `{"records":[{"id":"`+e2eFleet+`","name":"fleet","source":"fleet"},{"id":"`+e2eDoc+`","name":"doc","source":"remote","url":"https://provider.example/sub"}]}`)
+	// The staged rev-2 the fake reports, as the plugin's store keeps it
+	// beside the live document.
+	putSubStoreChainDocuments(t, cat.st, e2eFleet)
+	putSubStoreChainDocuments(t, cat.st, e2eDoc)
 	return env
 }
 
@@ -623,7 +627,7 @@ func TestS0JoinedProposeWithoutLiveRevision(t *testing.T) {
 	code, body := env.gateway(t, e2eOperator, subStorePlansService, "propose",
 		map[string]any{"subscription_id": e2eFleet, "from_revision": "rev-1", "to_revision": "rev-2"})
 	t.Logf("propose without a live revision from the plugin: %d %s", code, body)
-	if code != http.StatusConflict {
+	if code != http.StatusConflict || !strings.Contains(string(body), "from_revision is not the record's live revision") {
 		t.Fatalf("propose: %d %s", code, body)
 	}
 }

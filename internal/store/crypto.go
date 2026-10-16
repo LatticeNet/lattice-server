@@ -35,6 +35,7 @@ import (
 //   - model.ProxyInbound.RealityPrivateKey REALITY server private key
 //   - model.ProxyUser.UUID/Password/SubToken subscriber credentials and subscription bearer token
 //   - model.Task.Script                 node-executed script body; may carry generated deployment secrets
+//   - BeaconTarget.Key                  a node's beacon target key (design 29 D3)
 //
 // When adding a new persisted credential, encrypt it here AND extend
 // stateHasEnvelope so the lost-key guard stays accurate.
@@ -116,6 +117,22 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 		vpnUserSecrets[id] = enc
 	}
 	out.VpnUserSecrets = vpnUserSecrets
+
+	if st.Beacon != nil {
+		reg := cloneBeaconRegistry(st.Beacon)
+		for id, t := range reg.Targets {
+			if t.Key == "" {
+				continue
+			}
+			key, err := c.Encrypt(t.Key)
+			if err != nil {
+				return State{}, fmt.Errorf("encrypt beacon key of node %s: %w", id, err)
+			}
+			t.Key = key
+			reg.Targets[id] = t
+		}
+		out.Beacon = reg
+	}
 
 	managedLineSecrets := make(map[string]ManagedLineSecretRecord, len(st.ManagedLineSecrets))
 	for id, record := range st.ManagedLineSecrets {
@@ -336,6 +353,23 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.VpnUserSecrets = vpnUserSecrets
 
+	if st.Beacon != nil {
+		for id, t := range st.Beacon.Targets {
+			if t.Key == "" {
+				continue
+			}
+			if !c.Enabled() && secret.IsEnvelope(t.Key) {
+				return lostMasterKeyError()
+			}
+			key, err := c.Decrypt(t.Key)
+			if err != nil {
+				return fmt.Errorf("decrypt beacon key of node %s: %w", id, err)
+			}
+			t.Key = key
+			st.Beacon.Targets[id] = t
+		}
+	}
+
 	managedLineSecrets := make(map[string]ManagedLineSecretRecord, len(st.ManagedLineSecrets))
 	for id, record := range st.ManagedLineSecrets {
 		if !c.Enabled() && secret.IsEnvelope(record.RealityPrivateKey) {
@@ -502,6 +536,13 @@ func stateHasEnvelope(st *State) bool {
 	for _, record := range st.ManagedLineSecrets {
 		if secret.IsEnvelope(record.RealityPrivateKey) {
 			return true
+		}
+	}
+	if st.Beacon != nil {
+		for _, t := range st.Beacon.Targets {
+			if secret.IsEnvelope(t.Key) {
+				return true
+			}
 		}
 	}
 	for _, d := range st.DDNS {

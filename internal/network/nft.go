@@ -24,6 +24,21 @@ type NFTPlan struct {
 	// JSON API for raw Network Guard inputs; callers must pass structured,
 	// validated intent through server-owned compilers.
 	InputRules []NFTInputRule `json:"-"`
+
+	// NotrackUDP are local UDP endpoints whose datagrams skip connection
+	// tracking both ways: the measurement beacon's address and port
+	// (design 29 D3), so spoofed datagrams cannot fill the conntrack table
+	// the node's other traffic needs. Matching the address as well as the
+	// port leaves forwarded traffic and flows on other local addresses
+	// tracked. The renderer adds two raw-priority chains for them; with none
+	// the ruleset is byte-for-byte what it was before.
+	NotrackUDP []NFTNotrackUDP `json:"-"`
+}
+
+// NFTNotrackUDP is one local IPv4 address and UDP port to leave untracked.
+type NFTNotrackUDP struct {
+	Addr string
+	Port int
 }
 
 const (
@@ -121,7 +136,21 @@ func GenerateNFTPlan(p NFTPlan) (string, error) {
 		fmt.Fprintf(&b, "    ip saddr @wg_peers4 udp dport { %s } accept comment \"wg udp services\"\n", joinPorts(p.WireGuardUDP))
 	}
 	fmt.Fprintf(&b, "    counter drop\n")
-	fmt.Fprintf(&b, "  }\n}\n")
+	fmt.Fprintf(&b, "  }\n")
+	if len(p.NotrackUDP) > 0 {
+		fmt.Fprintf(&b, "\n  chain beacon_notrack_in {\n")
+		fmt.Fprintf(&b, "    type filter hook prerouting priority raw; policy accept;\n")
+		for _, e := range p.NotrackUDP {
+			fmt.Fprintf(&b, "    ip daddr %s udp dport %d notrack comment \"lattice beacon\"\n", e.Addr, e.Port)
+		}
+		fmt.Fprintf(&b, "  }\n\n  chain beacon_notrack_out {\n")
+		fmt.Fprintf(&b, "    type filter hook output priority raw; policy accept;\n")
+		for _, e := range p.NotrackUDP {
+			fmt.Fprintf(&b, "    ip saddr %s udp sport %d notrack comment \"lattice beacon\"\n", e.Addr, e.Port)
+		}
+		fmt.Fprintf(&b, "  }\n")
+	}
+	fmt.Fprintf(&b, "}\n")
 	return b.String(), nil
 }
 
@@ -162,6 +191,13 @@ func NormalizeNFTPlan(p NFTPlan) (NFTPlan, error) {
 	}
 	if p.InputRules, err = normalizeInputRules(p.InputRules); err != nil {
 		return NFTPlan{}, err
+	}
+	for i, e := range p.NotrackUDP {
+		addr, perr := netip.ParseAddr(strings.TrimSpace(e.Addr))
+		if perr != nil || !addr.Is4() || e.Port < 1 || e.Port > 65535 {
+			return NFTPlan{}, fmt.Errorf("notrack udp %d: invalid address %q or port %d", i+1, e.Addr, e.Port)
+		}
+		p.NotrackUDP[i].Addr = addr.String()
 	}
 	return p, nil
 }

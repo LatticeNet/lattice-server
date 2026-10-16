@@ -122,7 +122,8 @@ func TestMonitorCreateValidation(t *testing.T) {
 		{"http with a secret and no value", `{"name":"h","type":"http","target":"https://example.com/","headers":[{"name":"X-Key","secret":true}],"node_ids":["node-new"]}`, 400, "needs a value"},
 		{"http with nine headers", `{"name":"h","type":"http","target":"https://example.com/","headers":[` + strings.TrimSuffix(strings.Repeat(`{"name":"X-H","value":"v"},`, 9), ",") + `],"node_ids":["node-new"]}`, 400, "at most 8"},
 		{"tls with packets", `{"name":"c","type":"tls","target":"example.com:443","packets":3}`, 400, "do not apply"},
-		{"beacon is not created in M2a", `{"name":"b","type":"beacon","target_node":"node-tgt","node_ids":["node-new"]}`, 400, "only tcp, http, icmp and tls"},
+		{"beacon to a node without a beacon", `{"name":"b","type":"beacon","target_node":"node-tgt","node_ids":["node-new"]}`, 400, "has no enabled beacon"},
+		{"beacon to an address", `{"name":"b","type":"beacon","target":"203.0.113.9:45000","node_ids":["node-new"]}`, 400, "never takes an address"},
 	}
 	for _, tc := range cases {
 		res := doJSON(t, handler, http.MethodPost, "/api/monitors", tc.body, cookies, csrf)
@@ -522,7 +523,7 @@ func TestLatencyPathSetMethods(t *testing.T) {
 	for _, body := range []string{
 		`{"enabled":true,"sources":["node-new"],"method":"udp","version":` + itoa64(version) + `}`,
 		`{"enabled":true,"sources":["node-new"],"source_methods":{"node-old":"icmp"},"version":` + itoa64(version) + `}`,
-		`{"enabled":true,"sources":["node-new"],"source_methods":{"node-new":"beacon"},"version":` + itoa64(version) + `}`,
+		`{"enabled":true,"sources":["node-new"],"source_methods":{"node-new":"ping"},"version":` + itoa64(version) + `}`,
 	} {
 		res := doJSON(t, handler, http.MethodPut, "/api/monitors/latency", body, cookies, csrf)
 		if raw := readBody(t, res); res.StatusCode != http.StatusBadRequest {

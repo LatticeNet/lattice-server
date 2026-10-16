@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // Checks of design 29 M2a: node targets resolved per kind, icmp with
@@ -26,6 +27,9 @@ import (
 type monitorTargets struct {
 	nodes     map[string]model.Node
 	endpoints map[string]latencyNodeEndpoints
+	// beacons are the nodes' beacon states, which beacon checks resolve
+	// against (design 29 D12).
+	beacons map[string]store.BeaconTarget
 }
 
 // monitorTargetsAt is the resolver for now: the cached latency plan's node
@@ -35,7 +39,7 @@ func (s *Server) monitorTargetsAt(now time.Time) monitorTargets {
 	for _, n := range s.store.Nodes() {
 		nodes[n.ID] = n
 	}
-	return monitorTargets{nodes: nodes, endpoints: s.pathPlanned(now).endpoints}
+	return monitorTargets{nodes: nodes, endpoints: s.pathPlanned(now).endpoints, beacons: s.store.BeaconTargets()}
 }
 
 // resolve is what a check of kind that names nodeID dials now, given the
@@ -67,6 +71,12 @@ func (t monitorTargets) resolve(kind, nodeID, prior string) (target, reason stri
 			return "", note
 		}
 		return chosen.target, ""
+	case model.MonitorTypeBeacon:
+		t, ok := t.beacons[nodeID]
+		if !ok || !t.Settings.Enabled || t.Settings.Endpoint == "" {
+			return "", model.PathReasonBeaconNotEnabled
+		}
+		return t.Settings.Endpoint, ""
 	}
 	return "", "unsupported_kind"
 }
@@ -416,8 +426,37 @@ func monitorResolveNote(reason string) string {
 		return "it serves no public TCP line the probe may dial (never SSH or a knock-gated port)"
 	case model.LatencyEndpointNoInventory:
 		return "it has not reported its lines yet"
+	case model.PathReasonBeaconNotEnabled:
+		return "it has no enabled beacon; enable one through a node.beacon plan"
 	}
 	return reason
+}
+
+// normalizeBeaconMonitor checks a beacon check: it names a node and never
+// an address, and the node has an applied, enabled beacon whose advertised
+// endpoint the check resolves to.
+func (t monitorTargets) normalizeBeaconMonitor(mon *model.Monitor) error {
+	if mon.ExpectStatus != "" || len(mon.Headers) > 0 {
+		return errors.New("expect_status and headers apply to http checks only")
+	}
+	if mon.TargetNode == "" {
+		return errors.New("a beacon check names its target with target_node; it never takes an address")
+	}
+	if mon.Packets == 0 {
+		mon.Packets = model.MonitorPacketsDefault
+	}
+	if mon.Packets < 1 || mon.Packets > model.MonitorPacketsMax {
+		return fmt.Errorf("packets must be 1 to %d", model.MonitorPacketsMax)
+	}
+	if mon.IntervalSec < model.LatencyProbeMinIntervalSec {
+		return fmt.Errorf("a beacon check runs at most every %d s", model.LatencyProbeMinIntervalSec)
+	}
+	target, reason := t.resolve(model.MonitorTypeBeacon, mon.TargetNode, "")
+	if reason != "" {
+		return fmt.Errorf("node %s cannot be probed by beacon: %s", mon.TargetNode, monitorResolveNote(reason))
+	}
+	mon.Target = target
+	return nil
 }
 
 // monitorPacketKey is one (source, target address) a packet budget counts.

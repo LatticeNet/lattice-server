@@ -114,10 +114,19 @@ const latencyICMPMonitorPrefix = "mon_lati_"
 
 func latencyICMPMonitorID(targetNodeID string) string { return latencyICMPMonitorPrefix + targetNodeID }
 
+// latencyBeaconMonitorID is the generated beacon check of a target (design
+// 29 D2, D12).
+func latencyBeaconMonitorID(targetNodeID string) string {
+	return model.LatencyMonitorPrefixBeacon + targetNodeID
+}
+
 // latencyGeneratedTarget is the target node of a generated check id, from
-// either prefix.
+// any of the prefixes.
 func latencyGeneratedTarget(monitorID string) (string, bool) {
 	if target, ok := strings.CutPrefix(monitorID, latencyICMPMonitorPrefix); ok {
+		return target, true
+	}
+	if target, ok := strings.CutPrefix(monitorID, model.LatencyMonitorPrefixBeacon); ok {
 		return target, true
 	}
 	return strings.CutPrefix(monitorID, latencyMonitorPrefix)
@@ -381,6 +390,11 @@ type latencyPlan struct {
 	plan      model.LatencyProbePlan
 	desired   []model.Monitor
 	endpoints map[string]latencyNodeEndpoints
+	// beaconCandidates are, per target node, the path set sources whose
+	// method for it is auto or beacon, whose agent runs the beacon client
+	// and whose pair is enabled: the sources a node.beacon plan for the
+	// target approves, and that keep a key while approved (design 29 D12).
+	beaconCandidates map[string][]string
 }
 
 // latencyNodeEndpoints is what the port rule found on one node: the
@@ -470,20 +484,45 @@ func latencySourceMethod(cfg model.LatencyProbeConfig, sourceID string) string {
 	return model.LatencyMethodTCP
 }
 
+// latencyTargetCaps is what one target offers one source.
+type latencyTargetCaps struct {
+	// tcpOK and icmpOK say whether the target has a tcp endpoint and a
+	// public IPv4.
+	tcpOK, icmpOK bool
+	// icmpFiltered says icmp reads icmp_filtered for this pair now (its
+	// latest icmp result failed on a path that has never had an echo back).
+	icmpFiltered bool
+	// beaconGate is why this source may not use the target's beacon, ""
+	// when it may (beaconTargetGate, then beaconSourceGate);
+	// beaconListening says the target's agent listens where its plan put it.
+	beaconGate      string
+	beaconListening bool
+}
+
 // latencyPairMethod is the kind a source probes a target with and, when it
-// cannot, why (a model.PathReason* code). tcpOK and icmpOK say whether the
-// target has a tcp endpoint and a public IPv4. auto takes icmp when the
-// source runs it and the target can be pinged, else tcp; a pin never falls
-// back.
-func latencyPairMethod(setting string, source model.Node, tcpOK, icmpOK bool) (method, reason string) {
+// cannot, why (a model.PathReason* code). auto takes, in D2's order, the
+// beacon when the target's applied plan approved the source and the target
+// listens, else icmp when the source runs it, the target can be pinged and
+// icmp does not read icmp_filtered for the pair (the console design review
+// decision of 2026-10-16), else tcp. A pin never falls back.
+func latencyPairMethod(setting string, source model.Node, caps latencyTargetCaps) (method, reason string) {
+	tcpOK, icmpOK := caps.tcpOK, caps.icmpOK
 	switch setting {
+	case model.LatencyMethodBeacon:
+		if reason := latencyProbeGate(source, model.MonitorTypeBeacon); reason != "" {
+			return model.MonitorTypeBeacon, reason
+		}
+		return model.MonitorTypeBeacon, caps.beaconGate
 	case model.LatencyMethodICMP:
 		if !icmpOK {
 			return model.MonitorTypeICMP, model.PathReasonNotProbeable
 		}
 		return model.MonitorTypeICMP, latencyProbeGate(source, model.MonitorTypeICMP)
 	case model.LatencyMethodAuto:
-		if icmpOK && latencyProbeGate(source, model.MonitorTypeICMP) == "" {
+		if caps.beaconGate == "" && caps.beaconListening && latencyProbeGate(source, model.MonitorTypeBeacon) == "" {
+			return model.MonitorTypeBeacon, ""
+		}
+		if icmpOK && !caps.icmpFiltered && latencyProbeGate(source, model.MonitorTypeICMP) == "" {
 			return model.MonitorTypeICMP, ""
 		}
 		if tcpOK {
@@ -503,15 +542,37 @@ func latencyPairMethod(setting string, source model.Node, tcpOK, icmpOK bool) (m
 
 // latencyMethodResolvable reports whether a method setting can reach a
 // target at all, whatever the source.
-func latencyMethodResolvable(setting string, tcpOK, icmpOK bool) bool {
+func latencyMethodResolvable(setting string, tcpOK, icmpOK, beaconOK bool) bool {
 	switch setting {
+	case model.LatencyMethodBeacon:
+		return beaconOK
 	case model.LatencyMethodICMP:
 		return icmpOK
 	case model.LatencyMethodAuto:
-		return tcpOK || icmpOK
+		return tcpOK || icmpOK || beaconOK
 	default:
 		return tcpOK
 	}
+}
+
+// latencyICMPRecheck is how long auto keeps a pair on tcp after its icmp
+// read icmp_filtered. Once the pair is on tcp nothing runs icmp for it, so
+// the verdict would otherwise stand forever; after this the pair tries icmp
+// again, and one more filtered run puts it back on tcp for another day.
+const latencyICMPRecheck = 24 * time.Hour
+
+// latencyICMPFiltered reports whether a pair's icmp path reads
+// icmp_filtered now, from its generated icmp check's latest result, and
+// that result is less than latencyICMPRecheck old.
+func (s *Server) latencyICMPFiltered(icmpMonitorID, sourceID string, now time.Time) bool {
+	latest, ok, err := s.store.MonitorLatest(icmpMonitorID, sourceID)
+	if err != nil || !ok || latest.Unknown != nil {
+		return false
+	}
+	if now.Sub(latest.At) >= latencyICMPRecheck {
+		return false
+	}
+	return icmpFiltered(model.MonitorTypeICMP, latest)
 }
 
 // planLatencyProbes applies the stored configuration (or the defaults) to
@@ -547,8 +608,10 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			Nodes:             []model.LatencyProbeNode{},
 			Pairs:             []model.LatencyProbePairState{},
 		},
-		endpoints: make(map[string]latencyNodeEndpoints, len(nodes)),
+		endpoints:        make(map[string]latencyNodeEndpoints, len(nodes)),
+		beaconCandidates: map[string][]string{},
 	}
+	beaconTargets := s.store.BeaconTargets()
 
 	configured := map[string]bool{}
 	var sources []string
@@ -641,9 +704,17 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 		default:
 			pn.TargetReason = model.LatencyReasonRegionUnknown
 		}
-		tcpID, icmpID := latencyMonitorID(n.ID), latencyICMPMonitorID(n.ID)
+		tcpID, icmpID, beaconID := latencyMonitorID(n.ID), latencyICMPMonitorID(n.ID), latencyBeaconMonitorID(n.ID)
 		priorTCP, hadTCP := existing[tcpID]
 		priorICMP, hadICMP := existing[icmpID]
+		priorBeacon, hadBeacon := existing[beaconID]
+		bt, btOK := beaconTargets[n.ID]
+		beaconEndpoint := ""
+		facts := s.beaconFactsOf(n)
+		if btOK && bt.Settings.Enabled {
+			beaconEndpoint = bt.Settings.Endpoint
+			pn.BeaconTarget = beaconEndpoint
+		}
 		if pn.Target == model.LatencyTargetNone {
 			// Out of the set: the monitors stay, paused, with their history.
 			if hadTCP {
@@ -653,6 +724,10 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			if hadICMP {
 				keepPaused(priorICMP, n.ID)
 				pn.ICMPMonitorID = icmpID
+			}
+			if hadBeacon {
+				keepPaused(priorBeacon, n.ID)
+				pn.BeaconMonitorID = beaconID
 			}
 			out.plan.Nodes = append(out.plan.Nodes, pn)
 			continue
@@ -669,8 +744,15 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			pn.ICMPTarget = icmpTarget
 		}
 		tcpOK := chosen != nil
+		targetGate := beaconTargetGate(bt, btOK, facts)
+		if targetGate == "" && !beaconEndpointCurrent(n, beaconEndpoint, out.endpoints) {
+			// The node moved off the address its plan advertises.
+			targetGate = model.PathReasonNotProbeable
+		}
+		beaconOK := targetGate == ""
+		listening := beaconOK && beaconListening(facts, bt)
 
-		var activeTCP, activeICMP []string
+		var activeTCP, activeICMP, activeBeacon []string
 		firstPair := len(out.plan.Pairs)
 		probeable, methodBlocked, plainInactive := false, false, false
 		for _, sourceID := range sources {
@@ -678,7 +760,19 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 				continue
 			}
 			enabled := !disabledPairs[latencyPairKey(sourceID, n.ID)]
-			method, reason := latencyPairMethod(latencySourceMethod(cfg, sourceID), byID[sourceID], tcpOK, icmpOK)
+			setting := latencySourceMethod(cfg, sourceID)
+			caps := latencyTargetCaps{tcpOK: tcpOK, icmpOK: icmpOK, beaconGate: targetGate, beaconListening: listening}
+			if caps.beaconGate == "" {
+				caps.beaconGate = beaconSourceGate(bt, sourceID)
+			}
+			if setting == model.LatencyMethodAuto && icmpOK && hadICMP {
+				caps.icmpFiltered = s.latencyICMPFiltered(icmpID, sourceID, now)
+			}
+			if (setting == model.LatencyMethodAuto || setting == model.LatencyMethodBeacon) && enabled && cfg.Enabled &&
+				latencyProbeGate(byID[sourceID], model.MonitorTypeBeacon) == "" {
+				out.beaconCandidates[n.ID] = append(out.beaconCandidates[n.ID], sourceID)
+			}
+			method, reason := latencyPairMethod(setting, byID[sourceID], caps)
 			if reason != model.PathReasonNotProbeable {
 				probeable = true
 			}
@@ -689,9 +783,12 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			switch {
 			case enabled && cfg.Enabled && reason == "":
 				pair.Active = true
-				if method == model.MonitorTypeICMP {
+				switch method {
+				case model.MonitorTypeICMP:
 					activeICMP = append(activeICMP, sourceID)
-				} else {
+				case model.MonitorTypeBeacon:
+					activeBeacon = append(activeBeacon, sourceID)
+				default:
 					activeTCP = append(activeTCP, sourceID)
 				}
 			case enabled && reason != "" && reason != model.PathReasonNotProbeable:
@@ -702,13 +799,14 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			out.plan.Pairs = append(out.plan.Pairs, pair)
 		}
 		if len(sources) == 0 || !latencyHasOtherSource(sources, n.ID) {
-			probeable = latencyMethodResolvable(latencySourceMethod(cfg, ""), tcpOK, icmpOK)
+			probeable = latencyMethodResolvable(latencySourceMethod(cfg, ""), tcpOK, icmpOK, beaconOK)
 		}
 		// A monitor exists for each kind while something probes with it or
 		// a history was already taken; nothing is created just to sit
 		// paused.
 		tcpMonitor := tcpOK && (hadTCP || len(activeTCP) > 0)
 		icmpMonitor := icmpOK && (hadICMP || len(activeICMP) > 0)
+		beaconMonitor := beaconEndpoint != "" && (hadBeacon || len(activeBeacon) > 0)
 		for i := firstPair; i < len(out.plan.Pairs); i++ {
 			pair := &out.plan.Pairs[i]
 			switch {
@@ -716,6 +814,8 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 				pair.MonitorID = icmpID
 			case pair.Method == model.MonitorTypeTCP && (tcpMonitor || hadTCP):
 				pair.MonitorID = tcpID
+			case pair.Method == model.MonitorTypeBeacon && (beaconMonitor || hadBeacon):
+				pair.MonitorID = beaconID
 			}
 		}
 
@@ -727,7 +827,7 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			if !tcpOK && latencySourceMethod(cfg, "") == model.LatencyMethodICMP {
 				pn.EndpointNote = model.LatencyEndpointNoAddress
 			}
-		} else if len(activeTCP)+len(activeICMP) == 0 {
+		} else if len(activeTCP)+len(activeICMP)+len(activeBeacon) == 0 {
 			pn.Target = model.LatencyTargetPaused
 			switch {
 			case !cfg.Enabled:
@@ -789,6 +889,30 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 		case hadICMP:
 			keepPaused(priorICMP, n.ID)
 			pn.ICMPMonitorID = icmpID
+		}
+		switch {
+		case beaconMonitor:
+			mon := model.Monitor{
+				ID:          beaconID,
+				Name:        "Beacon to " + latencyNodeLabel(n),
+				Type:        model.MonitorTypeBeacon,
+				Target:      beaconEndpoint,
+				TargetNode:  n.ID,
+				IntervalSec: interval,
+				TimeoutSec:  timeout,
+				Packets:     model.MonitorPacketsDefault,
+				NodeIDs:     activeBeacon,
+				Enabled:     len(activeBeacon) > 0,
+				ManagedBy:   model.MonitorManagedLatency,
+			}
+			if len(activeBeacon) == 0 {
+				mon.NodeIDs = slices.Clone(priorBeacon.NodeIDs)
+			}
+			out.desired = append(out.desired, mon)
+			pn.BeaconMonitorID = beaconID
+		case hadBeacon:
+			keepPaused(priorBeacon, n.ID)
+			pn.BeaconMonitorID = beaconID
 		}
 		out.plan.Nodes = append(out.plan.Nodes, pn)
 	}
@@ -993,14 +1117,14 @@ func (s *Server) normalizeLatencyProbeConfig(in model.LatencyProbeConfig) (model
 	// saved before methods existed keeps its paths and history.
 	validMethod := func(m string) bool {
 		switch m {
-		case model.LatencyMethodTCP, model.LatencyMethodICMP, model.LatencyMethodAuto:
+		case model.LatencyMethodTCP, model.LatencyMethodICMP, model.LatencyMethodBeacon, model.LatencyMethodAuto:
 			return true
 		}
 		return false
 	}
 	out.Method = strings.TrimSpace(in.Method)
 	if out.Method != "" && !validMethod(out.Method) {
-		return out, fmt.Errorf("method must be %q, %q or %q", model.LatencyMethodTCP, model.LatencyMethodICMP, model.LatencyMethodAuto)
+		return out, fmt.Errorf("method must be %q, %q, %q or %q", model.LatencyMethodTCP, model.LatencyMethodICMP, model.LatencyMethodBeacon, model.LatencyMethodAuto)
 	}
 	for raw, method := range in.SourceMethods {
 		sourceID, method := strings.TrimSpace(raw), strings.TrimSpace(method)
@@ -1008,7 +1132,7 @@ func (s *Server) normalizeLatencyProbeConfig(in model.LatencyProbeConfig) (model
 			return out, fmt.Errorf("source_methods names %q, which is not one of the sources", raw)
 		}
 		if !validMethod(method) {
-			return out, fmt.Errorf("source_methods[%s] must be %q, %q or %q", sourceID, model.LatencyMethodTCP, model.LatencyMethodICMP, model.LatencyMethodAuto)
+			return out, fmt.Errorf("source_methods[%s] must be %q, %q, %q or %q", sourceID, model.LatencyMethodTCP, model.LatencyMethodICMP, model.LatencyMethodBeacon, model.LatencyMethodAuto)
 		}
 		if out.SourceMethods == nil {
 			out.SourceMethods = map[string]string{}

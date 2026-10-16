@@ -234,6 +234,39 @@ func readBoltLatencyProbes(tx *bolt.Tx) (*model.LatencyProbeConfig, error) {
 	return &cfg, nil
 }
 
+// boltKeyBeacon holds State.Beacon in the meta bucket, so the offline
+// migrate round trip keeps the beacon's source ids, plans and (encrypted)
+// target keys.
+var boltKeyBeacon = []byte("beacon")
+
+func putBoltBeacon(tx *bolt.Tx, reg *BeaconRegistry) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if reg == nil {
+		return meta.Delete(boltKeyBeacon)
+	}
+	raw, err := json.Marshal(reg)
+	if err != nil {
+		return err
+	}
+	return meta.Put(boltKeyBeacon, raw)
+}
+
+func readBoltBeacon(tx *bolt.Tx) (*BeaconRegistry, error) {
+	meta := tx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return nil, nil
+	}
+	raw := meta.Get(boltKeyBeacon)
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var reg BeaconRegistry
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		return nil, fmt.Errorf("decode beacon: %w", err)
+	}
+	return &reg, nil
+}
+
 var boltStateBuckets = [][]byte{
 	boltBucketUsers,
 	boltBucketTokens,
@@ -550,6 +583,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putBoltMonitorSettings(tx, persist.MonitorSettings); err != nil {
 			return err
 		}
+		if err := putBoltBeacon(tx, persist.Beacon); err != nil {
+			return err
+		}
 		if err := putBoltEvidenceSettings(tx, persist.EvidenceSettings); err != nil {
 			return err
 		}
@@ -820,6 +856,11 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		st.MonitorSettings = monitorSettings
+		beacon, err := readBoltBeacon(tx)
+		if err != nil {
+			return err
+		}
+		st.Beacon = beacon
 		evidence, err := readBoltEvidenceSettings(tx)
 		if err != nil {
 			return err

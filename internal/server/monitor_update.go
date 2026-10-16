@@ -213,8 +213,8 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 		next.TimeoutSec = *req.TimeoutSec
 	}
 	if req.Packets != nil {
-		if mon.Type != model.MonitorTypeICMP {
-			return model.Monitor{}, nil, false, errors.New("packets applies to icmp checks only")
+		if !model.MonitorKindSendsPackets(mon.Type) {
+			return model.Monitor{}, nil, false, errors.New("packets applies to icmp and beacon checks only")
 		}
 		if *req.Packets < 1 || *req.Packets > model.MonitorPacketsMax {
 			return model.Monitor{}, nil, false, fmt.Errorf("packets must be 1 to %d", model.MonitorPacketsMax)

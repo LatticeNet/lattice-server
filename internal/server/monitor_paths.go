@@ -204,6 +204,7 @@ type pathCheck struct {
 var latencyCheckMethods = []struct{ prefix, method string }{
 	{latencyMonitorPrefix, model.MonitorTypeTCP},
 	{latencyICMPMonitorPrefix, model.MonitorTypeICMP},
+	{model.LatencyMonitorPrefixBeacon, model.MonitorTypeBeacon},
 }
 
 // generatedPathChecks lists the generated checks that reach target.
@@ -510,8 +511,11 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 		if method == "" {
 			method = model.MonitorTypeTCP
 		}
-		if method == model.MonitorTypeICMP {
+		switch method {
+		case model.MonitorTypeICMP:
 			target = pn.ICMPTarget
+		case model.MonitorTypeBeacon:
+			target = pn.BeaconTarget
 		}
 		e := pathEntry{
 			cell: model.PathCell{
@@ -524,6 +528,9 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 		}
 		if pair.Reason != model.PathReasonNotProbeable {
 			e.gate = pair.Reason
+		}
+		if e.gate == "" && method == model.MonitorTypeBeacon {
+			e.gate = s.beaconTargetListenGate(pair.Target, nodes)
 		}
 		if mon, ok := monitors[pair.MonitorID]; ok && pair.MonitorID != "" {
 			e.monitor, e.hasCheck = &mon, true
@@ -563,7 +570,7 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 		target, resolvable := mon.Target, true
 		if mon.TargetNode != "" {
 			if targets == nil {
-				t := monitorTargets{nodes: nodes, endpoints: planned.endpoints}
+				t := monitorTargets{nodes: nodes, endpoints: planned.endpoints, beacons: s.store.BeaconTargets()}
 				targets = &t
 			}
 			if resolved, ok := targets.resolved(mon); ok {
@@ -585,8 +592,18 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 				paused:       !mon.Enabled || slices.Contains(mon.PausedNodeIDs, source),
 				notProbeable: !resolvable,
 			}
-			if source != "" {
+			if mon.Type == model.MonitorTypeBeacon && !resolvable {
+				// The target's beacon is off: say so rather than reading
+				// the node as one the method cannot reach.
+				e.notProbeable = false
+				e.gate = model.PathReasonBeaconNotEnabled
+			} else if source != "" {
 				e.gate = monitorProbeGate(nodes[source], mon)
+				if e.gate == "" && mon.Type == model.MonitorTypeBeacon && mon.TargetNode != "" {
+					if e.gate = s.beaconMonitorGate(nodes[source], mon.TargetNode, now); e.gate == "" {
+						e.gate = s.beaconTargetListenGate(mon.TargetNode, nodes)
+					}
+				}
 			}
 			out = append(out, e)
 		}
@@ -894,6 +911,9 @@ func pathStateOf(e pathEntry, latest *store.MonitorLatest, nodes map[string]mode
 	if icmpFiltered(e.cell.Method, *latest) {
 		return model.PathStateUnknown, model.PathReasonICMPFiltered
 	}
+	if beaconFiltered(e.cell.Method, *latest) {
+		return model.PathStateUnknown, model.PathReasonBeaconFiltered
+	}
 	// Down follows the check's alert hold: its failures in a row
 	// (store.MonitorAlertAfter), two for a generated check.
 	after := store.MonitorAlertAfter(model.Monitor{})
@@ -912,6 +932,32 @@ func pathStateOf(e pathEntry, latest *store.MonitorLatest, nodes map[string]mode
 // node that really dies still reads down and pages.
 func icmpFiltered(method string, latest store.MonitorLatest) bool {
 	return method == model.MonitorTypeICMP && !latest.Success && latest.LastOKAt.IsZero()
+}
+
+// beaconFiltered is icmpFiltered for the beacon (design 29 D12): a beacon
+// path losing every request that has never had a reply reads filtered, and
+// once one has come back, failures are failures.
+func beaconFiltered(method string, latest store.MonitorLatest) bool {
+	return method == model.MonitorTypeBeacon && !latest.Success && latest.LastOKAt.IsZero()
+}
+
+// beaconTargetListenGate is beacon_not_listening while the target is
+// online and its agent reports no socket where its plan put one, so the
+// path names the target's state instead of reading down for it.
+func (s *Server) beaconTargetListenGate(target string, nodes map[string]model.Node) string {
+	n, ok := nodes[target]
+	if !ok || !n.Online || n.Disabled {
+		return ""
+	}
+	facts := s.beaconFactsOf(n)
+	if facts == nil {
+		return ""
+	}
+	switch facts.State {
+	case model.BeaconAgentBindFailed, model.BeaconAgentCircuitOpen:
+		return model.PathReasonBeaconNotListening
+	}
+	return ""
 }
 
 // pathMatrixFor builds the matrix the principal may read.

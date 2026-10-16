@@ -123,6 +123,9 @@ type State struct {
 	// MonitorSettings is the operator's monitor history setting
 	// (monitor_settings.go), nil until one is saved. Written only on an edit.
 	MonitorSettings *model.MonitorSettings `json:"monitor_settings,omitempty"`
+	// Beacon is the measurement beacon's state (beacon.go): source ids,
+	// applied plans and target keys, nil until the first is written.
+	Beacon *BeaconRegistry `json:"beacon,omitempty"`
 	// EvidenceSettings are the operator's evidence budgets
 	// (evidence_settings.go), nil until saved. Written only on an edit.
 	EvidenceSettings *model.EvidenceSettings `json:"evidence_settings,omitempty"`

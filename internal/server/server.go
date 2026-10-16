@@ -376,6 +376,9 @@ type Server struct {
 	// monitorPaths holds the paths matrix cache and the history pruning
 	// sweep's guard; see monitor_paths.go and monitor_settings.go.
 	monitorPaths monitorPathState
+	// beacon holds the measurement beacon's in-memory state: each agent's
+	// latest report and egress address; see beacon.go.
+	beacon beaconRuntime
 	// monitorSaves holds a check or path set save from the packet budget
 	// check to the write it guards, so two saves cannot both pass against
 	// the same stored set (monitor_checks.go). Taken before latencySync.
@@ -1340,6 +1343,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/agent-updates/artifacts", s.withAuth("", s.handleAgentArtifacts))
 	mux.HandleFunc("/api/nodes/agent-updates/artifacts/import", s.withAuth("node:admin", s.handleAgentArtifactImport))
 	mux.HandleFunc("/api/nodes/agent-updates/artifacts/delete", s.withAuth("node:admin", s.handleDeleteAgentArtifact))
+	mux.HandleFunc("/api/nodes/beacon", s.withAuth("monitor:read", s.handleNodeBeacon))
+	mux.HandleFunc("/api/nodes/beacon/plan", s.withAuth("", s.handleBeaconPlan))
+	mux.HandleFunc("/api/nodes/beacon/rotate", s.withAuth("", s.handleBeaconRotate))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
 	mux.HandleFunc("/api/nodes/reconfigure-command", s.withAuth("node:admin", s.handleNodeReconfigureCommand))
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
@@ -5421,7 +5427,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		req.PausedNodeIDs = nil
 		req.SecretsOrigin = ""
 		switch req.Type {
-		case model.MonitorTypeTCP, model.MonitorTypeHTTP, model.MonitorTypeICMP:
+		case model.MonitorTypeTCP, model.MonitorTypeHTTP, model.MonitorTypeICMP, model.MonitorTypeBeacon:
 			if !req.AssignAll && len(req.NodeIDs) == 0 {
 				writeError(w, http.StatusBadRequest, errors.New("set assign_all or provide node_ids"))
 				return
@@ -5453,6 +5459,8 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 				err = normalizeHTTPMonitor(&req, true)
 			case model.MonitorTypeICMP:
 				err = targets.normalizeICMPMonitor(&req)
+			case model.MonitorTypeBeacon:
+				err = targets.normalizeBeaconMonitor(&req)
 			default:
 				err = targets.normalizeTCPMonitor(&req)
 			}
@@ -5462,7 +5470,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			if err == nil {
 				err = validMonitorRun(req)
 			}
-			if err == nil && req.Type == model.MonitorTypeICMP {
+			if err == nil && model.MonitorKindSendsPackets(req.Type) {
 				req.Enabled = true
 				err = targets.checkPacketBudget(s.store.Monitors(), req)
 			}
@@ -5488,7 +5496,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			}
 			req = normalized
 		default:
-			writeError(w, http.StatusBadRequest, errors.New("only tcp, http, icmp and tls monitors are supported"))
+			writeError(w, http.StatusBadRequest, errors.New("only tcp, http, icmp, beacon and tls monitors are supported"))
 			return
 		}
 		if err := validMonitorTiming(req.IntervalSec, req.TimeoutSec); err != nil {
@@ -5691,6 +5699,12 @@ func (s *Server) agentMonitorsFor(node model.Node, assigned []model.Monitor, now
 	var targets *monitorTargets
 	for _, mon := range assigned {
 		if monitorProbeGate(node, mon) != "" {
+			continue
+		}
+		// A beacon check goes only to a source the target's applied plan
+		// approved, to a target that can answer; the key it signs with
+		// comes in the same pull's config.
+		if mon.Type == model.MonitorTypeBeacon && (mon.TargetNode == "" || s.beaconMonitorGate(node, mon.TargetNode, now) != "") {
 			continue
 		}
 		if mon.TargetNode != "" && mon.ManagedBy == "" {
@@ -7580,6 +7594,19 @@ func requestBool(r *http.Request, key string) bool {
 // real fix and needs an SDK field.
 func (s *Server) approvalPlanReach(approval model.Approval) (string, []string) {
 	switch {
+	case isBeaconApproval(approval):
+		// The plan names every source with its addresses.
+		plan, err := beaconPlanOf(approval)
+		if err != nil {
+			return "", nil
+		}
+		sources := make([]string, 0, len(plan.Sources))
+		for _, src := range plan.Sources {
+			if src.NodeID != approval.NodeID {
+				sources = append(sources, src.NodeID)
+			}
+		}
+		return "monitor:read", sources
 	case approval.Plugin == "wireguard" && approval.Action == "apply-config":
 		// The plan is a mesh config: every member's public key, mesh IP and
 		// endpoint is in the bytes.
@@ -7704,6 +7731,11 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 		// so reading one needs it unconfined as well.
 		return !principalHasNodeRestriction(p) &&
 			rbac.Allows(p.Principal, "notify:admin", "") &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
+	case model.BeaconApprovalPlugin:
+		// A node.beacon plan names the beacon's sources and their addresses
+		// and, under NetGuard, the node's whole ruleset; it carries no key.
+		return rbac.Allows(p.Principal, "monitor:read", approval.NodeID) &&
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case sshGuardPlugin:
 		// An SSH Guard plan carries the node's knock sequence in plaintext,
@@ -8868,6 +8900,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	if isSubStorePlanApproval(approval) {
 		return s.subStorePlanApprove(ctx, p, approval, queueApply)
 	}
+	// A node.beacon plan's effect is the control plane's own state, which
+	// reaches the node through its config pull; only its NetGuard
+	// companion, when there is one, is a node task (beacon_plan.go).
+	if isBeaconApproval(approval) {
+		return s.beaconApprove(ctx, p, approval, queueApply)
+	}
 	if queueApply && s.taskExecutionDisabled {
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:       id.New("audit"),
@@ -9397,6 +9435,11 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 	case witnessPlugin:
 		// Approving hands a stored channel's device key to a node.
 		return "notify:admin"
+	case model.BeaconApprovalPlugin:
+		// Approving opens or closes a port on the node; beaconApprove also
+		// asks for node:admin, and netguard:admin when NetGuard rules ride
+		// along.
+		return "monitor:admin"
 	case subStorePlanApprovalPlugin:
 		// Approving changes what existing share holders receive, which the
 		// share API guards with proxy:admin.
@@ -9495,6 +9538,14 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 		n.HostFacts = hostFacts
 	}
 	n.ProbeMethods, n.ProbeRefusals = normalizeProbeFacts(req.ProbeMethods, req.ProbeRefusals)
+	// The beacon report is replaced on every hello, as probe_methods are.
+	if facts := normalizeBeaconFacts(req.Beacon, s.now()); facts != nil {
+		s.beacon.noteFacts(n.ID, *facts)
+		n.Beacon = beaconFactsDurable(facts)
+	} else {
+		n.Beacon = nil
+		s.beacon.forgetFacts(n.ID)
+	}
 	n.LastSeen = time.Now().UTC()
 	cameOnline := !n.Online
 	if cameOnline {
@@ -9578,6 +9629,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 			s.logger.Printf("agent probe facts for node %s not stored: %v", req.NodeID, err)
 		}
 	}
+	s.noteBeaconFacts(req.NodeID, old.Beacon, req.Beacon)
 	if old.PublicIP != v4 || old.PublicIPv6 != v6 {
 		s.invalidateLineReadModel()
 	}
@@ -9855,6 +9907,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	if isWitnessApproval(approval) {
 		return s.handleWitnessTaskResult(r, approval, task, result)
 	}
+	if isBeaconApproval(approval) {
+		return s.handleBeaconTaskResult(r, approval, task, result)
+	}
 	if isPluginOperationApproval(approval) {
 		return s.handlePluginOperationTaskResult(r, approval, task, result)
 	}
@@ -10079,6 +10134,9 @@ type agentAuthRequest struct {
 	// that predate them.
 	ProbeMethods  []string          `json:"probe_methods"`
 	ProbeRefusals map[string]string `json:"probe_refusals"`
+	// Beacon is the agent's report about its beacon responder (design 29
+	// D12); absent from agents that predate it.
+	Beacon *model.BeaconFacts `json:"beacon"`
 }
 
 var blockedReportedPublicPrefixes = []netip.Prefix{

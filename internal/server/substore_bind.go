@@ -1164,10 +1164,24 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in 
 	return result
 }
 
-// substoreBindEach calls fn(i) for every i in [0, n), spread over up to
-// GOMAXPROCS workers (at most eight) once n is large enough to repay them,
-// and returns when every call has returned. fn must touch only what index i
-// owns.
+// substoreBindHelpers bounds, process-wide, the goroutines substoreBindEach
+// starts beside its callers: a bind or a catalogue build takes a token per
+// helper and never waits for one, so K concurrent calls run their own
+// goroutines plus at most eight helpers between them instead of eight each.
+var substoreBindHelpers = make(chan struct{}, 8)
+
+// substoreBindEach calls fn(i) for every i in [0, n), spread over the
+// calling goroutine and up to seven helpers (fewer under a lower GOMAXPROCS,
+// or while other calls hold the process-wide helper tokens) once n is large
+// enough to repay them, and returns when every call has returned. fn must
+// touch only what index i owns.
+//
+// A panic in fn reaches the caller as it would from the serial loop: the
+// worker that panicked recovers, the others stop taking indexes, and once
+// all have returned substoreBindEach panics again on the calling goroutine
+// with the first value. The per-node input is plugin-controlled JSON, and a
+// panic left on a helper goroutine would end the core process instead of
+// failing one request through net/http's per-connection recover.
 func substoreBindEach(n int, fn func(i int)) {
 	workers := min(runtime.GOMAXPROCS(0), 8)
 	if n < 128 || workers < 2 {
@@ -1178,24 +1192,51 @@ func substoreBindEach(n int, fn func(i int)) {
 	}
 	const block = 32
 	var next atomic.Int64
-	var wg sync.WaitGroup
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				start := int(next.Add(block)) - block
-				if start >= n {
-					return
-				}
-				for i := start; i < min(start+block, n); i++ {
-					fn(i)
-				}
+	var first atomic.Pointer[substoreBindPanic]
+	work := func() {
+		defer func() {
+			if v := recover(); v != nil {
+				first.CompareAndSwap(nil, &substoreBindPanic{value: v})
+				next.Store(int64(n))
 			}
 		}()
+		for {
+			start := int(next.Add(block)) - block
+			if start >= n {
+				return
+			}
+			for i := start; i < min(start+block, n); i++ {
+				fn(i)
+			}
+		}
 	}
+	var wg sync.WaitGroup
+helpers:
+	for w := 1; w < workers; w++ {
+		select {
+		case substoreBindHelpers <- struct{}{}:
+		default:
+			break helpers
+		}
+		wg.Add(1)
+		go func() {
+			defer func() {
+				<-substoreBindHelpers
+				wg.Done()
+			}()
+			work()
+		}()
+	}
+	work()
 	wg.Wait()
+	if p := first.Load(); p != nil {
+		panic(p.value)
+	}
 }
+
+// substoreBindPanic carries a recovered panic value from a worker to the
+// caller of substoreBindEach.
+type substoreBindPanic struct{ value any }
 
 // substoreBindDocumentRefusal is why a document plan cannot be served, or
 // "": the first exclusion that is not operational, a placeholder count that

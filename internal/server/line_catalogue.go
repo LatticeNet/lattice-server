@@ -397,17 +397,17 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 // without a template too is withheld.
 func finishLineCatalogueRow(row *model.LineCatalogueRow, identity lineCatalogueSecrets) (raw []byte, keptTemplate bool, err error) {
 	for {
-		// Validate's size bound encodes the row; ValidateEncoded reads it
-		// from the encoding the row is served as, so each row is encoded
-		// once. A row that does not encode is judged by Validate, which
-		// words the error as before.
+		// Validate's size bound encodes the row; ValidateTrustingEncoding
+		// reads it from the encoding the row is served as, which is raw
+		// right here, so each row is encoded once. A row that does not
+		// encode is judged by Validate, which words the error as before.
 		raw, err = json.Marshal(row)
 		if err != nil {
 			if verr := row.Validate(); verr != nil {
 				err = verr
 			}
 		} else {
-			err = row.ValidateEncoded(raw)
+			err = row.ValidateTrustingEncoding(raw)
 		}
 		if err == nil {
 			if identity.in(raw) {
@@ -792,11 +792,11 @@ func lineCatalogueTokenValid(value string) bool {
 
 // lineCatalogueProbeRowValid is the SDK's row rule on a probe row that
 // carries one value to check. A probe row is far under the row's size
-// bound, so its fields are all the rule can refuse, and ValidateEncoded
+// bound, so its fields are all the rule can refuse, and ValidateFields
 // checks them without encoding the row (a catalogue build checks one value
 // per line).
 func lineCatalogueProbeRowValid(row model.LineCatalogueRow) bool {
-	return row.ValidateEncoded(nil) == nil
+	return row.ValidateFields() == nil
 }
 
 // lineCatalogueDDNSNameValid checks one name by the SDK's own row rule.

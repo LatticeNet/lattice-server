@@ -472,15 +472,6 @@ func validSystemHostCallID(id string) bool {
 	return err == nil && n > 0 && "h"+strconv.FormatUint(n, 10) == id
 }
 
-// canonicalRawJSON reports whether raw is already what encoding/json writes
-// for a json.RawMessage holding it: compact, and free of the bytes it
-// escapes ('<', '>', '&', U+2028, U+2029), which cannot occur outside a
-// string. A payload that is can be spliced into a frame as it is.
-func canonicalRawJSON(raw []byte) bool {
-	return strictjson.Compact(raw) && !bytes.ContainsAny(raw, "<>&") &&
-		!bytes.Contains(raw, []byte("\u2028")) && !bytes.Contains(raw, []byte("\u2029"))
-}
-
 func appendJSONString(dst []byte, s string) []byte {
 	raw, _ := json.Marshal(s)
 	return append(dst, raw...)
@@ -493,7 +484,7 @@ func appendJSONString(dst []byte, s string) []byte {
 // in canonical form, so it is spliced in once instead of compacted twice
 // more; any other payload goes through encoding/json as before.
 func encodeInvokeV2Frame(generation uint64, invocation string, req InvokeRequest) []byte {
-	if len(req.Payload) == 0 || canonicalRawJSON(req.Payload) {
+	if len(req.Payload) == 0 || strictjson.CanonicalRaw(req.Payload) {
 		out := make([]byte, 0, len(req.Payload)+128+len(invocation)+len(req.Action))
 		out = append(out, `{"protocol":2,"kind":"invoke","generation":`...)
 		out = strconv.AppendUint(out, generation, 10)
@@ -518,7 +509,7 @@ func encodeInvokeV2Frame(generation uint64, invocation string, req InvokeRequest
 // json.Marshal writes struct{service, method, payload (omitempty)}, with a
 // canonical payload spliced in rather than compacted again.
 func EncodeServiceCall(service, method string, payload json.RawMessage) ([]byte, error) {
-	if len(payload) == 0 || canonicalRawJSON(payload) {
+	if len(payload) == 0 || strictjson.CanonicalRaw(payload) {
 		out := make([]byte, 0, len(payload)+64+len(service)+len(method))
 		out = appendJSONString(append(out, `{"service":`...), service)
 		out = appendJSONString(append(out, `,"method":`...), method)

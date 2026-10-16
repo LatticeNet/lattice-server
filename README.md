@@ -616,8 +616,9 @@ Use the compose file and deployment guide in the umbrella repository:
   renamed to `cd-hs-sh` becomes a source within one sweep; a saved
   configuration names its sources by node id and ends that. The control plane turns the configuration into monitors
   marked `managed_by: "latency"`, one per target and kind (`mon_lat_<target>`
-  for tcp, `mon_lati_<target>` for icmp) and assigned to the sources that use
-  that kind. `method` (`tcp`, `icmp` or `auto`; empty reads as `tcp`) and
+  for tcp, `mon_lati_<target>` for icmp, `mon_latb_<target>` for the beacon)
+  and assigned to the sources that use that kind. `method` (`tcp`, `icmp`,
+  `beacon` or `auto`; empty reads as `tcp`) and
   `source_methods` (per-source pins) choose the kind: `auto` takes icmp where
   the source's agent runs it and the target has a public IPv4, else tcp; a
   pin never falls back, and a pair whose source cannot run its kind reads
@@ -693,6 +694,47 @@ Use the compose file and deployment guide in the umbrella repository:
   only the kinds it reports in `probe_methods` on hello and heartbeat (an
   agent that reports none runs tcp and http), with node targets resolved;
   node reads carry the effective `probe_methods` and `probe_refusals`.
+- Measurement beacon (design 29 D3, wire contract in design 29 D12, wire
+  format in the SDK's `beacon` package): an authenticated UDP responder an
+  agent opens only while an applied `node.beacon` plan enables it.
+  `POST /api/nodes/beacon/plan` (`monitor:admin`, `node:admin` and
+  `network:plan` on the node, `netguard:admin` too when NetGuard manages it,
+  and `monitor:read` on every source the plan names) takes `node_id`,
+  `action` (`enable`, `disable`, `change`) and optional `port` (1024 to
+  65535; by default a random port in 40000 to 59999 assigned once per node),
+  `bind` (an IPv4 literal; by default the node's primary interface address,
+  so a NAT node binds its private address) and `endpoint` (the advertised
+  IPv4 literal and port, a NAT mapping allowed; host names, loopback,
+  link-local, multicast and 240.0.0.0/4 refused). It answers `{approval,
+  plan, findings}`: the approval (plugin `beacon`, action `node.beacon`)
+  carries the plan document, whose hash covers the settings, the limits, the
+  source set (the path set's auto and beacon sources running the beacon
+  client, and the sources of operator beacon checks) and, under NetGuard,
+  the node's whole ruleset with the companion rules (UDP to the port from
+  each source's public and WireGuard /32 and its observed egress, `notrack`
+  in both directions). Findings refuse a port a sing-box inbound, sshd, a
+  knock sequence or WireGuard holds and a bind on the WireGuard address,
+  and warn on a mapped endpoint, no sources and a node NetGuard does not
+  manage. Deciding it renders the document again and answers 409 stale when
+  the bytes differ, needs the same scopes as planning plus `network:apply`,
+  and, with a companion, must queue its apply task. The server mints the
+  node's 32-byte key on the first enable, keeps it encrypted at rest, and
+  hands each target its table and each source only its own path key per
+  target in `GET /api/agent/config` (`beacon`); a source the plan did not
+  approve reads `firewall_pending` (`beacon_source_pending` without
+  NetGuard) until a change plan applies. `POST /api/nodes/beacon/rotate`
+  (`monitor:admin` and `node:admin`, audited as `beacon.rotate`) moves the
+  key to a new epoch; a source leaving the table does too. `GET
+  /api/nodes/beacon?node_id=` (`monitor:read`) answers the beacon's state,
+  applied settings, epoch, last authenticated request, the agent's report,
+  the reachability verdict of the check one approved source runs after an
+  apply (`mon_beaconr_<node>`), the exposure, `firewall_pending` and each
+  source; no read and no audit record ever carries a key. Beacon checks
+  (`type: "beacon"`) name `target_node` only, resolve to the endpoint, and
+  share icmp's packet rules and budget. The path set takes `beacon` as a
+  method, and `auto` prefers the beacon for approved sources of a listening
+  target, then icmp unless that pair reads `icmp_filtered` (then tcp, and it
+  stays there), then tcp; generated beacon checks are `mon_latb_<target>`.
 - `GET /api/monitors/settings` (`monitor:read`, no node allowlist, since the
   figures cover the fleet) returns the history setting
   (`fine_retention_days`, 3 to 14, 7 by default; the hourly tier is fixed at

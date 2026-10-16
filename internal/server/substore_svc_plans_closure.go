@@ -347,8 +347,8 @@ func subStorePlanMissingMigrations(g subStorePlanGraph, promoted map[string]subS
 		_, changed := promoted[collection]
 		becomesFleet := changed || cf.FleetBound || cf.Source == subStoreSourceFleet
 		for member := range members {
-			if p, ok := promoted[member]; ok {
-				if mf, _ := g.facts(member); mf.StagedSource == subStoreSourceFleet || mf.Kind == subStoreRecordKindCollection || p.ToRevision != "" {
+			if _, ok := promoted[member]; ok {
+				if mf, _ := g.facts(member); mf.StagedSource == subStoreSourceFleet || mf.Kind == subStoreRecordKindCollection {
 					becomesFleet = true
 				}
 			}

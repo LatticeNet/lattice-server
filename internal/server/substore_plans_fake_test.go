@@ -7,6 +7,9 @@ import (
 	"sort"
 	"sync"
 	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // subStoreFakeGraph answers depends_on v2 the way the plugin does
@@ -26,6 +29,11 @@ type subStoreFakeGraph struct {
 	calls      []fleetDependsRequest
 	// onQuery runs before each answer, outside the lock.
 	onQuery func(fleetDependsRequest)
+	// st holds the record documents a plan reads each section's process
+	// chain from (substore_svc_plans_chain.go). put writes a document with
+	// no steps for each revision a record states, unless one is there:
+	// setSteps writes the steps a test needs.
+	st *store.Store
 }
 
 func newSubStoreFakeGraph() *subStoreFakeGraph {
@@ -38,11 +46,69 @@ func (f *subStoreFakeGraph) put(facts fleetDependsFacts) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.records[facts.ID] = facts
+	if f.st != nil {
+		f.putDocumentIfAbsent(subStoreRecordKey(facts.ID), facts.Revision != "", map[string]any{"id": facts.ID})
+		f.putDocumentIfAbsent(subStoreStagedKey(facts.ID), facts.StagedRevision != "", map[string]any{"record": map[string]any{"id": facts.ID}})
+	}
 	if facts.FleetBound || facts.Source == subStoreSourceFleet || facts.StagedSource == subStoreSourceFleet {
 		f.unionFleet[facts.ID] = true
 	}
 	if facts.OwnerCredentials || subStoreLegacySource(facts.Source) {
 		f.unionOwner[facts.ID] = true
+	}
+}
+
+// putDocumentIfAbsent writes a record document under key when want is set
+// and none is stored there.
+func (f *subStoreFakeGraph) putDocumentIfAbsent(key string, want bool, doc map[string]any) {
+	if !want {
+		return
+	}
+	if _, ok := f.st.KVEntry(usageSubStoreKVBucket, key); ok {
+		return
+	}
+	raw, _ := json.Marshal(doc)
+	if err := f.st.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: key, Value: string(raw)}); err != nil {
+		panic(err)
+	}
+}
+
+// putSubStoreChainDocuments writes a live and a staged record document with
+// no steps for id where none is stored, for a test that answers depends_on
+// with a fake of its own: propose reads each side's process chain from them
+// (substore_svc_plans_chain.go).
+func putSubStoreChainDocuments(t testing.TB, st *store.Store, id string) {
+	t.Helper()
+	for key, doc := range map[string]any{
+		subStoreRecordKey(id): map[string]any{"id": id},
+		subStoreStagedKey(id): map[string]any{"record": map[string]any{"id": id}},
+	} {
+		if _, ok := st.KVEntry(usageSubStoreKVBucket, key); ok {
+			continue
+		}
+		raw, _ := json.Marshal(doc)
+		if err := st.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: key, Value: string(raw)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// setSteps stores a record's process steps in its live document, or in its
+// staged one, as the plugin's store writes them.
+func (f *subStoreFakeGraph) setSteps(t testing.TB, id string, staged bool, steps ...json.RawMessage) {
+	t.Helper()
+	record := map[string]any{"id": id, "process": steps}
+	var doc any = record
+	key := subStoreRecordKey(id)
+	if staged {
+		doc, key = map[string]any{"record": record, "base_revision": f.records[id].Revision, "staged_at": "2026-10-16T00:00:00Z"}, subStoreStagedKey(id)
+	}
+	raw, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.PutKV(model.KVEntry{Bucket: usageSubStoreKVBucket, Key: key, Value: string(raw)}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -154,6 +220,7 @@ func (f *subStoreFakeGraph) answer(_ context.Context, _ string, payload []byte) 
 func installSubStoreFakeGraph(t testing.TB, srv *Server) *subStoreFakeGraph {
 	t.Helper()
 	g := newSubStoreFakeGraph()
+	g.st = srv.store
 	srv.substoreCatalogue.deps.query = g.answer
 	return g
 }

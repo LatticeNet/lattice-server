@@ -120,11 +120,12 @@ const (
 	subStorePlanStaleLive    = "the record's live revision moved since this plan was proposed; propose it again"
 	subStorePlanStaleStaged  = "the staged revision this plan publishes was replaced or discarded since it was proposed; propose the new one"
 	subStorePlanStaleClosure = "the records this plan covers changed since it was proposed: a collection started or stopped reading one of them; propose it again"
+	subStorePlanStaleChain   = "a record's process steps changed since this plan was proposed; propose it again"
 )
 
 // subStorePlanStaleReasons are the stale reasons, for the status row.
 var subStorePlanStaleReasons = []string{subStorePlanStalePlugin, subStorePlanStaleShares, subStorePlanStaleReceive,
-	subStorePlanStaleLive, subStorePlanStaleStaged, subStorePlanStaleClosure}
+	subStorePlanStaleLive, subStorePlanStaleStaged, subStorePlanStaleClosure, subStorePlanStaleChain}
 
 // subStoreCoreOnlyReason is the gateway's refusal of apply_revision, and
 // subStoreFetchCoreOnlyReason its refusal of fetch.
@@ -274,6 +275,9 @@ type subStorePlan struct {
 	RecordKind      string            `json:"record_kind,omitempty"`
 	MemberRevisions map[string]string `json:"member_revisions,omitempty"`
 	BeforeEmpty     bool              `json:"before_empty,omitempty"`
+	// Chain is the request's own record's process chain, as a section
+	// carries it (subStorePlanChain).
+	Chain *subStorePlanChain `json:"chain,omitempty"`
 	// Totals counts every record the plan covers; PrimaryTotals the
 	// request's own record.
 	Totals        subStorePlanTotals  `json:"totals"`
@@ -318,7 +322,12 @@ type subStorePlanRecord struct {
 	// BeforeEmpty says the before side was taken as empty without a render:
 	// a restored record has no live revision, and a collection mixed by a
 	// partial migration serves nothing to anyone.
-	BeforeEmpty   bool                       `json:"before_empty,omitempty"`
+	BeforeEmpty bool `json:"before_empty,omitempty"`
+	// Chain is the record's process chain on each side, hashed, with a
+	// plain line per step added, removed or changed, so a revision that
+	// only changes a step shows in the plan and in its hash. A staged-only
+	// section has none (substore_svc_plans_chain.go).
+	Chain         *subStorePlanChain         `json:"chain,omitempty"`
 	Totals        subStorePlanTotals         `json:"totals"`
 	Shares        []subStorePlanShare        `json:"shares"`
 	UnboundShares []subStorePlanUnboundShare `json:"unbound_shares"`
@@ -750,7 +759,10 @@ func subStoreBuildClearPlan(spec subStorePlanSpec, shares []model.SubscriptionSh
 // subStorePlanProposeError maps a preview failure to propose's reply.
 func subStorePlanProposeError(err error) error {
 	var previewErr *subStorePlanPreviewError
+	var chainErr *errSubStorePlanChainUnreadable
 	switch {
+	case errors.As(err, &chainErr):
+		return subStorePlanChainProposeError(chainErr)
 	case errors.Is(err, errSubStorePlanNotLive):
 		return rpcAPIError(http.StatusConflict, subStoreSvcErrConflict, "from_revision is not the record's live revision; propose from the live revision")
 	case errors.Is(err, errSubStorePlanNoPreviewer):

@@ -984,6 +984,7 @@ func TestProposeRunsImmediatelyAfterApply(t *testing.T) {
 			FleetBound: true, StagedRevision: next, StagedSource: subStoreSourceFleet}},
 			"fleet_bound": []string{"fleet-1"}, "owner_credentials": []string{}, "edges": []fleetDependsEdge{}, "version": "t"})
 	}
+	putSubStoreChainDocuments(t, env.st, "fleet-1")
 	propose := func(from, to string) subStorePlansProposeReply {
 		t.Helper()
 		ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, subStoreSvcAdmin)

@@ -993,6 +993,48 @@ func TestStagedRevisionServesOnlyAfterApproval(t *testing.T) {
 	serves("after the approval", 3)
 }
 
+// TestChainOnlyRevisionShowsInThePlan (S2 security review, S2-SR-2): a
+// revision of a fleet-bound record that only adds a Script Operator passing
+// every node through is staged by the real plugin, and core's plan, read
+// from the plugin's own record documents, names the added step by position
+// and type, without its program, and moves the chain digest; with the chain
+// as proposed, the decision's check passes and the revision applies.
+func TestChainOnlyRevisionShowsInThePlan(t *testing.T) {
+	env := newS2Env(t, 3, 2, 1)
+	live := env.live(t, fleetRecord("fleet"))
+	env.createShare(t, "fleet", "alice-chain", e2eAliceID)
+	saved := env.save(t, fleetRecord("fleet", scriptOperatorStep("function operator(proxies) { return proxies } // SR2-PROGRAM-MARKER")))
+	if !saved.Staged || saved.BaseRevision != live {
+		t.Fatalf("the step was not staged over the live revision: %+v", saved)
+	}
+	reply := env.propose(t, map[string]any{"subscription_id": "fleet", "from_revision": live, "to_revision": saved.StagedRevision})
+	if !reply.Required || reply.Status != model.ApprovalPending {
+		t.Fatalf("propose: %+v", reply)
+	}
+	var plan subStorePlan
+	if err := json.Unmarshal([]byte(reply.Plan), &plan); err != nil {
+		t.Fatal(err)
+	}
+	// The step passes every node through, so every line binds as before:
+	// the chain is the only change the plan can show.
+	if plan.Totals.Identities != 1 || plan.Totals.Added+plan.Totals.Removed+plan.Totals.Changed+plan.Totals.Excluded != 0 {
+		t.Fatalf("the chain-only revision moved lines: %+v", plan.Totals)
+	}
+	if plan.Chain == nil || plan.Chain.Before == "" || plan.Chain.After == "" || plan.Chain.Before == plan.Chain.After ||
+		strings.Join(plan.Chain.Changes, "|") != "step 1 added: Script Operator" {
+		t.Fatalf("the plan's chain: %+v", plan.Chain)
+	}
+	if strings.Contains(reply.Plan, "SR2-PROGRAM-MARKER") || strings.Contains(reply.Plan, "function operator") {
+		t.Fatal("the plan shows the step's program")
+	}
+	if code, body := env.approve(t, reply); code != http.StatusOK {
+		t.Fatalf("approve with the chain as proposed: %d %.300s", code, body)
+	}
+	if e := env.entry(t, "fleet"); e.Revision != saved.StagedRevision {
+		t.Fatalf("the approved revision is not live: %+v", e)
+	}
+}
+
 // TestClearOnlyPlanProposedThroughGateway: an identity-bound share on a
 // record that renders a document (left from before S2) answers the decoy;
 // a clear-only plan proposed through the plugin gateway, with the real

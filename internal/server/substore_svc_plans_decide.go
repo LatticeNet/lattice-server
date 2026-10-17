@@ -263,6 +263,12 @@ func (s *Server) subStorePlanStaleReason(approval model.Approval, plan subStoreP
 		if facts.Revision != section.FromRevision {
 			return subStorePlanStaleLive
 		}
+		// The revisions are what depends_on reports; the steps are read
+		// from the documents themselves, so a chain that moved under an
+		// unchanged revision id is caught too.
+		if !s.subStorePlanChainHolds(section) {
+			return subStorePlanStaleChain
+		}
 	}
 	live := s.subStorePlanSharesOf(slices.Collect(func(yield func(string) bool) {
 		for id := range plan.shareMaps() {

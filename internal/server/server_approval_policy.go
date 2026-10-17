@@ -28,7 +28,8 @@ type approvalAutoRule struct {
 	Name string `json:"name"`
 	// Writer exact-matches the approval's creator (ActorID); empty matches any.
 	Writer string `json:"writer"`
-	// Plugin exact-matches the approval's plugin; empty matches any.
+	// Plugin exact-matches the approval's plugin; empty matches any plugin
+	// except those in approvalPluginsNamedOnly.
 	Plugin string `json:"plugin"`
 	// ActionPrefix prefix-matches the approval's action; empty matches any.
 	ActionPrefix string `json:"action_prefix"`
@@ -69,8 +70,19 @@ func parseApprovalAutoRules(raw string) ([]approvalAutoRule, error) {
 	return rules, nil
 }
 
+// approvalPluginsNamedOnly are the approval plugins a rule matches only when
+// it names the plugin itself. A Sub-Store plan changes what existing
+// identity holders receive across the fleet, so a rule written for some
+// other writer or action (a rule that leaves plugin empty matches every
+// plugin) must not approve one by accident. Every other plugin keeps the
+// wildcard, so existing rules behave as they did.
+var approvalPluginsNamedOnly = map[string]bool{subStorePlanApprovalPlugin: true}
+
 // matches reports whether the rule applies to a freshly submitted approval.
 func (r approvalAutoRule) matches(a model.Approval) bool {
+	if r.Plugin == "" && approvalPluginsNamedOnly[a.Plugin] {
+		return false
+	}
 	if r.Writer != "" && r.Writer != a.ActorID {
 		return false
 	}

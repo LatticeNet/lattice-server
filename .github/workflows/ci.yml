@@ -30,6 +30,12 @@ jobs:
       - name: docker defaults contract
         working-directory: lattice-server
         run: sh scripts/check-docker-defaults.sh
+      - name: m3 golden drift
+        working-directory: lattice-server
+        # The console pinned in dashboard.ref keeps copies of
+        # internal/server/testdata/m3-golden/ and must carry these bytes; the
+        # step skips only for a console that predates the copies.
+        run: sh scripts/check-m3-golden-drift.sh
       - name: vet
         working-directory: lattice-server
         run: go vet ./...

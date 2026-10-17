@@ -230,3 +230,84 @@ export interface ShareRow {
   updated_at: string;
   rotated_at?: string;
 }
+
+export interface ScriptNetworkStep {
+  position: number;
+  type: string;
+}
+
+export interface ScriptNetworkRefusal {
+  code: string;
+  message: string;
+  request_id: string;
+  record?: string;
+  step?: ScriptNetworkStep;
+}
+
+// A fleet_script_network_unavailable refusal as core words it, from
+// internal/server/testdata/script_network_refusals.json. The plugin bridge relays a
+// host error's message and code only, so the UI reads the record and the step
+// back out of the message; the server's TestScriptNetworkRefusalSamples holds
+// each message to the refusal core builds.
+export interface ScriptNetworkRefusalSample {
+  name: string;
+  rendered: string;
+  record: string;
+  step?: ScriptNetworkStep;
+  message: string;
+}
+
+export const scriptNetworkRefusalSamples: ScriptNetworkRefusalSample[] = [
+  {
+    "name": "a step of the rendered record's own chain",
+    "rendered": "jp-fleet",
+    "record": "jp-fleet",
+    "step": {
+      "position": 2,
+      "type": "Script Operator"
+    },
+    "message": "fleet_script_network_unavailable: a step asked for the network while record \"jp-fleet\" rendered, and a chain that reaches fleet nodes runs without one until S3; step 2 (Script Operator) of record \"jp-fleet\" is the first step in that render that can ask for it, so remove the network call or the step"
+  },
+  {
+    "name": "a provider member's step, read through the fleet-bound combination that rendered",
+    "rendered": "family-plus",
+    "record": "paid-extra",
+    "step": {
+      "position": 1,
+      "type": "Script Filter"
+    },
+    "message": "fleet_script_network_unavailable: a step asked for the network while record \"family-plus\" rendered, and a chain that reaches fleet nodes runs without one until S3; step 1 (Script Filter) of record \"paid-extra\" is the first step in that render that can ask for it, so remove the network call or the step"
+  },
+  {
+    "name": "a step of an unsaved draft",
+    "rendered": "",
+    "record": "",
+    "step": {
+      "position": 3,
+      "type": "Resolve Domain Operator"
+    },
+    "message": "fleet_script_network_unavailable: a step asked for the network while the draft rendered, and a chain that reaches fleet nodes runs without one until S3; step 3 (Resolve Domain Operator) of the draft is the first step in that render that can ask for it, so remove the network call or the step"
+  },
+  {
+    "name": "no step that can ask was found",
+    "rendered": "jp-fleet",
+    "record": "jp-fleet",
+    "message": "fleet_script_network_unavailable: a step asked for the network while record \"jp-fleet\" rendered, and a chain that reaches fleet nodes runs without one until S3; remove the network call or the Script or Resolve Domain step that makes it"
+  },
+  {
+    "name": "a draft where no step was found",
+    "rendered": "",
+    "record": "",
+    "message": "fleet_script_network_unavailable: a step asked for the network while the draft rendered, and a chain that reaches fleet nodes runs without one until S3; remove the network call or the Script or Resolve Domain step that makes it"
+  },
+  {
+    "name": "record ids with a quote, a space and CJK, as the store allows",
+    "rendered": "东京 \"lines\"",
+    "record": "provider's \"extra\" 2",
+    "step": {
+      "position": 12,
+      "type": "Script Operator"
+    },
+    "message": "fleet_script_network_unavailable: a step asked for the network while record \"东京 \\\"lines\\\"\" rendered, and a chain that reaches fleet nodes runs without one until S3; step 12 (Script Operator) of record \"provider's \\\"extra\\\" 2\" is the first step in that render that can ask for it, so remove the network call or the step"
+  }
+];

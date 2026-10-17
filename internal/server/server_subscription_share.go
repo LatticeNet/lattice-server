@@ -538,6 +538,9 @@ func (s *Server) subscriptionCacheSnapshotForSource(pluginID, subscriptionID str
 // classification without copying or deriving content from an untrusted
 // plugin/provider diagnostic (which can contain low-entropy credentials, URIs,
 // keys, or arbitrarily large text) into logs, durable state, or audit evidence.
+// A plugin refusal whose code core knows (substoreScriptNetworkRefused) adds
+// that fixed code, so a share that stops serving because its chain asked for
+// the network says so in the log; nothing of the text is copied.
 func subscriptionDiagnosticSummary(err error) string {
 	if err == nil {
 		return "class=nil bytes=0"
@@ -547,6 +550,9 @@ func subscriptionDiagnosticSummary(err error) string {
 	bytes := len(text)
 	if bytes > maxReportedDiagnosticBytes {
 		bytes = maxReportedDiagnosticBytes
+	}
+	if substoreScriptNetworkRefused(err) {
+		return fmt.Sprintf("class=%T code=%s bytes<=%d", err, apiErrorFleetScriptNetworkUnavailable, bytes)
 	}
 	return fmt.Sprintf("class=%T bytes<=%d", err, bytes)
 }

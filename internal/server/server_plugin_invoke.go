@@ -343,6 +343,13 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		}
 	} else {
 		dispatch()
+		// Sub-Store's refusal of an editor preview whose chain asked for
+		// the network over fleet nodes is answered as core answers it on
+		// the plan paths (substore_script_network.go), not relayed as the
+		// plugin's text.
+		if err != nil && substoreScriptNetworkRelayMethod(req.ID, req.Service, req.Method) && substoreScriptNetworkRefused(err) {
+			err = s.substoreScriptNetworkRelayRefusal(payload)
+		}
 	}
 	finishSubscriptionMutation()
 	if err != nil {

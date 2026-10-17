@@ -117,6 +117,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Design 30: unset keeps plugin children on the server's uid. The system
+	// runner checks the range against this process's own uid and groups.
+	pluginUIDs, err := plugin.ParsePluginUIDRange(os.Getenv("LATTICE_PLUGIN_UID_BASE"), os.Getenv("LATTICE_PLUGIN_UID_RANGE"))
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	trustPolicy, err := loadPluginTrust(pluginTrust)
 	if err != nil {
@@ -147,6 +153,13 @@ func main() {
 		log.Printf("WARNING: at-rest encryption is DISABLED; stored credentials (TOTP secrets, API tokens, notify configs) are written in plaintext")
 	default:
 		log.Printf("at-rest encryption: enabled (key source: %s)", keyRes.Source)
+	}
+	// Design 30: a plugin whose uid owns a data file or the master key would
+	// own the server's secrets, so the drop is not armed over such a file.
+	if pluginUIDs != nil {
+		if err := pluginUIDs.CheckOwnership(dataDir, keyRes.KeyFilePath); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	st, err := store.OpenWithCipher(dataPath, keyRes.Cipher)
@@ -262,6 +275,7 @@ func main() {
 		PluginRuntimeDir:     pluginRuntimeDir,
 		PluginRuntimeEnv:     pluginRuntimeEnvAllowlist,
 		PluginRuntimePool:    pluginRuntimePool,
+		PluginUIDs:           pluginUIDs,
 		PluginTrust:          trustPolicy,
 		PublicURL:            publicURL,
 		ProbeSocket:          os.Getenv("LATTICE_PROBE_SOCKET"),

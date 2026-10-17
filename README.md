@@ -234,13 +234,50 @@ and keeps the newest 10 stale untagged versions by default as a rollback buffer.
 
 The container leaves `LATTICE_MASTER_KEY_FILE` unset by default so first boot can
 generate `/var/lib/lattice/master.key` automatically. Set it only when restoring
-or mounting a pre-existing key. The entrypoint fixes ownership of the mounted
-data directory before dropping privileges to the `lattice` user.
+or mounting a pre-existing key. The entrypoint chowns the mounted data
+directory to `lattice:lattice` when anything in it, the directory included, has
+another owner or group (a fresh bind mount, or a restore, `docker cp` or extract
+run as another user), then drops privileges to the `lattice` user. A tree
+`lattice` owns throughout is left alone, so an ordinary boot needs no
+`CAP_CHOWN`; without `CAP_CHOWN`, a tree that needs the repair stops the boot.
 
 Manifest-v2 plugins require a writable private extraction cache, for example
 `LATTICE_PLUGIN_BUNDLE_CACHE_DIR=/var/lib/lattice/plugin-bundles`. Keep this
 separate from both the read-only plugin source mount (`LATTICE_PLUGIN_DIR`) and
 the executable working directories (`LATTICE_PLUGIN_RUNTIME_DIR`).
+
+System plugin children can run as their own uid instead of the server's
+(design 30). Set `LATTICE_PLUGIN_UID_BASE` (1000 or higher) and optionally
+`LATTICE_PLUGIN_UID_RANGE` (default 1024), together with
+`LATTICE_PLUGIN_RUNTIME_DIR`: each plugin then runs as a uid from that range,
+with the same number as its gid and no supplementary groups, so it cannot read
+the server's `0600` files, open the probe socket, or signal the server or
+another plugin. The server refuses to start when the base is set without a
+runtime directory, when the range contains its own uid, one of its groups, or
+65532 (lattice-probe), and when a file in the data directory or the master key
+is owned by a uid or group inside the range. With the base set, the runtime
+directory and every directory under it down to a plugin's generation are
+`0711` and the staged artifact is `0555`, all owned by the server, and the
+runner refuses to exec an artifact when any of them has another mode or owner.
+A plugin's uid comes from a hash of its id, so it stays the same across
+restarts unless two ids collide, in which case the later one to load takes the
+next free uid; do not treat a plugin uid as a stable owner for files on disk.
+
+Unset keeps plugins on the server's uid with today's staging: a `0700` working
+directory and artifact, and the runtime directory left at the mode it has.
+
+The image gives `/usr/local/bin/lattice-server` the file capabilities
+`cap_setuid,cap_setgid,cap_kill` for this, so the container must not set
+`no-new-privileges`: with it the server starts with no capabilities and every
+plugin fails to start. File capabilities land on whoever execs the file, so the
+binary is `0750 root:lattice`: the server's own identity can exec it and a
+plugin uid cannot, and the runner refuses to arm the drop from a capped binary
+that a plugin uid could exec. The image carries these capabilities whether or
+not the drop is on, and they narrow the server's reach only once the compose
+also sets `cap_drop: [ALL]` and adds back `SETUID`, `SETGID` and `KILL` (design
+30 S2); until then a server compromise could use `CAP_SETUID` to become
+container root inside Docker's default capability set.
+`scripts/check-image-isolation.sh IMAGE` checks a built image for all of this.
 
 Dashboard static serving is cache-aware: `index.html`, SPA fallback routes, and
 `theme-init.js` are served with `Cache-Control: no-cache`; content-hashed Vite

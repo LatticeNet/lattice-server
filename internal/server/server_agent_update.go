@@ -2123,31 +2123,28 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 	// loses the race against the new agent's first hello the approval is
 	// applied before its task result lands. A result cannot un-apply what the
 	// node has proven, so it is recorded as a task result and nothing else.
+	summary, fetch, hasFetch := s.agentUpdateFetchRecord(approval, payload, result)
 	if approval.Status == model.ApprovalApplied {
-		s.recordAgentUpdateFetch(r, approval, payload, result)
-		return nil
+		return s.recordAgentUpdateFetch(r, approval, payload, summary, fetch, hasFetch)
 	}
-	policy, ok := s.store.AgentUpdatePolicy(payload.NodeID)
-	if !ok {
-		policy = model.AgentUpdatePolicy{NodeID: payload.NodeID}
-	}
-	var status, reason, action, decision string
-	if result.Error == "" && result.ExitCode == 0 {
+	succeeded := result.Error == "" && result.ExitCode == 0
+	var status, reason, lastError, action, decision string
+	if succeeded {
 		reason = agentUpdateAwaitingConfirmationReason(payload.TargetVersion)
-		policy.LastError = reason
+		lastError = reason
 		status, action, decision = model.ApprovalApproved, "agent.update.awaiting_confirmation", "allow"
 	} else {
-		policy.LastError = taskFailureSummary(result)
+		lastError = taskFailureSummary(result)
 		// An execution failure is not a decision: return the approval to
 		// pending with the failure reason attached, so the operator can fix the
 		// cause and re-approve the exact same plan. Marking it rejected burned
 		// the review and left no retry path (2026-08-12 fleet rollout: 20
 		// nodes failed on the rlimit and read as "rejected" in the UI).
-		reason = "execution failed: " + policy.LastError
+		reason = "execution failed: " + lastError
 		status, action, decision = model.ApprovalPending, "agent.update.failed", "deny"
 	}
 	// Same race, other order: the heartbeat can apply the approval between
-	// the read above and this write. Leave an applied row alone.
+	// the status read above and this write. Leave an applied row alone.
 	_, written, err := s.store.MutateApproval(approval.ID, func(current *model.Approval) bool {
 		if current.Status == model.ApprovalApplied {
 			return false
@@ -2161,10 +2158,25 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		return err
 	}
 	if !written {
-		s.recordAgentUpdateFetch(r, approval, payload, result)
-		return nil
+		return s.recordAgentUpdateFetch(r, approval, payload, summary, fetch, hasFetch)
 	}
-	if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
+	// The policy takes this result's last_error and, when the walk printed
+	// one, its fetch record. Only those fields are written, under the store
+	// lock: once the approval reads approved, the node's report can apply it
+	// and write the applied version at any moment, and a whole policy read
+	// before that would put the old version back. A success the report has
+	// already confirmed for this approval keeps the cleared error rather
+	// than "awaiting confirmation". A missing policy is created, as before.
+	var fetchRecord *model.AgentUpdateFetch
+	if hasFetch {
+		fetchRecord = &fetch
+	}
+	if _, err := s.writeAgentUpdateResult(payload.NodeID, approval, true, fetchRecord, func(policy *model.AgentUpdatePolicy) {
+		if succeeded && policy.LastAppliedVersion == payload.TargetVersion && !policy.LastAppliedAt.Before(approval.CreatedAt) {
+			return
+		}
+		policy.LastError = lastError
+	}); err != nil {
 		return err
 	}
 	ev := model.AuditEvent{
@@ -2177,11 +2189,11 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 	// What each source delivered, from the line the walk prints last. It is
 	// kept for success and failure alike: a slow download that finished is
 	// the measurement the next change to the sources needs.
-	if summary, ok := parseAgentFetchSummary(result.Stderr); ok {
+	if hasFetch {
 		ev.Metadata["fetch"] = summary
 	}
 	if decision == "deny" {
-		ev.Reason = policy.LastError
+		ev.Reason = lastError
 	}
 	s.recordRequestAudit(r, ev)
 	return nil
@@ -2190,10 +2202,14 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 // recordAgentUpdateFetch keeps the fetch summary of a result that arrives
 // after the node's own report already applied its approval. Those are often
 // the slow downloads that finished, the measurement the summary exists for.
-func (s *Server) recordAgentUpdateFetch(r *http.Request, approval model.Approval, payload agentUpdatePayload, result model.TaskResult) {
-	summary, ok := parseAgentFetchSummary(result.Stderr)
+// The policy takes last_fetch alone; a policy deleted meanwhile is not
+// re-created for it, and the audit records the line either way.
+func (s *Server) recordAgentUpdateFetch(r *http.Request, approval model.Approval, payload agentUpdatePayload, summary string, fetch model.AgentUpdateFetch, ok bool) error {
 	if !ok {
-		return
+		return nil
+	}
+	if _, err := s.writeAgentUpdateResult(payload.NodeID, approval, false, &fetch, nil); err != nil {
+		return err
 	}
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID:       id.New("audit"),
@@ -2202,6 +2218,64 @@ func (s *Server) recordAgentUpdateFetch(r *http.Request, approval model.Approval
 		Decision: "observe",
 		Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID, "fetch": summary},
 	})
+	return nil
+}
+
+// writeAgentUpdateResult writes what one task result tells a node's policy,
+// field by field under the store lock: set, when given, and fetch as
+// last_fetch, when given and not older than the record the policy holds.
+//
+// Older means planned earlier. The agent keeps results in a durable outbox
+// and can deliver one after a restart, so the result of an older approval
+// can land after a newer approval's; arrival order cannot decide. Within one
+// approval it can: an attempt's result must land before the approval
+// returns to pending and runs again. The record's approval is looked up
+// before the lock is taken, so the write is made only if the policy still
+// holds that record then.
+func (s *Server) writeAgentUpdateResult(nodeID string, approval model.Approval, create bool, fetch *model.AgentUpdateFetch, set func(policy *model.AgentUpdatePolicy)) (bool, error) {
+	var seen string
+	if fetch != nil {
+		if current, ok := s.store.AgentUpdatePolicy(nodeID); ok && current.LastFetch != nil {
+			seen = current.LastFetch.ApprovalID
+			if seen != approval.ID {
+				if prior, ok := s.store.Approval(seen); ok && prior.CreatedAt.After(approval.CreatedAt) {
+					fetch = nil
+				}
+			}
+		}
+	}
+	return s.store.MutateAgentUpdatePolicy(nodeID, create, func(policy *model.AgentUpdatePolicy) bool {
+		changed := false
+		if set != nil {
+			set(policy)
+			changed = true
+		}
+		if fetch != nil {
+			held := ""
+			if policy.LastFetch != nil {
+				held = policy.LastFetch.ApprovalID
+			}
+			if held == seen || held == approval.ID {
+				policy.LastFetch = fetch
+				changed = true
+			}
+		}
+		return changed
+	})
+}
+
+// agentUpdateFetchRecord reads the fetch summary out of a task result: the
+// line the audit keeps, and the record the policy keeps as last_fetch, stamped
+// with the approval, its target and when the control plane received it.
+func (s *Server) agentUpdateFetchRecord(approval model.Approval, payload agentUpdatePayload, result model.TaskResult) (string, model.AgentUpdateFetch, bool) {
+	summary, fetch, ok := parseAgentFetchSummary(result.Stderr)
+	if !ok {
+		return "", model.AgentUpdateFetch{}, false
+	}
+	fetch.ApprovalID = approval.ID
+	fetch.TargetVersion = payload.TargetVersion
+	fetch.At = s.now().UTC()
+	return summary, fetch, true
 }
 
 func agentUpdateAwaitingConfirmationReason(targetVersion string) string {

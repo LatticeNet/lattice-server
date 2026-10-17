@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 // Design 31, S2 and S3: the download walks its sources, leaves a slow one
@@ -547,9 +549,11 @@ var (
 const agentFetchSummaryMaxFields = 9
 
 // parseAgentFetchSummary returns the last lattice-agent-fetch line in a task's
-// output, re-assembled from fields that each passed a strict pattern. The
-// output comes from the node, so nothing else from it is kept.
-func parseAgentFetchSummary(output string) (string, bool) {
+// output, re-assembled from fields that each passed a strict pattern, and the
+// same fields as the record the update policy keeps as last_fetch. The
+// output comes from the node, so nothing else from it is kept. The record
+// carries no approval, version or time; the caller knows those.
+func parseAgentFetchSummary(output string) (string, model.AgentUpdateFetch, bool) {
 	lines := strings.Split(output, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
@@ -559,17 +563,49 @@ func parseAgentFetchSummary(output string) (string, bool) {
 		}
 		fields := strings.Fields(rest)
 		if len(fields) == 0 || len(fields) > agentFetchSummaryMaxFields {
-			return "", false
+			return "", model.AgentUpdateFetch{}, false
 		}
+		var record model.AgentUpdateFetch
 		for _, field := range fields[:len(fields)-1] {
-			if !agentFetchEntryRe.MatchString(field) {
-				return "", false
+			attempt, ok := parseAgentFetchEntry(field)
+			if !ok {
+				return "", model.AgentUpdateFetch{}, false
 			}
+			record.Fetches = append(record.Fetches, attempt)
 		}
-		if !agentFetchResultRe.MatchString(fields[len(fields)-1]) {
-			return "", false
+		last := fields[len(fields)-1]
+		if !agentFetchResultRe.MatchString(last) {
+			return "", model.AgentUpdateFetch{}, false
 		}
-		return agentFetchSummaryPrefix + " " + strings.Join(fields, " "), true
+		// result:<exit>:<stage>, both already held to the pattern.
+		parts := strings.Split(last, ":")
+		record.ExitCode, _ = strconv.Atoi(parts[1])
+		record.Stage = parts[2]
+		return agentFetchSummaryPrefix + " " + strings.Join(fields, " "), record, true
 	}
-	return "", false
+	return "", model.AgentUpdateFetch{}, false
+}
+
+// parseAgentFetchEntry reads one index:kind:exit:bytes:seconds field. The
+// pattern bounds every number well inside its type, so the conversions
+// cannot fail once it matches.
+func parseAgentFetchEntry(field string) (model.AgentUpdateFetchAttempt, bool) {
+	if !agentFetchEntryRe.MatchString(field) {
+		return model.AgentUpdateFetchAttempt{}, false
+	}
+	parts := strings.Split(field, ":")
+	var attempt model.AgentUpdateFetchAttempt
+	if parts[0] == "p2" {
+		attempt.SecondPass = true
+	} else {
+		attempt.Source, _ = strconv.Atoi(parts[0])
+	}
+	attempt.Kind = parts[1]
+	attempt.ExitCode, _ = strconv.Atoi(parts[2])
+	attempt.Bytes, _ = strconv.ParseInt(parts[3], 10, 64)
+	if parts[4] != "-" {
+		seconds, _ := strconv.ParseInt(parts[4], 10, 64)
+		attempt.Seconds = &seconds
+	}
+	return attempt, true
 }

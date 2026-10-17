@@ -386,7 +386,7 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 		out.calls = strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
 	}
 	out.installed, _ = os.ReadFile(target)
-	out.summary, _ = parseAgentFetchSummary(out.stderr)
+	out.summary, _, _ = parseAgentFetchSummary(out.stderr)
 	return out
 }
 
@@ -781,7 +781,7 @@ func TestAgentUpdateTaskResultRecordsTheFetchSummary(t *testing.T) {
 		{"lattice-agent-fetch v2 1:cp:0:1:1 result:0:done", ""},
 		{"no summary at all", ""},
 	} {
-		got, ok := parseAgentFetchSummary(tc.output)
+		got, _, ok := parseAgentFetchSummary(tc.output)
 		if got != tc.want || ok != (tc.want != "") {
 			t.Fatalf("parse %q = %q %t, want %q", tc.output, got, ok, tc.want)
 		}
@@ -806,7 +806,7 @@ func TestAgentUpdateTaskResultRecordsTheFetchSummary(t *testing.T) {
 			t.Fatal(err)
 		}
 		ev, ok := lastAuditFor(st, tc.action)
-		if want, _ := parseAgentFetchSummary(tc.result.Stderr); !ok || ev.Metadata["fetch"] != want {
+		if want, _, _ := parseAgentFetchSummary(tc.result.Stderr); !ok || ev.Metadata["fetch"] != want {
 			t.Fatalf("%s must record the fetch summary %q, got %v", tc.action, want, ev.Metadata)
 		}
 	}

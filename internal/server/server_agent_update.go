@@ -67,6 +67,14 @@ type agentUpdatePayload struct {
 	// release. The digest check is the same for both URLs. Approvals planned
 	// before this field existed decode as empty and render no fallback.
 	FallbackURL string `json:"fallback_url,omitempty"`
+	// ResumeDownload keeps an interrupted download beside the install path,
+	// in a file named by the pinned digest, so the next attempt continues it
+	// instead of starting from byte zero. 2026-10-17: four nodes fetching at
+	// 15 to 18 KB/s pulled 7 to 9 MB of a 14 MB agent before the 480 s budget
+	// ran out, and every retry started over, so they could never update.
+	// Every plan made now sets it. Approvals planned before this field existed
+	// decode as false and render the download they were approved with.
+	ResumeDownload bool `json:"resume_download,omitempty"`
 }
 
 type agentReleaseInfoView struct {
@@ -551,12 +559,13 @@ func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.Agent
 	if (binaryRaw == "") != (shaRaw == "") {
 		return agentUpdatePayload{}, errors.New("binary_url and sha256 must be provided together, or both left empty for the official release")
 	}
+	var payload agentUpdatePayload
 	if binaryRaw != "" {
 		normalized, err := sNormalizeAgentUpdatePayload(policy)
 		if err != nil {
 			return agentUpdatePayload{}, err
 		}
-		return s.withControlPlaneBinarySource(node, agentUpdatePayload{
+		payload = s.withControlPlaneBinarySource(node, agentUpdatePayload{
 			NodeID:         normalized.NodeID,
 			CurrentVersion: strings.TrimSpace(node.AgentVersion),
 			TargetVersion:  normalized.TargetVersion,
@@ -564,9 +573,16 @@ func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.Agent
 			SHA256:         normalized.SHA256,
 			InstallPath:    normalized.InstallPath,
 			ServiceName:    normalized.ServiceName,
-		}), nil
+		})
+	} else {
+		resolved, err := s.resolveOfficialAgentUpdatePayload(node, policy)
+		if err != nil {
+			return agentUpdatePayload{}, err
+		}
+		payload = resolved
 	}
-	return s.resolveOfficialAgentUpdatePayload(node, policy)
+	payload.ResumeDownload = true
+	return payload, nil
 }
 
 // withControlPlaneBinarySource points a payload at the control plane when it
@@ -988,11 +1004,17 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	fmt.Fprintf(&b, "sha256: %s\n", payload.SHA256)
 	fmt.Fprintf(&b, "install_path: %s\n", payload.InstallPath)
 	fmt.Fprintf(&b, "service_name: %s\n", payload.ServiceName)
+	if payload.ResumeDownload {
+		fmt.Fprintf(&b, "resume_download: true\n")
+	}
 	fmt.Fprintf(&b, "\nSafety:\n")
 	if normalizeAgentBinarySource(payload.BinarySource) == agentBinarySourceControlPlane {
 		fmt.Fprintf(&b, "- the binary comes from this control plane, so the node needs no third-party egress\n")
 		fmt.Fprintf(&b, "- the control plane re-verifies the stored bytes against this digest before serving them\n")
-		if payload.FallbackURL != "" {
+		switch {
+		case payload.FallbackURL != "" && payload.ResumeDownload:
+			fmt.Fprintf(&b, "- if the control-plane download fails, the node fetches fallback_url once, without the task lease, continuing from what the control plane already sent, and verifies the result against the same digest; with curl the fallback gets what is left of the same %s s download budget\n", agentFetchBudgetSec)
+		case payload.FallbackURL != "":
 			fmt.Fprintf(&b, "- if the control-plane download fails, the node fetches fallback_url once, without the task lease, and verifies it against the same digest; with curl the fallback gets what is left of the same %s s download budget\n", agentFetchBudgetSec)
 		}
 	} else {
@@ -1003,6 +1025,9 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	fmt.Fprintf(&b, "- binary is installed atomically with a timestamped backup\n")
 	fmt.Fprintf(&b, "- service restart is delayed so the current agent can post the task result\n")
 	fmt.Fprintf(&b, "- the download gives up after %s s without a connection or %s s in total, so a node without egress to the source fails the task instead of hanging it\n", agentFetchConnectSec, agentFetchBudgetSec)
+	if payload.ResumeDownload {
+		fmt.Fprintf(&b, "%s\n", agentUpdateResumePlanLine)
+	}
 	fmt.Fprintf(&b, "- default/legacy install targets follow the running lattice-agent path and default service may follow the running systemd unit\n")
 	fmt.Fprintf(&b, "%s\n", agentUpdateKeepalivePlanLine)
 	fmt.Fprintf(&b, "%s\n", agentUpdateGuardPlanLine)
@@ -1207,6 +1232,7 @@ func agentUpdatePayloadFromApproval(approval model.Approval) (agentUpdatePayload
 		ServiceName:    normalized.ServiceName,
 		BinarySource:   source,
 		FallbackURL:    fallbackURL,
+		ResumeDownload: payload.ResumeDownload,
 	}, nil
 }
 
@@ -1302,6 +1328,9 @@ func agentUpdatePayloadChangeSummary(planned, current agentUpdatePayload) string
 	}
 	if planned.ServiceName != current.ServiceName {
 		changes = append(changes, fmt.Sprintf("service_name planned=%s current=%s", planned.ServiceName, current.ServiceName))
+	}
+	if planned.ResumeDownload != current.ResumeDownload {
+		changes = append(changes, fmt.Sprintf("resume_download planned=%t current=%t", planned.ResumeDownload, current.ResumeDownload))
 	}
 	if len(changes) == 0 {
 		return "resolved update payload changed"
@@ -1489,6 +1518,12 @@ func (s *Server) agentUpdateApprovalLocalStaleness(approval model.Approval) (boo
 		current.ServiceName = policy.ServiceName
 		changed = true
 	}
+	// Every plan made now resumes an interrupted download, so one planned
+	// before that would rerun the download that cannot finish on a slow node.
+	if !payload.ResumeDownload {
+		current.ResumeDownload = true
+		changed = true
+	}
 	target, err := normalizeOfficialAgentTarget(policy.TargetVersion)
 	if err != nil {
 		return true, agentUpdateApprovalStaleReasonWithDetails("target_version is invalid: " + err.Error())
@@ -1584,11 +1619,8 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"  exit 1\n" +
 		"fi\n" +
 		agentUpdateLeasePreflight(source) +
-		"WORK=$(mktemp -d \"${TMPDIR:-/tmp}/lattice-agent-update.XXXXXX\")\n" +
-		"cleanup() { rm -rf \"$WORK\"; }\n" +
-		"trap cleanup EXIT\n" +
-		"CANDIDATE=\"$WORK/lattice-agent\"\n" +
-		agentUpdateDownloadStep(source, payload.FallbackURL != "") +
+		agentUpdateCandidateStep(payload.ResumeDownload) +
+		agentUpdateFetchStep(source, payload.FallbackURL != "", payload.ResumeDownload) +
 		"if command -v sha256sum >/dev/null 2>&1; then\n" +
 		"  ACTUAL_SHA=$(sha256sum \"$CANDIDATE\" | awk '{print $1}')\n" +
 		"elif command -v shasum >/dev/null 2>&1; then\n" +
@@ -1597,11 +1629,8 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"  echo 'lattice agent update: sha256sum or shasum is required' >&2\n" +
 		"  exit 1\n" +
 		"fi\n" +
-		"if [ \"$ACTUAL_SHA\" != \"$EXPECT_SHA\" ]; then\n" +
-		"  echo \"lattice agent update: sha256 mismatch expected=$EXPECT_SHA actual=$ACTUAL_SHA\" >&2\n" +
-		"  exit 1\n" +
-		"fi\n" +
-		"chmod 0755 \"$CANDIDATE\"\n" +
+		agentUpdateDigestMismatchStep(payload.ResumeDownload) +
+		agentUpdateVerifiedModeStep(payload.ResumeDownload) +
 		"CANDIDATE_VERSION=$(\"$CANDIDATE\" -version)\n" +
 		"if [ \"$CANDIDATE_VERSION\" != \"$TARGET_VERSION\" ]; then\n" +
 		"  echo \"lattice agent update: version mismatch expected=$TARGET_VERSION actual=$CANDIDATE_VERSION\" >&2\n" +
@@ -1616,6 +1645,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"fi\n" +
 		"install -m 0755 \"$CANDIDATE\" \"$TARGET.new\"\n" +
 		"mv \"$TARGET.new\" \"$TARGET\"\n" +
+		agentUpdateInstalledStep(payload.ResumeDownload) +
 		agentUpdateKeepaliveStep(approval.Plan) +
 		"systemctl daemon-reload\n" +
 		agentUpdateGuardStep(approval.Plan) +
@@ -1676,6 +1706,33 @@ const (
 	agentFetchBudgetSec    = "480"
 	agentFetchCurlTimeouts = " --connect-timeout " + agentFetchConnectSec + " --max-time " + agentFetchBudgetSec
 	agentFetchWgetTimeouts = " --timeout=" + agentFetchConnectSec + " --tries=2"
+
+	// The task lease, as the control-plane fetch presents it and no other
+	// fetch ever does.
+	agentFetchCurlLease = " -H \"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
+		" -H \"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\""
+	agentFetchWgetLease = " --header=\"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
+		" --header=\"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\""
+)
+
+// A download that does not finish inside one budget is kept and continued by
+// the next attempt. The budget cannot grow (see above), and on 2026-10-17 four
+// nodes at 15 to 18 KB/s needed 800 to 950 s for the 14 MB agent: each attempt
+// pulled 7 to 9 MB and the next started from byte zero again. Kept, two
+// attempts finish it.
+//
+// agentUpdatePartialPrefix names the kept file. It lives beside the installed
+// binary, in the directory the script already writes the new binary and its
+// backup into, and the pinned digest completes the name. The digest is
+// validated as 64 lowercase hex characters before any script renders, so
+// nothing a caller supplies can steer the path.
+//
+// The plan states the behaviour, reading the name and the budget from here.
+const (
+	agentUpdatePartialPrefix  = ".lattice-agent-download-"
+	agentUpdateResumePlanLine = "- an interrupted download is kept beside the install path as " + agentUpdatePartialPrefix +
+		"<sha256>, readable by root only, and the next attempt continues it instead of starting over, so a node too slow to fetch the binary inside one " +
+		agentFetchBudgetSec + " s budget finishes it over successive attempts; the finished file is held to the pinned digest and deleted if it fails, and kept downloads for any other digest are removed first"
 )
 
 // agentUpdateFallbackURLLine declares the fallback URL for a plan that has one
@@ -1699,8 +1756,6 @@ func agentUpdateDownloadStep(source string, withFallback bool) string {
 	curl := "curl -fsSL --proto '=https' --tlsv1.2" + agentFetchCurlTimeouts + " -o \"$CANDIDATE\" \"$URL\""
 	wget := "wget --https-only -q" + agentFetchWgetTimeouts + " -O \"$CANDIDATE\" \"$URL\""
 	if source == agentBinarySourceControlPlane {
-		leaseHeaders := " -H \"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
-			" -H \"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\""
 		// No redirect following on the credentialed fetch. curl only strips the
 		// standard Authorization header across a cross-host redirect, never a
 		// custom -H, and wget strips nothing, so a 3xx from anything in front of
@@ -1711,11 +1766,8 @@ func agentUpdateDownloadStep(source string, withFallback bool) string {
 		// the current proxy configuration. The upstream branch keeps following
 		// redirects, because release assets legitimately land on CDN storage,
 		// and it carries no credential.
-		curl = "curl -fsS --proto '=https' --tlsv1.2" + agentFetchCurlTimeouts + leaseHeaders + " -o \"$CANDIDATE\" \"$URL\""
-		wget = "wget --https-only -q --max-redirect=0" + agentFetchWgetTimeouts +
-			" --header=\"" + agentTaskIDHeader + ": $LATTICE_TASK_ID\"" +
-			" --header=\"" + agentTaskLeaseHeader + ": $LATTICE_TASK_LEASE_ID\"" +
-			" -O \"$CANDIDATE\" \"$URL\""
+		curl = "curl -fsS --proto '=https' --tlsv1.2" + agentFetchCurlTimeouts + agentFetchCurlLease + " -o \"$CANDIDATE\" \"$URL\""
+		wget = "wget --https-only -q --max-redirect=0" + agentFetchWgetTimeouts + agentFetchWgetLease + " -O \"$CANDIDATE\" \"$URL\""
 		if withFallback {
 			return agentUpdateDownloadWithFallback(curl, wget)
 		}
@@ -1778,6 +1830,170 @@ func agentUpdateDownloadWithFallback(controlPlaneCurl, controlPlaneWget string) 
 		"  echo 'lattice agent update: curl or wget is required' >&2\n" +
 		"  exit 1\n" +
 		"fi\n"
+}
+
+// agentUpdateCandidateStep says where the download lands. A plan without
+// resume gets the per-task temp directory, removed on exit, that it was
+// approved with. A plan with resume gets a file beside the install path named
+// by the pinned digest, which outlives the task so a later attempt can
+// continue it, and kept files for any other digest are removed first so the
+// directory holds at most one.
+//
+// A kept file is trusted as far as the directory it lives in, which holds the
+// binary root runs: anyone who can write there can already replace the agent
+// itself. Even so, a kept file is continued only when it is a regular file,
+// not a symlink, owned by the user the script runs as. Anything else at that
+// name is removed and the download starts over, and so does everything on a
+// shell whose test lacks -O. The bytes need no trust: the digest check after
+// the download decides.
+func agentUpdateCandidateStep(resume bool) string {
+	if !resume {
+		return "WORK=$(mktemp -d \"${TMPDIR:-/tmp}/lattice-agent-update.XXXXXX\")\n" +
+			"cleanup() { rm -rf \"$WORK\"; }\n" +
+			"trap cleanup EXIT\n" +
+			"CANDIDATE=\"$WORK/lattice-agent\"\n"
+	}
+	return "PARTIAL_DIR=$(dirname \"$TARGET\")\n" +
+		"mkdir -p \"$PARTIAL_DIR\"\n" +
+		"CANDIDATE=\"$PARTIAL_DIR/" + agentUpdatePartialPrefix + "$EXPECT_SHA\"\n" +
+		"for KEPT in \"$PARTIAL_DIR\"/" + agentUpdatePartialPrefix + "*; do\n" +
+		"  if [ \"$KEPT\" != \"$CANDIDATE\" ]; then rm -rf \"$KEPT\"; fi\n" +
+		"done\n" +
+		"if [ -f \"$CANDIDATE\" ] && [ ! -L \"$CANDIDATE\" ] && [ -O \"$CANDIDATE\" ]; then\n" +
+		"  chmod 0600 \"$CANDIDATE\"\n" +
+		"  echo \"lattice agent update: continuing the download an earlier attempt kept in $CANDIDATE ($(wc -c <\"$CANDIDATE\") bytes)\"\n" +
+		"else\n" +
+		"  rm -rf \"$CANDIDATE\"\n" +
+		"fi\n"
+}
+
+// agentUpdateFetchStep renders the download an approval was planned with.
+func agentUpdateFetchStep(source string, withFallback, resume bool) string {
+	if !resume {
+		return agentUpdateDownloadStep(source, withFallback)
+	}
+	return agentUpdateResumableDownloadStep(source, withFallback)
+}
+
+// agentUpdateResumableDownloadStep is agentUpdateDownloadStep for a plan that
+// resumes. Each fetch continues the kept file from where it ends: curl -C -
+// and wget -c ask for the rest with a Range header, and leave a complete file
+// alone when the server answers 416. The commands are otherwise the ones
+// agentUpdateDownloadStep renders: the same timeouts, the lease only on the
+// control-plane fetch and no redirect following there, and the fallback in
+// the plain upstream form within what is left of the budget.
+//
+// A failed fetch leaves what it received for the next attempt, and the
+// fallback continues the control-plane partial instead of discarding it. The
+// bytes are pinned by digest, so which source sent them does not matter; a
+// file spliced from two different binaries fails the digest check after this
+// step and is deleted there. The one failure that discards the partial is
+// curl's 33, a server that ignored the range: the partial cannot be continued
+// from that server, so the next fetch starts over, as it did before resume.
+func agentUpdateResumableDownloadStep(source string, withFallback bool) string {
+	curl := "curl -fsSL --proto '=https' --tlsv1.2" + agentFetchCurlTimeouts + " -C - -o \"$CANDIDATE\" \"$URL\""
+	wget := "wget --https-only -q" + agentFetchWgetTimeouts + " -c -O \"$CANDIDATE\" \"$URL\""
+	if source == agentBinarySourceControlPlane {
+		curl = "curl -fsS --proto '=https' --tlsv1.2" + agentFetchCurlTimeouts + agentFetchCurlLease + " -C - -o \"$CANDIDATE\" \"$URL\""
+		wget = "wget --https-only -q --max-redirect=0" + agentFetchWgetTimeouts + agentFetchWgetLease + " -c -O \"$CANDIDATE\" \"$URL\""
+	}
+	const dropUnresumable = "  if [ \"$FETCH_STATUS\" = 33 ]; then rm -f \"$CANDIDATE\"; fi\n"
+	const keepOrFail = "if [ \"$FETCH_STATUS\" != 0 ]; then\n" +
+		"  if [ -s \"$CANDIDATE\" ]; then\n" +
+		"    echo \"lattice agent update: download failed; kept the $(wc -c <\"$CANDIDATE\") bytes received so far for the next attempt to continue\" >&2\n" +
+		"  fi\n" +
+		"  exit \"$FETCH_STATUS\"\n" +
+		"fi\n"
+	if source != agentBinarySourceControlPlane || !withFallback {
+		return "FETCH_STATUS=0\n" +
+			"if command -v curl >/dev/null 2>&1; then\n" +
+			"  " + curl + " || FETCH_STATUS=$?\n" +
+			dropUnresumable +
+			"elif command -v wget >/dev/null 2>&1; then\n" +
+			"  " + wget + " || FETCH_STATUS=$?\n" +
+			"else\n" +
+			"  echo 'lattice agent update: curl or wget is required' >&2\n" +
+			"  exit 1\n" +
+			"fi\n" +
+			keepOrFail
+	}
+	fallbackCurl := "curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout " + agentFetchConnectSec +
+		" --max-time \"$FETCH_LEFT\" -C - -o \"$CANDIDATE\" \"$FALLBACK_URL\""
+	fallbackWget := "wget --https-only -q" + agentFetchWgetTimeouts + " -c -O \"$CANDIDATE\" \"$FALLBACK_URL\""
+	unknownLeft := "FETCH_LEFT=$((" + agentFetchBudgetSec + " - " + agentFetchConnectSec + "))"
+	return "FETCH_STATUS=0\n" +
+		"FETCH_START=$(date +%s 2>/dev/null || echo 0)\n" +
+		"if command -v curl >/dev/null 2>&1; then\n" +
+		"  " + curl + " || FETCH_STATUS=$?\n" +
+		dropUnresumable +
+		"  if [ \"$FETCH_STATUS\" != 0 ]; then\n" +
+		"    FETCH_NOW=$(date +%s 2>/dev/null || echo 0)\n" +
+		"    case \"$FETCH_START:$FETCH_NOW\" in\n" +
+		"      0:*|*:0|:*|*:|*[!0-9:]*) " + unknownLeft + " ;;\n" +
+		"      *) FETCH_LEFT=$((" + agentFetchBudgetSec + " - ($FETCH_NOW - $FETCH_START))) ;;\n" +
+		"    esac\n" +
+		"    if [ \"$FETCH_LEFT\" -gt " + agentFetchBudgetSec + " ]; then " + unknownLeft + "; fi\n" +
+		"    if [ \"$FETCH_LEFT\" -lt " + agentFetchConnectSec + " ]; then\n" +
+		"      echo \"lattice agent update: control-plane download failed with ${FETCH_LEFT}s of the " + agentFetchBudgetSec + " s download budget left; not falling back to $FALLBACK_URL\" >&2\n" +
+		"      FETCH_STATUS=1\n" +
+		"    else\n" +
+		"      echo \"lattice agent update: control-plane download failed; falling back to the release URL $FALLBACK_URL with ${FETCH_LEFT}s left\" >&2\n" +
+		"      FETCH_STATUS=0\n" +
+		"      " + fallbackCurl + " || FETCH_STATUS=$?\n" +
+		"    " + dropUnresumable +
+		"    fi\n" +
+		"  fi\n" +
+		"elif command -v wget >/dev/null 2>&1; then\n" +
+		"  " + wget + " || FETCH_STATUS=$?\n" +
+		"  if [ \"$FETCH_STATUS\" != 0 ]; then\n" +
+		"    echo \"lattice agent update: control-plane download failed; falling back to the release URL $FALLBACK_URL\" >&2\n" +
+		"    FETCH_STATUS=0\n" +
+		"    " + fallbackWget + " || FETCH_STATUS=$?\n" +
+		"  fi\n" +
+		"else\n" +
+		"  echo 'lattice agent update: curl or wget is required' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		keepOrFail
+}
+
+// agentUpdateDigestMismatchStep fails the task when the downloaded bytes are
+// not the pinned ones. With resume it also deletes them: a kept file that
+// fails the digest was spliced or corrupted, and continuing it can only fail
+// again.
+func agentUpdateDigestMismatchStep(resume bool) string {
+	if !resume {
+		return "if [ \"$ACTUAL_SHA\" != \"$EXPECT_SHA\" ]; then\n" +
+			"  echo \"lattice agent update: sha256 mismatch expected=$EXPECT_SHA actual=$ACTUAL_SHA\" >&2\n" +
+			"  exit 1\n" +
+			"fi\n"
+	}
+	return "if [ \"$ACTUAL_SHA\" != \"$EXPECT_SHA\" ]; then\n" +
+		"  rm -f \"$CANDIDATE\"\n" +
+		"  echo \"lattice agent update: sha256 mismatch expected=$EXPECT_SHA actual=$ACTUAL_SHA; deleted the download so the next attempt starts over\" >&2\n" +
+		"  exit 1\n" +
+		"fi\n"
+}
+
+// agentUpdateVerifiedModeStep makes the verified download executable so its
+// version can be checked. A kept download sits beside the install path rather
+// than in a private temp directory, so it stays root-only: the installed copy
+// gets its own 0755 from install.
+func agentUpdateVerifiedModeStep(resume bool) string {
+	if !resume {
+		return "chmod 0755 \"$CANDIDATE\"\n"
+	}
+	return "chmod 0700 \"$CANDIDATE\"\n"
+}
+
+// agentUpdateInstalledStep removes the kept download once its copy is in
+// place. Until then it stays: a verified file that a later step failed on is
+// finished in one request by the next attempt.
+func agentUpdateInstalledStep(resume bool) string {
+	if !resume {
+		return ""
+	}
+	return "rm -f \"$CANDIDATE\"\n"
 }
 
 func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.Approval, result model.TaskResult) error {

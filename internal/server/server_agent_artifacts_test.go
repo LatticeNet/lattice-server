@@ -736,3 +736,251 @@ func TestAgentArtifactStoreFullTellsTheOperatorWhatToDo(t *testing.T) {
 		}
 	}
 }
+
+func getAgentBinaryWith(t *testing.T, handler http.Handler, method, urlPath, taskID, lease string, header map[string]string) *http.Response {
+	t.Helper()
+	req := httptest.NewRequest(method, urlPath, nil)
+	if taskID != "" {
+		req.Header.Set(agentTaskIDHeader, taskID)
+	}
+	if lease != "" {
+		req.Header.Set(agentTaskLeaseHeader, lease)
+	}
+	for key, value := range header {
+		req.Header.Set(key, value)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec.Result()
+}
+
+// A node on a slow uplink continues a cut download with a range request. The
+// route answers single ranges with 206 and the exact bytes, names the pinned
+// digest as a strong ETag, and answers anything it cannot serve as a range
+// in a way that never hands back a slice of different bytes.
+func TestAgentBinaryServesByteRanges(t *testing.T) {
+	srv, handler, st := newAgentArtifactServer(t)
+	data, ref, task := seedControlPlaneUpdate(t, srv, st)
+	size := len(data)
+	etag := `"` + ref.SHA256 + `"`
+
+	for _, tc := range []struct {
+		name         string
+		method       string
+		header       map[string]string
+		status       int
+		body         []byte
+		contentRange string
+	}{
+		{"a middle range", http.MethodGet, map[string]string{"Range": "bytes=100-199"}, http.StatusPartialContent,
+			data[100:200], fmt.Sprintf("bytes 100-199/%d", size)},
+		{"the rest from an offset, as curl -C - and wget -c ask", http.MethodGet, map[string]string{"Range": "bytes=4000-"}, http.StatusPartialContent,
+			data[4000:], fmt.Sprintf("bytes 4000-%d/%d", size-1, size)},
+		{"a suffix range", http.MethodGet, map[string]string{"Range": "bytes=-100"}, http.StatusPartialContent,
+			data[size-100:], fmt.Sprintf("bytes %d-%d/%d", size-100, size-1, size)},
+		{"If-Range naming the pinned digest resumes", http.MethodGet, map[string]string{"Range": "bytes=4000-", "If-Range": etag}, http.StatusPartialContent,
+			data[4000:], fmt.Sprintf("bytes 4000-%d/%d", size-1, size)},
+		{"If-Range naming other bytes gets the whole object", http.MethodGet,
+			map[string]string{"Range": "bytes=4000-", "If-Range": `"` + strings.Repeat("0", 64) + `"`}, http.StatusOK, data, ""},
+		{"a weak If-Range gets the whole object", http.MethodGet, map[string]string{"Range": "bytes=4000-", "If-Range": "W/" + etag}, http.StatusOK, data, ""},
+		{"a date If-Range gets the whole object", http.MethodGet,
+			map[string]string{"Range": "bytes=4000-", "If-Range": time.Now().UTC().Format(http.TimeFormat)}, http.StatusOK, data, ""},
+		{"a range past the end", http.MethodGet, map[string]string{"Range": fmt.Sprintf("bytes=%d-", size)}, http.StatusRequestedRangeNotSatisfiable,
+			nil, fmt.Sprintf("bytes */%d", size)},
+		{"several ranges get the whole object once", http.MethodGet, map[string]string{"Range": "bytes=0-9,0-9,0-9,0-9"}, http.StatusOK, data, ""},
+		{"no range", http.MethodGet, nil, http.StatusOK, data, ""},
+		{"HEAD", http.MethodHead, nil, http.StatusOK, nil, ""},
+		{"HEAD with a range", http.MethodHead, map[string]string{"Range": "bytes=4000-"}, http.StatusPartialContent,
+			nil, fmt.Sprintf("bytes 4000-%d/%d", size-1, size)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := getAgentBinaryWith(t, handler, tc.method, ref.urlPath(), task.ID, task.LeaseID, tc.header)
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.StatusCode != tc.status {
+				t.Fatalf("answered %d, want %d: %s", res.StatusCode, tc.status, body)
+			}
+			if tc.status == http.StatusRequestedRangeNotSatisfiable {
+				body = nil
+			}
+			if !bytes.Equal(body, tc.body) {
+				t.Fatalf("served %d bytes, want %d", len(body), len(tc.body))
+			}
+			if got := res.Header.Get("Content-Range"); got != tc.contentRange {
+				t.Fatalf("Content-Range = %q, want %q", got, tc.contentRange)
+			}
+			if tc.status != http.StatusRequestedRangeNotSatisfiable {
+				if got := res.Header.Get("ETag"); got != etag {
+					t.Fatalf("ETag = %q, want the pinned digest %q", got, etag)
+				}
+				if res.Header.Get("Accept-Ranges") != "bytes" || res.Header.Get("Cache-Control") != "no-store" ||
+					res.Header.Get("X-Content-Type-Options") != "nosniff" || res.Header.Get("Content-Type") != agentArtifactContentType {
+					t.Fatalf("headers lost: %v", res.Header)
+				}
+				want := len(tc.body)
+				if tc.method == http.MethodHead {
+					want = size
+					if tc.contentRange != "" {
+						want = size - 4000
+					}
+				}
+				if res.Header.Get("Content-Length") != strconv.Itoa(want) {
+					t.Fatalf("Content-Length = %q, want %d", res.Header.Get("Content-Length"), want)
+				}
+			}
+		})
+	}
+	if event, ok := servedRangeAudit(st, "bytes=4000-"); !ok || event.Metadata["bytes"] != strconv.Itoa(size) || event.Metadata["task_id"] != task.ID {
+		t.Fatalf("a served range must be audited with the range asked for: %+v", event)
+	}
+	if event, ok := servedRangeAudit(st, "bytes=0-9,0-9,0-9,0-9"); !ok || event.Metadata["range_ignored"] == "" {
+		t.Fatalf("a multi-range request must be audited with what it asked for and that it was served whole: %+v", event)
+	}
+}
+
+// deadlineRecorder is a response recorder that takes a write deadline, as the
+// server's own connection writer does.
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadline time.Time
+}
+
+func (w *deadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	w.deadline = deadline
+	return nil
+}
+
+// The server's 60 s write timeout would cut a direct connection to a slow
+// node about a megabyte in. The binary route lifts it to the update task's
+// own timeout, through every wrapper the handler chain puts in between, and
+// only for a caller that proved its lease.
+func TestAgentBinaryOutlastsTheServerWriteTimeout(t *testing.T) {
+	srv, handler, st := newAgentArtifactServer(t)
+	data, ref, task := seedControlPlaneUpdate(t, srv, st)
+	serve := func(lease string) *deadlineRecorder {
+		req := httptest.NewRequest(http.MethodGet, ref.urlPath(), nil)
+		req.Header.Set(agentTaskIDHeader, task.ID)
+		req.Header.Set(agentTaskLeaseHeader, lease)
+		rec := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	before := time.Now()
+	rec := serve(task.LeaseID)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), data) {
+		t.Fatalf("download answered %d with %d bytes", rec.Code, rec.Body.Len())
+	}
+	budget := time.Duration(approvalApplyTaskTimeoutSec(agentUpdatePlugin)) * time.Second
+	if rec.deadline.Before(before.Add(budget)) || rec.deadline.After(time.Now().Add(budget)) {
+		t.Fatalf("write deadline %v, want about %v from now", rec.deadline, budget)
+	}
+	if denied := serve("not-a-lease"); denied.Code != http.StatusForbidden || !denied.deadline.IsZero() {
+		t.Fatalf("a refused caller must keep the server's deadline: %d, deadline %v", denied.Code, denied.deadline)
+	}
+}
+
+// servedRangeAudit finds the serve audit for one range request.
+func servedRangeAudit(st *store.Store, requested string) (model.AuditEvent, bool) {
+	for _, event := range st.AuditEvents() {
+		if event.Action == "agent.binary.serve" && event.Decision != "deny" && event.Metadata["range"] == requested {
+			return event, true
+		}
+	}
+	return model.AuditEvent{}, false
+}
+
+// A range request is held to every check a full one is, before any byte goes
+// out: the lease, the node's own artifact, the integrity of the stored copy,
+// and the denial audit throttle.
+func TestAgentBinaryRangeRequestsPassTheSameChecks(t *testing.T) {
+	rangeHeader := map[string]string{"Range": "bytes=10-"}
+	t.Run("lease and artifact", func(t *testing.T) {
+		srv, handler, st := newAgentArtifactServer(t)
+		_, ref, task := seedControlPlaneUpdate(t, srv, st)
+		otherArch := agentArtifactRef{Version: ref.Version, OS: ref.OS, Arch: "arm64", SHA256: ref.SHA256}
+		for name, req := range map[string]struct{ path, taskID, lease string }{
+			"no credentials":    {ref.urlPath(), "", ""},
+			"a foreign lease":   {ref.urlPath(), task.ID, "lease-that-was-never-issued"},
+			"another platform":  {otherArch.urlPath(), task.ID, task.LeaseID},
+			"an unknown task":   {ref.urlPath(), "task-does-not-exist", task.LeaseID},
+			"a task id, no key": {ref.urlPath(), task.ID, ""},
+		} {
+			res := getAgentBinaryWith(t, handler, http.MethodGet, req.path, req.taskID, req.lease, rangeHeader)
+			body, _ := io.ReadAll(res.Body)
+			res.Body.Close()
+			if res.StatusCode != http.StatusForbidden || bytes.Contains(body, []byte("lattice-agent-binary")) {
+				t.Fatalf("%s: a range request answered %d %s, want 403 and no bytes", name, res.StatusCode, body)
+			}
+		}
+	})
+	t.Run("integrity", func(t *testing.T) {
+		srv, handler, st := newAgentArtifactServer(t)
+		data, ref, task := seedControlPlaneUpdate(t, srv, st)
+		if err := st.PutStatic(model.StaticObject{
+			Bucket: agentArtifactBucket, Path: ref.objectPath(),
+			Content:     base64.StdEncoding.EncodeToString(data[:len(data)-1]),
+			ContentType: agentArtifactContentType,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		res := getAgentBinaryWith(t, handler, http.MethodGet, ref.urlPath(), task.ID, task.LeaseID, rangeHeader)
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+		if res.StatusCode != http.StatusInternalServerError || bytes.Contains(body, []byte("lattice-agent-binary")) {
+			t.Fatalf("a range of a corrupt object answered %d %s; it must be refused whole", res.StatusCode, body)
+		}
+	})
+	t.Run("denial audit throttle", func(t *testing.T) {
+		srv, handler, st := newAgentArtifactServer(t)
+		_, ref, _ := seedControlPlaneUpdate(t, srv, st)
+		before := len(st.AuditEvents())
+		refused := 0
+		for i := 0; i < 200; i++ {
+			res := getAgentBinaryWith(t, handler, http.MethodGet, ref.urlPath(), "task-does-not-exist", "not-a-lease", rangeHeader)
+			status := res.StatusCode
+			res.Body.Close()
+			if status == http.StatusTooManyRequests {
+				break
+			}
+			if status != http.StatusForbidden {
+				t.Fatalf("attempt %d answered %d, want 403", i, status)
+			}
+			refused++
+		}
+		if written := len(st.AuditEvents()) - before; refused < 10 || written == 0 || written >= refused {
+			t.Fatalf("%d refused range requests wrote %d audit events; the throttle must hold", refused, written)
+		}
+	})
+}
+
+// The per-source route limiter counts a range request exactly as it counts a
+// full download: one request, one token. A resuming node costs the limiter no
+// more than a node that starts over, and a caller cannot buy extra requests
+// by asking for small pieces.
+func TestAgentBinaryRangeRequestsCostTheLimiterWhatAFullOneDoes(t *testing.T) {
+	count := func(header map[string]string) int {
+		srv, handler, st := newAgentArtifactServer(t)
+		_, ref, task := seedControlPlaneUpdate(t, srv, st)
+		for i := 0; i < 500; i++ {
+			res := getAgentBinaryWith(t, handler, http.MethodGet, ref.urlPath(), task.ID, task.LeaseID, header)
+			status := res.StatusCode
+			res.Body.Close()
+			if status == http.StatusTooManyRequests {
+				return i
+			}
+			if status != http.StatusOK && status != http.StatusPartialContent {
+				t.Fatalf("request %d answered %d", i, status)
+			}
+		}
+		t.Fatal("the route limiter never cut in")
+		return 0
+	}
+	full := count(nil)
+	ranged := count(map[string]string{"Range": "bytes=0-0"})
+	if full == 0 || ranged != full {
+		t.Fatalf("one source got %d full downloads but %d one-byte ranges before the limiter cut in; they must cost the same", full, ranged)
+	}
+}

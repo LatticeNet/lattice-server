@@ -191,7 +191,7 @@ func TestAgentUpdatePolicyPlanAndQueue(t *testing.T) {
 	script := tasks[0].Script
 	for _, want := range []string{
 		"curl -fsSL --proto '=https' --tlsv1.2",
-		"wget --https-only -q --timeout=20 --tries=2 -O \"$CANDIDATE\" \"$URL\"",
+		"wget --https-only -q --timeout=20 --tries=2 -c -O \"$CANDIDATE\" \"$URL\"",
 		"EXPECT_SHA='" + agentUpdateTestSHA + "'",
 		"RUNNING_AGENT=$(readlink -f \"/proc/$PPID/exe\"",
 		"RUNNING_SERVICE=$(sed -n 's#.*system\\.slice/",

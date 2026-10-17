@@ -282,6 +282,14 @@ func TestPathWindowsCountTheirBuckets(t *testing.T) {
 			t.Errorf("%s matrix = %d samples of %d expected, want %d of %d", c.window, cell.Samples, cell.Expected, c.want, c.want)
 		}
 	}
+	// Read four and a half minutes into a five-minute bucket, a matrix
+	// window still counts its whole buckets only: the runs it expects are
+	// the ones its samples could hold, not the minutes since its start.
+	if m, err := srv.pathMatrixFor(p, model.PathWindowSixHours, now.Add(4*time.Minute+30*time.Second)); err != nil {
+		t.Fatal(err)
+	} else if cell := pathCellFor(t, m, "node-a", "mon-a"); cell.Samples != 360 || cell.Expected != 360 {
+		t.Errorf("6h matrix read mid-bucket = %d samples of %d expected, want 360 of 360", cell.Samples, cell.Expected)
+	}
 	checks := []pathCheck{{monitorID: "mon-a", method: model.MonitorTypeTCP}}
 	series, err := srv.pathSeriesFor(checks, "node-a", model.PathWindowHour, time.Minute, now.Add(30*time.Second))
 	if err != nil {

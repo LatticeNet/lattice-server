@@ -180,8 +180,10 @@ func beaconFactsDurableChanged(prev, next *model.BeaconFacts) bool {
 // noteBeaconFacts takes a heartbeat's report: kept in memory always,
 // written to the node record when it changed durably. A beat without one
 // (an agent older than M2b, or one downgraded to it) clears the report, as
-// a beat without probe_methods clears those. A change to a target's
-// listening state starts its pending reachability check.
+// a beat without probe_methods clears those. A change to where a target
+// listens (its state, bind address or port) starts its pending reachability
+// check: a change plan that moves the port leaves the agent reporting
+// listening before and after, and only the port says it moved.
 func (s *Server) noteBeaconFacts(nodeID string, stored *model.BeaconFacts, reported *model.BeaconFacts) {
 	facts := normalizeBeaconFacts(reported, s.now())
 	if facts == nil {
@@ -201,11 +203,20 @@ func (s *Server) noteBeaconFacts(nodeID string, stored *model.BeaconFacts, repor
 		s.logger.Printf("beacon facts for node %s not stored: %v", nodeID, err)
 		return
 	}
-	if stored == nil || stored.State != facts.State {
+	if beaconListenMoved(stored, facts) {
 		if t, ok := s.store.BeaconTarget(nodeID); ok && t.ReachArmed {
 			s.syncBeaconReach(s.now())
 		}
 	}
+}
+
+// beaconListenMoved reports whether a report changes where the agent says
+// it listens: its state, its bind address or its port.
+func beaconListenMoved(prev, next *model.BeaconFacts) bool {
+	if prev == nil || next == nil {
+		return prev != next
+	}
+	return prev.State != next.State || prev.Bind != next.Bind || prev.Port != next.Port
 }
 
 // beaconListening reports whether a node's agent says it listens where its

@@ -55,7 +55,8 @@ jobs:
     # runs them unprivileged, where they skip; here they run as root and as
     # an unprivileged user holding the server's three file capabilities, the
     # way production runs, and LATTICE_TEST_REQUIRE_UID_DROP=1 turns a skip
-    # into a failure.
+    # into a failure. The job then builds the image, which is otherwise built
+    # only on tags, and checks what the boundary rests on in it.
     name: plugin uid isolation
     runs-on: ubuntu-latest
     steps:
@@ -78,12 +79,40 @@ jobs:
           sudo env LATTICE_TEST_REQUIRE_UID_DROP=1 "$RUNNER_TEMP/plugin.test"
           -test.count=1 -test.v -test.run 'PluginUID|StagedChain|StagedArtifact|RelaxedChain'
       - name: as an unprivileged user with the server's file capabilities
+        # 0750, as the image installs the server: the runner refuses to arm
+        # the drop from a capped binary that other uids can exec.
         run: |
           command -v setcap >/dev/null || sudo apt-get install -y libcap2-bin
+          chmod 0750 "$RUNNER_TEMP/plugin.test"
           sudo setcap cap_setuid,cap_setgid,cap_kill+ep "$RUNNER_TEMP/plugin.test"
           getcap "$RUNNER_TEMP/plugin.test"
           LATTICE_TEST_REQUIRE_UID_DROP=1 LATTICE_TEST_ALLOW_NO_CHOWN=1 "$RUNNER_TEMP/plugin.test" \
             -test.count=1 -test.v -test.run 'PluginUID|StagedChain|StagedArtifact|RelaxedChain'
+      - name: read sdk ref
+        id: sdk
+        run: echo "ref=$(cat lattice-server/sdk.ref)" >> "$GITHUB_OUTPUT"
+      - name: checkout lattice-sdk
+        uses: actions/checkout@v6
+        with:
+          repository: LatticeNet/lattice-sdk
+          ref: ${{ steps.sdk.outputs.ref }}
+          path: lattice-sdk
+      - name: build the server image with a stub dashboard
+        # The checks below are about the final stage (the server binary,
+        # its capabilities and the entrypoint), so a named context replaces
+        # the dashboard stage instead of building the dashboard.
+        run: |
+          stub="$RUNNER_TEMP/dashboard-stub"
+          mkdir -p "$stub/src/dashboard/dist"
+          echo '<!doctype html><title>stub</title>' > "$stub/src/dashboard/dist/index.html"
+          docker buildx build --load -t lattice-server:ci \
+            --build-context lattice-sdk=./lattice-sdk \
+            --build-context lattice-dashboard="$stub" \
+            --build-context dashboard="$stub" \
+            lattice-server
+      - name: image isolation checks
+        working-directory: lattice-server
+        run: sh scripts/check-image-isolation.sh lattice-server:ci
   server:
     # internal/server is one test binary of about 1400 serial tests that took
     # 1437 s under -race -cover on a shared runner, against go test's 25m

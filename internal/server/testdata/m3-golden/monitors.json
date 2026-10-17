@@ -1,0 +1,246 @@
+[
+  {
+    "id": "mon-web",
+    "name": "tyo-3 web",
+    "type": "tcp",
+    "target": "203.0.113.3:443",
+    "interval_sec": 60,
+    "timeout_sec": 5,
+    "assign_all": false,
+    "node_ids": [
+      "node-sh",
+      "node-hk"
+    ],
+    "enabled": true,
+    "alert": "down_and_degraded",
+    "alert_after": 2,
+    "degraded": {
+      "loss_percent": 5,
+      "latency_margin_ms": 50
+    },
+    "version": 1,
+    "created_at": "2026-08-03T10:12:00Z",
+    "updated_at": "2026-09-14T09:00:00Z",
+    "latest": [
+      {
+        "node_id": "node-hk",
+        "at": "2026-09-14T09:47:00Z",
+        "success": true,
+        "latency_ms": 51,
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-07T08:00:00Z"
+      },
+      {
+        "node_id": "node-sh",
+        "at": "2026-09-14T09:47:00Z",
+        "success": true,
+        "latency_ms": 140,
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-14T09:25:00Z"
+      }
+    ]
+  },
+  {
+    "id": "mon-ping-jp",
+    "name": "Ping tyo-3",
+    "type": "icmp",
+    "target": "203.0.113.3",
+    "interval_sec": 60,
+    "timeout_sec": 5,
+    "assign_all": false,
+    "node_ids": [
+      "node-hk",
+      "node-fra"
+    ],
+    "enabled": true,
+    "packets": 5,
+    "alert": "down",
+    "alert_after": 2,
+    "version": 1,
+    "created_at": "2026-08-20T07:41:00Z",
+    "updated_at": "2026-09-14T09:00:00Z",
+    "latest": [
+      {
+        "node_id": "node-hk",
+        "at": "2026-09-14T09:47:00Z",
+        "success": true,
+        "latency_ms": 50,
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-07T08:00:00Z",
+        "sent": 5,
+        "rtts_ms": [
+          50,
+          50,
+          50,
+          50,
+          50
+        ]
+      }
+    ]
+  },
+  {
+    "id": "mon-cert",
+    "name": "lattice.example.net certificate",
+    "type": "tls",
+    "target": "lattice.example.net:443",
+    "interval_sec": 3600,
+    "timeout_sec": 10,
+    "assign_all": false,
+    "threshold_days": 14,
+    "enabled": true,
+    "alert": "down",
+    "alert_after": 2,
+    "version": 1,
+    "created_at": "2026-08-20T07:45:00Z",
+    "updated_at": "2026-09-14T09:00:00Z",
+    "latest": [
+      {
+        "node_id": "",
+        "at": "2026-09-14T09:15:00Z",
+        "success": true,
+        "latency_ms": 85,
+        "cert_not_after": "2026-10-25T23:59:59Z",
+        "received_at": "2026-09-14T09:15:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-07T10:15:00Z"
+      }
+    ]
+  },
+  {
+    "id": "mon_lat_node-fra",
+    "name": "Latency to fra-2",
+    "type": "tcp",
+    "target": "203.0.113.4:443",
+    "interval_sec": 60,
+    "timeout_sec": 5,
+    "assign_all": false,
+    "node_ids": [
+      "node-hk",
+      "node-sh"
+    ],
+    "enabled": true,
+    "target_node": "node-fra",
+    "managed_by": "latency",
+    "alert": "down_and_degraded",
+    "alert_after": 3,
+    "version": 0,
+    "created_at": "2026-09-14T09:35:00Z",
+    "updated_at": "2026-09-14T09:35:00Z",
+    "latest": [
+      {
+        "node_id": "node-hk",
+        "at": "2026-09-14T09:47:00Z",
+        "success": true,
+        "latency_ms": 158,
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-07T08:00:00Z"
+      },
+      {
+        "node_id": "node-sh",
+        "at": "2026-09-14T09:47:00Z",
+        "success": true,
+        "latency_ms": 212,
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-07T08:00:00Z"
+      }
+    ]
+  },
+  {
+    "id": "mon_lat_node-hk",
+    "name": "Latency to hk-edge",
+    "type": "tcp",
+    "target": "203.0.113.2:443",
+    "interval_sec": 60,
+    "timeout_sec": 5,
+    "assign_all": false,
+    "node_ids": [
+      "node-fra",
+      "node-sh"
+    ],
+    "enabled": true,
+    "target_node": "node-hk",
+    "managed_by": "latency",
+    "alert": "down_and_degraded",
+    "alert_after": 3,
+    "version": 0,
+    "created_at": "2026-09-14T09:35:00Z",
+    "updated_at": "2026-09-14T09:35:00Z",
+    "latest": [
+      {
+        "node_id": "node-fra",
+        "at": "2026-09-14T09:47:00Z",
+        "success": true,
+        "latency_ms": 163,
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-07T08:00:00Z"
+      },
+      {
+        "node_id": "node-sh",
+        "at": "2026-09-14T09:47:00Z",
+        "success": false,
+        "latency_ms": 0,
+        "error": "dial tcp: i/o timeout",
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 3,
+        "since": "2026-09-14T09:45:00Z"
+      }
+    ]
+  },
+  {
+    "id": "mon_lat_node-jp",
+    "name": "Latency to tyo-3",
+    "type": "tcp",
+    "target": "203.0.113.3:443",
+    "interval_sec": 60,
+    "timeout_sec": 5,
+    "assign_all": false,
+    "node_ids": [
+      "node-fra",
+      "node-hk",
+      "node-sh"
+    ],
+    "enabled": true,
+    "target_node": "node-jp",
+    "managed_by": "latency",
+    "alert": "down_and_degraded",
+    "alert_after": 3,
+    "version": 0,
+    "created_at": "2026-09-14T09:35:00Z",
+    "updated_at": "2026-09-14T09:35:00Z",
+    "latest": [
+      {
+        "node_id": "node-fra",
+        "at": "2026-09-14T09:47:00Z",
+        "success": true,
+        "latency_ms": 40,
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-07T08:00:00Z"
+      },
+      {
+        "node_id": "node-hk",
+        "at": "2026-09-14T09:47:00Z",
+        "success": true,
+        "latency_ms": 140,
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-07T08:00:00Z"
+      },
+      {
+        "node_id": "node-sh",
+        "at": "2026-09-14T09:47:00Z",
+        "success": true,
+        "latency_ms": 40,
+        "received_at": "2026-09-14T09:47:00Z",
+        "fail_streak": 0,
+        "since": "2026-09-14T09:25:00Z"
+      }
+    ]
+  }
+]

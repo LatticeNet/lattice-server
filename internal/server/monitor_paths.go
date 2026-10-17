@@ -327,6 +327,95 @@ func (s *Server) pathSeriesFor(checks []pathCheck, source, window string, interv
 	return out, nil
 }
 
+// pathPreviousFor reads the series' previous period (compare=previous): the
+// same checks for the same source one span earlier, as one median per step of
+// series. Entry i covers [t_i - span, t_i - span + step). It reads the finest
+// tier that holds the whole earlier window: raw rows for the hour (a path
+// keeps 1440 rows, four hours at the 10 s interval floor), five-minute
+// buckets while the fine retention reaches back far enough and the tier has
+// filled, one-hour buckets beyond. When that tier is coarser than the
+// series' step, one bucket gives its value to every step it covers.
+func (s *Server) pathPreviousFor(checks []pathCheck, source string, series model.PathSeries, span time.Duration, now time.Time) (*model.PathPreviousSeries, error) {
+	step := time.Duration(series.StepSeconds) * time.Second
+	if step <= 0 {
+		return nil, errors.New("series has no step")
+	}
+	from, to := series.From.Add(-span), series.To.Add(-span)
+	end := to.Add(time.Nanosecond)
+	tier := pathTierCoarse
+	switch {
+	case span <= time.Hour:
+		tier = pathTierRaw
+	case now.Sub(from) <= s.store.MonitorHistoryLimits().FineKeep:
+		short, err := s.fineTierShort(checks, source, from, now)
+		if err != nil {
+			return nil, err
+		}
+		if !short {
+			tier = pathTierFine
+		}
+	}
+	res := tier.resolution()
+	merged := map[time.Time]*store.MonitorRollup{}
+	add := func(b store.MonitorRollup) {
+		t := b.At.UTC().Truncate(res)
+		into := merged[t]
+		if into == nil {
+			into = &store.MonitorRollup{At: t}
+			merged[t] = into
+		}
+		into.Merge(b)
+	}
+	for _, check := range checks {
+		if tier == pathTierRaw {
+			rows, err := s.store.MonitorPairResultsBetween(check.monitorID, source, from, end)
+			if err != nil {
+				return nil, err
+			}
+			for _, b := range store.RollupMonitorResults(rows, res, from.Truncate(res), end) {
+				add(b)
+			}
+			continue
+		}
+		pair := store.MonitorPair{MonitorID: check.monitorID, NodeID: source}
+		read, err := s.store.MonitorRollups([]store.MonitorPair{pair}, res, from, end)
+		if err != nil {
+			return nil, err
+		}
+		for _, b := range read[pair] {
+			add(b)
+		}
+	}
+	out := &model.PathPreviousSeries{
+		From: from, To: to, OffsetSeconds: int(span / time.Second),
+		StepSeconds: int(max(res, step) / time.Second),
+		P50Ms:       make([]*float64, len(series.Buckets)),
+	}
+	if res > step {
+		for i, b := range series.Buckets {
+			if m := merged[b.T.Add(-span).Truncate(res)]; m != nil {
+				out.P50Ms[i] = pathQuantile(*m, 0.5)
+			}
+		}
+		return out, nil
+	}
+	perStep := make([]store.MonitorRollup, len(series.Buckets))
+	for t, m := range merged {
+		shifted := t.Add(span)
+		if shifted.Before(series.From) {
+			continue
+		}
+		i := int(shifted.Sub(series.From) / step)
+		if i < len(perStep) {
+			perStep[i].Merge(*m)
+		}
+	}
+	for i := range perStep {
+		out.P50Ms[i] = pathQuantile(perStep[i], 0.5)
+	}
+	return out, nil
+}
+
 // fineTierShort reports whether the five-minute tier lacks part of the
 // window that the hourly tier holds: hourly buckets exist between the
 // window's start and the hour before the oldest five-minute bucket. That is
@@ -405,9 +494,23 @@ func (s *Server) handleMonitorSeries(w http.ResponseWriter, r *http.Request, p p
 		writeError(w, http.StatusBadRequest, fmt.Errorf("window must be one of %s", pathWindowNames()))
 		return
 	}
+	compare := false
+	if values, ok := q["compare"]; ok {
+		if len(values) != 1 || values[0] != "previous" {
+			writeError(w, http.StatusBadRequest, errors.New(`compare must be "previous"`))
+			return
+		}
+		compare = true
+	}
+	now := s.now()
 	source := strings.TrimSpace(q.Get("source"))
 	var checks []pathCheck
 	var interval time.Duration
+	// basePair is the pair the path is judged on now, whose baseline the
+	// series carries, under rule; nil for a tls check or a generated path
+	// with no current check.
+	var basePair *store.MonitorPair
+	var rule model.MonitorDegradedRule
 	if monitorID := strings.TrimSpace(q.Get("monitor")); monitorID != "" {
 		mon, ok := s.store.Monitor(monitorID)
 		if !ok {
@@ -431,6 +534,10 @@ func (s *Server) handleMonitorSeries(w http.ResponseWriter, r *http.Request, p p
 		if mon.ManagedBy == model.MonitorManagedLatency {
 			interval = s.latencyInterval()
 		}
+		if mon.Type != model.MonitorTypeTLS {
+			basePair = &store.MonitorPair{MonitorID: mon.ID, NodeID: source}
+			rule = s.monitorPolicy(mon).rule
+		}
 	} else {
 		target := strings.TrimSpace(q.Get("target_node"))
 		if source == "" || target == "" {
@@ -447,11 +554,35 @@ func (s *Server) handleMonitorSeries(w http.ResponseWriter, r *http.Request, p p
 			return
 		}
 		interval = s.latencyInterval()
+		plan := s.pathPlan(now)
+		for _, pair := range plan.Pairs {
+			if pair.Source != source || pair.Target != target || pair.MonitorID == "" {
+				continue
+			}
+			if _, ok := s.store.Monitor(pair.MonitorID); ok {
+				basePair = &store.MonitorPair{MonitorID: pair.MonitorID, NodeID: source}
+				rule = pathSetPolicy(plan.Config).rule
+			}
+			break
+		}
 	}
-	series, err := s.pathSeriesFor(checks, source, window, interval, s.now())
+	series, err := s.pathSeriesFor(checks, source, window, interval, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	}
+	if basePair != nil {
+		if series.Baseline, err = s.pathBaselineView(*basePair, rule, now); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
+	if compare {
+		span, _ := pathWindowSpan(window)
+		if series.Previous, err = s.pathPreviousFor(checks, source, series, span, now); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, series)
 }
@@ -468,6 +599,9 @@ type pathEntry struct {
 	// gate is why the source does not run the path's kind (a
 	// model.PathReason* code), empty when it does.
 	gate string
+	// after is the failed runs in a row that read down: the check's own
+	// hold, or the path set's for a generated check (design 29 D13).
+	after int
 }
 
 func (e pathEntry) pair() store.MonitorPair {
@@ -505,6 +639,7 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 	if interval <= 0 {
 		interval = time.Duration(model.LatencyProbeDefaultIntervalSec) * time.Second
 	}
+	pathSetAfter := pathSetPolicy(plan.Config).after
 	for _, pair := range plan.Pairs {
 		pn := planNodes[pair.Target]
 		method, target := pair.Method, pn.Endpoint
@@ -523,6 +658,7 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 				MonitorID: pair.MonitorID, Managed: true, Method: method,
 			},
 			interval:     interval,
+			after:        pathSetAfter,
 			paused:       !pair.Active,
 			notProbeable: pn.Target == model.LatencyTargetNotProbeable || pair.Reason == model.PathReasonNotProbeable,
 		}
@@ -588,6 +724,7 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 				},
 				monitor:      &m,
 				interval:     time.Duration(mon.IntervalSec) * time.Second,
+				after:        store.MonitorAlertAfter(mon),
 				hasCheck:     true,
 				paused:       !mon.Enabled || slices.Contains(mon.PausedNodeIDs, source),
 				notProbeable: !resolvable,
@@ -915,10 +1052,13 @@ func pathStateOf(e pathEntry, latest *store.MonitorLatest, nodes map[string]mode
 		return model.PathStateUnknown, model.PathReasonBeaconFiltered
 	}
 	// Down follows the check's alert hold: its failures in a row
-	// (store.MonitorAlertAfter), two for a generated check.
-	after := store.MonitorAlertAfter(model.Monitor{})
-	if e.monitor != nil {
-		after = store.MonitorAlertAfter(*e.monitor)
+	// (store.MonitorAlertAfter), the path set's for a generated check.
+	after := e.after
+	if after < 1 {
+		after = store.MonitorAlertAfter(model.Monitor{})
+		if e.monitor != nil {
+			after = store.MonitorAlertAfter(*e.monitor)
+		}
 	}
 	if !latest.Success && latest.FailStreak >= after {
 		return model.PathStateDown, ""
@@ -989,6 +1129,11 @@ func (s *Server) pathMatrixFor(p principal, window string, now time.Time) (model
 		Targets:    []model.PathTarget{},
 		Paths:      make([]model.PathCell, 0, len(entries)),
 	}
+	degraded := s.pathDegradedSnapshot()
+	if !degraded.evaluatedAt.IsZero() {
+		at := degraded.evaluatedAt
+		out.DegradedAt = &at
+	}
 	if len(entries) == 0 {
 		return out, nil
 	}
@@ -1016,6 +1161,13 @@ func (s *Server) pathMatrixFor(p principal, window string, now time.Time) (model
 			l = latest[pair]
 		}
 		cell.State, cell.Reason = pathStateOf(e, l, nodes, now)
+		if d, ok := degraded.entries[pair]; ok && e.hasCheck && cell.State == model.PathStateUp && !d.pending {
+			// Degraded only where the path would read up: down and
+			// unknown say more about now. It is a state for now and does
+			// not change with the window.
+			cell.State, cell.Reason = model.PathStateDegraded, d.rec.Reason
+			cell.Degraded = pathDegradationView(d.rec)
+		}
 		if l != nil {
 			at := l.At
 			cell.LastAt = &at

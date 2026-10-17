@@ -95,6 +95,16 @@
     "tone": "critical"
   },
   {
+    "file": "trending-down-warning.png",
+    "icon": "trending-down",
+    "tone": "warning"
+  },
+  {
+    "file": "trending-up-recovered.png",
+    "icon": "trending-up",
+    "tone": "recovered"
+  },
+  {
     "file": "webhook-quiet.png",
     "icon": "webhook",
     "tone": "quiet"

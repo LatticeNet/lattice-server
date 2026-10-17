@@ -405,7 +405,9 @@ func (s *Store) recordMonitorResultsLocked(records []MonitorResultRecord) ([]Mon
 // every path) never holds up ingest or any other store call. bbolt runs read
 // transactions beside the writer; a Close that lands meanwhile waits for the
 // read to finish. Without the hot store it returns nil with the lock still
-// held, and the caller reads the JSON state and unlocks.
+// held, and the caller reads the JSON state and unlocks. The degraded
+// evaluator's record writes use it too: a bolt write waits only on bbolt's
+// own writer lock.
 func (s *Store) hotForMonitorRead() *BoltStateStore {
 	s.mu.Lock()
 	hot := s.runtimeBoltHot

@@ -294,9 +294,12 @@ type Store struct {
 	walAnchorPath      string
 	// The last chain walk, guarded separately so a readiness probe reading it
 	// never queues behind a long write holding mu.
-	auditVerifyMu      sync.Mutex
-	lastAuditVerify    AuditWALVerification
-	runtimeBoltHot     *BoltStateStore // optional record-level sidecar for high-churn runtime domains
+	auditVerifyMu   sync.Mutex
+	lastAuditVerify AuditWALVerification
+	runtimeBoltHot  *BoltStateStore // optional record-level sidecar for high-churn runtime domains
+	// pathDegraded holds the degraded evaluator's records without the hot
+	// store (monitor_degraded.go). Guarded by mu.
+	pathDegraded       map[MonitorPair]PathDegradedRecord
 	runtimeBoltHotPath string
 	syncParentDir      func(string) error
 	// taskQueueDeadline is how long a task may sit undelivered before the
@@ -331,6 +334,10 @@ type Store struct {
 	loadedLastSeen map[string]time.Time
 	// testNow is the heartbeat clock in tests; nil means time.Now.
 	testNow func() time.Time
+	// testBeforePathDegradedWrite runs in PutPathDegradedRecord after the
+	// first existence check and before the bolt write, outside the lock, so
+	// a test can put a delete in that window. Tests only; set before use.
+	testBeforePathDegradedWrite func(MonitorPair)
 	// closed is set by the first Close. A later Close does nothing: the bolt
 	// sidecar is gone by then, so a write would put its domains in the JSON
 	// file. Guarded by mu.
@@ -5573,7 +5580,9 @@ func (s *Store) Monitor(id string) (model.Monitor, bool) {
 	return m, ok
 }
 
-// Monitors returns all monitors sorted by creation time.
+// Monitors returns all monitors sorted by creation time, then by id: the
+// generated checks one sync creates share a creation time, and the map
+// order must not decide their order.
 func (s *Store) Monitors() []model.Monitor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5581,7 +5590,12 @@ func (s *Store) Monitors() []model.Monitor {
 	for _, m := range s.state.Monitors {
 		out = append(out, m)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 
@@ -5631,6 +5645,7 @@ func (s *Store) DeleteMonitor(id string) error {
 	}
 	delete(s.state.Monitors, id)
 	delete(s.state.MonResults, id)
+	s.deletePathDegradedMemLocked(func(p MonitorPair) bool { return p.MonitorID == id })
 	for key := range s.monitorPersistedAt {
 		if strings.HasPrefix(key, id+"\x00") {
 			delete(s.monitorPersistedAt, key)

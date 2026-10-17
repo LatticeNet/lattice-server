@@ -107,6 +107,9 @@ var incidentKinds = map[string]incidentKind{
 	EventServiceDown:  {recovery: EventServiceRecovered, severity: incidentSeverityCritical, noun: "nodes"},
 	EventMonitorDown:  {recovery: EventMonitorRecovered, severity: incidentSeverityWarning},
 	EventAgentStalled: {recovery: EventAgentRecovered, severity: incidentSeverityWarning, noun: "nodes"},
+	// A degraded path (design 29 D13) is a warning: quiet hours hold it as
+	// they hold monitor.down, and it never escalates.
+	EventPathDegraded: {recovery: EventPathRecovered, severity: incidentSeverityWarning, noun: "paths"},
 }
 
 // incidentRecoveryOf maps each recovery event type to the open it answers.
@@ -509,33 +512,10 @@ func (s *Server) evaluateIncidents(now time.Time) {
 				gone = append(gone, inc.ID)
 				continue
 			}
-			switch {
-			case !monitorPairAssigned(mon, inc.NodeID):
+			if msg, closing := s.monitorIncidentClosing(inc, mon); closing {
 				inc.State = store.IncidentStateResolved
 				inc.ResolvedAt = now
-				inc.RecoveryTitle = fmt.Sprintf("Monitor no longer checks %s", inc.Subject)
-				inc.RecoveryDetail = fmt.Sprintf("%s is no longer assigned, so its down state is closed without a recovery result.", inc.Subject)
-				inc.RecoveryLine = inc.Subject + ": no longer checked"
-				resolveOwed(&inc)
-				dirty = true
-			case !mon.Enabled:
-				// A disabled check is handed to no agent and its results
-				// are refused, so no recovery result will ever come.
-				inc.State = store.IncidentStateResolved
-				inc.ResolvedAt = now
-				inc.RecoveryTitle = fmt.Sprintf("Monitor paused: %s", inc.Subject)
-				inc.RecoveryDetail = fmt.Sprintf("%s is paused, so its down state is closed without a recovery result.", inc.Subject)
-				inc.RecoveryLine = inc.Subject + ": paused"
-				resolveOwed(&inc)
-				dirty = true
-			case !monitorPages(mon):
-				// Its alert policy was turned off (or it became a generated
-				// check): no recovery page would ever follow.
-				inc.State = store.IncidentStateResolved
-				inc.ResolvedAt = now
-				inc.RecoveryTitle = fmt.Sprintf("Alerts off for %s", inc.Subject)
-				inc.RecoveryDetail = fmt.Sprintf("Alerts are off for %s, so its down state is closed without a recovery result.", inc.Subject)
-				inc.RecoveryLine = inc.Subject + ": alerts off"
+				inc.RecoveryTitle, inc.RecoveryDetail, inc.RecoveryLine = msg.title, msg.detail, msg.line
 				resolveOwed(&inc)
 				dirty = true
 			}
@@ -677,6 +657,61 @@ func (s *Server) evaluateIncidents(now time.Time) {
 			s.logger.Printf("notify: record suppressed %s: %v", row.EventType, err)
 		}
 	}
+}
+
+// monitorIncidentClosing says whether an open incident of a monitor pair
+// must close because no recovery result will ever come, and the message that
+// says why in place of a recovery: the pair is no longer assigned (or is
+// paused), the check is disabled (handed to no agent, its results refused),
+// or its alert policy no longer pages this kind. monitor.down closes when
+// alerts are off; path.degraded also when the policy stops paging degraded.
+func (s *Server) monitorIncidentClosing(inc store.Incident, mon model.Monitor) (incidentMessage, bool) {
+	degraded := inc.Kind == EventPathDegraded
+	state := "down state"
+	if degraded {
+		state = "degraded state"
+	}
+	policy := s.monitorPolicy(mon)
+	switch {
+	case !monitorPairAssigned(mon, inc.NodeID):
+		if degraded {
+			return incidentMessage{
+				title:  fmt.Sprintf("Path no longer checked: %s", inc.Subject),
+				detail: fmt.Sprintf("%s is no longer checked from its source, so its %s is closed without a recovery.", inc.Subject, state),
+				line:   inc.Subject + ": no longer checked",
+			}, true
+		}
+		return incidentMessage{
+			title:  fmt.Sprintf("Monitor no longer checks %s", inc.Subject),
+			detail: fmt.Sprintf("%s is no longer assigned, so its %s is closed without a recovery result.", inc.Subject, state),
+			line:   inc.Subject + ": no longer checked",
+		}, true
+	case !mon.Enabled:
+		title := fmt.Sprintf("Monitor paused: %s", inc.Subject)
+		if degraded {
+			title = fmt.Sprintf("Path paused: %s", inc.Subject)
+		}
+		return incidentMessage{
+			title:  title,
+			detail: fmt.Sprintf("%s is paused, so its %s is closed without a recovery result.", inc.Subject, state),
+			line:   inc.Subject + ": paused",
+		}, true
+	case degraded && !policy.pagesDegraded():
+		return incidentMessage{
+			title:  fmt.Sprintf("Degraded alerts off for %s", inc.Subject),
+			detail: fmt.Sprintf("Degraded alerts are off for %s, so its degraded state is closed without a recovery.", inc.Subject),
+			line:   inc.Subject + ": degraded alerts off",
+		}, true
+	case !degraded && !policy.pagesDown():
+		// Its alert policy was turned off: no recovery page would ever
+		// follow.
+		return incidentMessage{
+			title:  fmt.Sprintf("Alerts off for %s", inc.Subject),
+			detail: fmt.Sprintf("Alerts are off for %s, so its down state is closed without a recovery result.", inc.Subject),
+			line:   inc.Subject + ": alerts off",
+		}, true
+	}
+	return incidentMessage{}, false
 }
 
 func sortedMapKeys[V any](m map[string]V) []string {
@@ -844,6 +879,10 @@ func incidentDigestTitle(eventType string, n int) string {
 		return fmt.Sprintf("Lattice agent stalled digest: %d nodes", n)
 	case EventAgentRecovered:
 		return fmt.Sprintf("Lattice agent recovered digest: %d nodes", n)
+	case EventPathDegraded:
+		return fmt.Sprintf("%d paths degraded", n)
+	case EventPathRecovered:
+		return fmt.Sprintf("%d paths recovered", n)
 	}
 	return alertDigestTitle(eventType, n)
 }
@@ -1042,8 +1081,9 @@ func (s *Server) adoptLegacyAlerts(now time.Time) {
 			}
 			for _, pair := range pairs {
 				// A pair that could not have paged was never paged for.
-				after := store.MonitorAlertAfter(mon)
-				if pair.Success || pair.FailStreak < after || !mon.Enabled || !monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) ||
+				policy := s.monitorPolicy(mon)
+				after := policy.after
+				if pair.Success || pair.FailStreak < after || !mon.Enabled || !monitorPairAssigned(mon, pair.NodeID) || !policy.pagesDown() ||
 					icmpFiltered(mon.Type, pair) {
 					continue
 				}

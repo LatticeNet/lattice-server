@@ -172,6 +172,8 @@ var notifyCatalogueTypes = []notifyCatalogueEntry{
 	notifyEntry(EventServiceRecovered, notifyCategoryServices, notifySeverityInfo, true, "power", "Proxy core recovered"),
 	notifyEntry(EventMonitorDown, notifyCategoryMonitors, notifySeverityWarning, false, "activity", "Monitor failing"),
 	notifyEntry(EventMonitorRecovered, notifyCategoryMonitors, notifySeverityInfo, true, "heart-pulse", "Monitor recovered"),
+	notifyEntry(EventPathDegraded, notifyCategoryMonitors, notifySeverityWarning, false, "trending-down", "Path degraded"),
+	notifyEntry(EventPathRecovered, notifyCategoryMonitors, notifySeverityInfo, true, "trending-up", "Path recovered"),
 	notifyEntry(EventAgentStalled, notifyCategoryAgents, notifySeverityWarning, false, "hourglass", "Agent loop stalled"),
 	notifyEntry(EventAgentRecovered, notifyCategoryAgents, notifySeverityInfo, true, "bot", "Agent loop recovered"),
 	notifyEntry(eventSSHLogin, notifyCategorySSH, notifySeverityNotice, false, "key-round", "SSH login"),

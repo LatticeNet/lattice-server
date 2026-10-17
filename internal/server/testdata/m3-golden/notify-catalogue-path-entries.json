@@ -1,0 +1,18 @@
+[
+  {
+    "type": "path.degraded",
+    "category": "monitors",
+    "severity": "warning",
+    "recovery": false,
+    "icon": "trending-down",
+    "description": "Path degraded"
+  },
+  {
+    "type": "path.recovered",
+    "category": "monitors",
+    "severity": "info",
+    "recovery": true,
+    "icon": "trending-up",
+    "description": "Path recovered"
+  }
+]

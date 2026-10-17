@@ -692,3 +692,24 @@ func TestFullExportReadsRowsAndTheLegacyBucket(t *testing.T) {
 		t.Fatalf("the hot export read monitor rows: %+v", hot.MonResults)
 	}
 }
+
+// Monitors that share a creation time, as the generated checks of one sync
+// do, list by id, whatever the map order.
+func TestMonitorsSharingACreationTimeListByID(t *testing.T) {
+	s := openHotStore(t, t.TempDir())
+	defer s.Close()
+	at := time.Date(2026, 9, 14, 9, 35, 0, 0, time.UTC)
+	seedMonitor(t, s, model.Monitor{ID: "mon-older", Type: model.MonitorTypeTCP, AssignAll: true, CreatedAt: at.Add(-time.Hour)})
+	for _, id := range []string{"mon-c", "mon-a", "mon-d", "mon-b"} {
+		seedMonitor(t, s, model.Monitor{ID: id, Type: model.MonitorTypeTCP, AssignAll: true, CreatedAt: at})
+	}
+	for i := 0; i < 20; i++ {
+		var ids []string
+		for _, m := range s.Monitors() {
+			ids = append(ids, m.ID)
+		}
+		if got := strings.Join(ids, ","); got != "mon-older,mon-a,mon-b,mon-c,mon-d" {
+			t.Fatalf("order = %s", got)
+		}
+	}
+}

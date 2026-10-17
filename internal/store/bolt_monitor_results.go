@@ -489,8 +489,8 @@ func deleteKeysWithPrefixTx(b *bolt.Bucket, prefix []byte) (int, error) {
 	return len(keys), nil
 }
 
-// deleteMonitorResultsTx removes a monitor's rows, rollups and latest
-// records.
+// deleteMonitorResultsTx removes a monitor's rows, rollups, degraded records
+// and latest records.
 func deleteMonitorResultsTx(tx *bolt.Tx, monitorID string) error {
 	prefix, err := boltKeyPrefix(monitorID + "/")
 	if err != nil {
@@ -500,6 +500,9 @@ func deleteMonitorResultsTx(tx *bolt.Tx, monitorID string) error {
 		return err
 	}
 	if err := deleteMonitorRollupsTx(tx, prefix); err != nil {
+		return err
+	}
+	if _, err := deleteKeysWithPrefixTx(tx.Bucket(boltBucketMonPathDegraded), prefix); err != nil {
 		return err
 	}
 	_, err = deleteKeysWithPrefixTx(tx.Bucket(boltBucketMonResultLatest), prefix)
@@ -577,6 +580,9 @@ func (bs *BoltStateStore) MonitorResultsHeldForNode(nodeID string) (int, error) 
 func (bs *BoltStateStore) DeleteMonitorResultsForNode(nodeID string) error {
 	return bs.db.Update(func(tx *bolt.Tx) error {
 		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		if err := deletePathDegradedForNodeTx(tx, nodeID); err != nil {
 			return err
 		}
 		return monitorPairsForNodeTx(tx, nodeID, func(key string, _ MonitorLatest) error {

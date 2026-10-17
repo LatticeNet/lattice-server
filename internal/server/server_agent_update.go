@@ -75,6 +75,19 @@ type agentUpdatePayload struct {
 	// Every plan made now sets it. Approvals planned before this field existed
 	// decode as false and render the download they were approved with.
 	ResumeDownload bool `json:"resume_download,omitempty"`
+	// CompressedSHA256, CompressedSize and BinarySize are set together when
+	// the control plane holds the binary gzip-compressed (design 31, S3). The
+	// control-plane URL then names the compressed object. The node holds it to
+	// CompressedSHA256 before decompressing, stops decompressing past
+	// BinarySize bytes, and holds the result to SHA256 like every download.
+	// The fallback stays the uncompressed release asset, held to SHA256, and
+	// CompressedSize lets the script compare progress on the two files. Only
+	// a resumable control-plane plan carries them. Approvals planned before
+	// compression decode without them and render the download they were
+	// approved with.
+	CompressedSHA256 string `json:"compressed_sha256,omitempty"`
+	CompressedSize   int    `json:"compressed_size,omitempty"`
+	BinarySize       int    `json:"binary_size,omitempty"`
 }
 
 type agentReleaseInfoView struct {
@@ -597,14 +610,29 @@ func (s *Server) withControlPlaneBinarySource(node model.Node, payload agentUpda
 	if err != nil {
 		return payload
 	}
-	if binaryURL, ok := s.controlPlaneAgentBinaryURL(payload.TargetVersion, osName, arch, payload.SHA256); ok {
-		if payload.BinaryURL != binaryURL {
+	if artifact, ok := s.controlPlaneAgentArtifact(payload.TargetVersion, osName, arch, payload.SHA256); ok {
+		// A policy URL on this control plane's own binary route is the same
+		// copy, and that route answers only a lease, which a fallback never
+		// carries, so it is not a fallback. The gzip form gives that copy a
+		// second URL, so comparing with the one URL chosen is not enough.
+		if !strings.HasPrefix(payload.BinaryURL, s.agentBinaryBaseURL()+agentBinaryPathPrefix) {
 			payload.FallbackURL = payload.BinaryURL
 		}
-		payload.BinaryURL = binaryURL
-		payload.BinarySource = agentBinarySourceControlPlane
+		applyControlPlaneArtifact(&payload, artifact)
 	}
 	return payload
+}
+
+// applyControlPlaneArtifact points a payload at the stored copy, and at its
+// compressed form with both digests and sizes when that is what is stored.
+func applyControlPlaneArtifact(payload *agentUpdatePayload, artifact agentControlPlaneArtifact) {
+	payload.BinaryURL = artifact.url
+	payload.BinarySource = agentBinarySourceControlPlane
+	if artifact.ref.GzipSHA256 != "" {
+		payload.CompressedSHA256 = artifact.ref.GzipSHA256
+		payload.CompressedSize = artifact.compressedSize
+		payload.BinarySize = artifact.binarySize
+	}
 }
 
 func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model.AgentUpdatePolicy) (agentUpdatePayload, error) {
@@ -634,10 +662,9 @@ func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model
 	// still deterministic, so it goes into the plan as the fallback without a
 	// fetch; the stored digest is what either download is verified against.
 	if stored, ok := s.storedAgentArtifact(target, osName, arch); ok {
-		if binaryURL, ok := s.controlPlaneAgentBinaryURL(target, osName, arch, stored.SHA256); ok {
+		if artifact, ok := s.controlPlaneAgentArtifact(target, osName, arch, stored.SHA256); ok {
 			payload.SHA256 = stored.SHA256
-			payload.BinaryURL = binaryURL
-			payload.BinarySource = agentBinarySourceControlPlane
+			applyControlPlaneArtifact(&payload, artifact)
 			payload.FallbackURL = releaseURL
 			return payload, nil
 		}
@@ -1002,6 +1029,12 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 		fmt.Fprintf(&b, "fallback_url: %s\n", payload.FallbackURL)
 	}
 	fmt.Fprintf(&b, "sha256: %s\n", payload.SHA256)
+	compressed := payload.CompressedSHA256 != ""
+	if compressed {
+		fmt.Fprintf(&b, "compressed_sha256: %s\n", payload.CompressedSHA256)
+		fmt.Fprintf(&b, "compressed_size: %d\n", payload.CompressedSize)
+		fmt.Fprintf(&b, "binary_size: %d\n", payload.BinarySize)
+	}
 	fmt.Fprintf(&b, "install_path: %s\n", payload.InstallPath)
 	fmt.Fprintf(&b, "service_name: %s\n", payload.ServiceName)
 	if payload.ResumeDownload {
@@ -1012,10 +1045,21 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 		fmt.Fprintf(&b, "- the binary comes from this control plane, so the node needs no third-party egress\n")
 		fmt.Fprintf(&b, "- the control plane re-verifies the stored bytes against this digest before serving them\n")
 		switch {
+		case payload.FallbackURL != "" && payload.ResumeDownload && compressed:
+			fmt.Fprintf(&b, "- if the control-plane download fails or is left early, the node fetches fallback_url, the uncompressed release binary, without the task lease, continuing its own kept download, and holds it to sha256; both share the same %s s download budget\n", agentFetchBudgetSec)
 		case payload.FallbackURL != "" && payload.ResumeDownload:
-			fmt.Fprintf(&b, "- if the control-plane download fails, the node fetches fallback_url once, without the task lease, continuing from what the control plane already sent, and verifies the result against the same digest; with curl the fallback gets what is left of the same %s s download budget\n", agentFetchBudgetSec)
+			fmt.Fprintf(&b, "- if the control-plane download fails or is left early, the node fetches fallback_url without the task lease, continuing from what the control plane already sent, and verifies the result against the same digest; both share the same %s s download budget\n", agentFetchBudgetSec)
 		case payload.FallbackURL != "":
 			fmt.Fprintf(&b, "- if the control-plane download fails, the node fetches fallback_url once, without the task lease, and verifies it against the same digest; with curl the fallback gets what is left of the same %s s download budget\n", agentFetchBudgetSec)
+		}
+		if compressed {
+			fmt.Fprintf(&b, "- the control plane sends the binary gzip-compressed, %d bytes for %d; the node holds the compressed file to compressed_sha256 before decompressing it, stops decompressing past binary_size bytes and refuses any other size, then holds the result to sha256 before running it; the compressed download is kept between attempts as %s<compressed_sha256>, like the binary's\n",
+				payload.CompressedSize, payload.BinarySize, agentUpdatePartialPrefix)
+			if payload.FallbackURL != "" {
+				fmt.Fprintf(&b, "- a node without a working gzip or head -c skips the compressed download and fetches fallback_url\n")
+			} else {
+				fmt.Fprintf(&b, "- a node without a working gzip or head -c has no source it can use, and the task fails with that reason\n")
+			}
 		}
 	} else {
 		fmt.Fprintf(&b, "- the binary comes from the upstream release, so this node needs egress to it\n")
@@ -1027,6 +1071,7 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	fmt.Fprintf(&b, "- the download gives up after %s s without a connection or %s s in total, so a node without egress to the source fails the task instead of hanging it\n", agentFetchConnectSec, agentFetchBudgetSec)
 	if payload.ResumeDownload {
 		fmt.Fprintf(&b, "%s\n", agentUpdateResumePlanLine)
+		fmt.Fprintf(&b, "%s\n", agentUpdateCutoffPlanLine)
 	}
 	fmt.Fprintf(&b, "- default/legacy install targets follow the running lattice-agent path and default service may follow the running systemd unit\n")
 	fmt.Fprintf(&b, "%s\n", agentUpdateKeepalivePlanLine)
@@ -1222,17 +1267,36 @@ func agentUpdatePayloadFromApproval(approval model.Approval) (agentUpdatePayload
 			return agentUpdatePayload{}, fmt.Errorf("fallback_url: %w", err)
 		}
 	}
+	compressedSHA := strings.ToLower(strings.TrimSpace(payload.CompressedSHA256))
+	if compressedSHA != "" || payload.CompressedSize != 0 || payload.BinarySize != 0 {
+		// Compression is a control-plane form of a resumable download: the
+		// script that decompresses is the one that keeps partials, and the
+		// upstream release asset is never compressed.
+		if source != agentBinarySourceControlPlane || !payload.ResumeDownload {
+			return agentUpdatePayload{}, errors.New("agent update approval names a compressed binary outside a resumable control-plane download")
+		}
+		if !agentSHA256Re.MatchString(compressedSHA) {
+			return agentUpdatePayload{}, errors.New("compressed_sha256 must be a 64-character lowercase hex digest")
+		}
+		if payload.BinarySize <= 0 || payload.BinarySize > maxAgentArtifactBytes ||
+			payload.CompressedSize <= 0 || payload.CompressedSize > maxAgentArtifactBytes {
+			return agentUpdatePayload{}, fmt.Errorf("binary_size and compressed_size must be between 1 and %d bytes", maxAgentArtifactBytes)
+		}
+	}
 	return agentUpdatePayload{
-		NodeID:         payload.NodeID,
-		CurrentVersion: payload.CurrentVersion,
-		TargetVersion:  normalized.TargetVersion,
-		BinaryURL:      normalized.BinaryURL,
-		SHA256:         normalized.SHA256,
-		InstallPath:    normalized.InstallPath,
-		ServiceName:    normalized.ServiceName,
-		BinarySource:   source,
-		FallbackURL:    fallbackURL,
-		ResumeDownload: payload.ResumeDownload,
+		NodeID:           payload.NodeID,
+		CurrentVersion:   payload.CurrentVersion,
+		TargetVersion:    normalized.TargetVersion,
+		BinaryURL:        normalized.BinaryURL,
+		SHA256:           normalized.SHA256,
+		InstallPath:      normalized.InstallPath,
+		ServiceName:      normalized.ServiceName,
+		BinarySource:     source,
+		FallbackURL:      fallbackURL,
+		ResumeDownload:   payload.ResumeDownload,
+		CompressedSHA256: compressedSHA,
+		CompressedSize:   payload.CompressedSize,
+		BinarySize:       payload.BinarySize,
 	}, nil
 }
 
@@ -1331,6 +1395,15 @@ func agentUpdatePayloadChangeSummary(planned, current agentUpdatePayload) string
 	}
 	if planned.ResumeDownload != current.ResumeDownload {
 		changes = append(changes, fmt.Sprintf("resume_download planned=%t current=%t", planned.ResumeDownload, current.ResumeDownload))
+	}
+	if planned.CompressedSHA256 != current.CompressedSHA256 {
+		changes = append(changes, fmt.Sprintf("compressed_sha256 planned=%s current=%s", shortDigest(planned.CompressedSHA256), shortDigest(current.CompressedSHA256)))
+	}
+	if planned.CompressedSize != current.CompressedSize {
+		changes = append(changes, fmt.Sprintf("compressed_size planned=%d current=%d", planned.CompressedSize, current.CompressedSize))
+	}
+	if planned.BinarySize != current.BinarySize {
+		changes = append(changes, fmt.Sprintf("binary_size planned=%d current=%d", planned.BinarySize, current.BinarySize))
 	}
 	if len(changes) == 0 {
 		return "resolved update payload changed"
@@ -1564,6 +1637,13 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 			return "", errors.New("approval pins control-plane binary distribution but its binary_url is not served by this control plane; re-plan before approving")
 		}
 	}
+	walk := agentUpdateWalks(approval.Plan, payload)
+	compressed := payload.CompressedSHA256 != ""
+	if compressed && !walk {
+		// Only the walk keeps the compressed download apart from the binary
+		// and checks it before decompressing; no other download may run it.
+		return "", errors.New("approval pins a compressed binary but its plan predates the source walk; re-plan before approving")
+	}
 	return "set -e\n" +
 		"umask 077\n" +
 		// The task shim caps every file the script writes at 8 MiB
@@ -1580,6 +1660,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		agentUpdateFallbackURLLine(payload.FallbackURL) +
 		"BINARY_SOURCE=" + shellQuote(source) + "\n" +
 		"EXPECT_SHA=" + shellQuote(payload.SHA256) + "\n" +
+		agentUpdateCompressedHeader(payload) +
 		"TARGET=" + shellQuote(payload.InstallPath) + "\n" +
 		"SERVICE=" + shellQuote(payload.ServiceName) + "\n" +
 		"TARGET_VERSION=" + shellQuote(payload.TargetVersion) + "\n" +
@@ -1605,6 +1686,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"fi\n" +
 		"if [ -n \"$RUNNING_SERVICE\" ] && [ \"$SERVICE\" = \"$DEFAULT_SERVICE\" ]; then SERVICE=\"$RUNNING_SERVICE\"; fi\n" +
 		"echo \"lattice agent update: effective target=$TARGET service=$SERVICE binary_source=$BINARY_SOURCE\"\n" +
+		agentUpdateSummaryStep(walk) +
 		"if ! command -v systemctl >/dev/null 2>&1 || [ ! -d /run/systemd/system ]; then\n" +
 		"  echo 'lattice agent update: systemd is required for managed agent updates; refusing to install without a restart manager' >&2\n" +
 		"  exit 1\n" +
@@ -1619,8 +1701,8 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"  exit 1\n" +
 		"fi\n" +
 		agentUpdateLeasePreflight(source) +
-		agentUpdateCandidateStep(payload.ResumeDownload) +
-		agentUpdateFetchStep(source, payload.FallbackURL != "", payload.ResumeDownload) +
+		agentUpdateDownload(payload, source, walk) +
+		agentUpdateStageLine(walk, "verify") +
 		"if command -v sha256sum >/dev/null 2>&1; then\n" +
 		"  ACTUAL_SHA=$(sha256sum \"$CANDIDATE\" | awk '{print $1}')\n" +
 		"elif command -v shasum >/dev/null 2>&1; then\n" +
@@ -1629,7 +1711,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"  echo 'lattice agent update: sha256sum or shasum is required' >&2\n" +
 		"  exit 1\n" +
 		"fi\n" +
-		agentUpdateDigestMismatchStep(payload.ResumeDownload) +
+		agentUpdateMismatch(payload, walk) +
 		agentUpdateVerifiedModeStep(payload.ResumeDownload) +
 		"CANDIDATE_VERSION=$(\"$CANDIDATE\" -version)\n" +
 		"if [ \"$CANDIDATE_VERSION\" != \"$TARGET_VERSION\" ]; then\n" +
@@ -1637,6 +1719,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"  exit 1\n" +
 		"fi\n" +
 		agentUpdateCompatStep(approval.Plan) +
+		agentUpdateStageLine(walk, "install") +
 		"mkdir -p \"$(dirname \"$TARGET\")\"\n" +
 		"BACKUP=\"\"\n" +
 		"if [ -e \"$TARGET\" ]; then\n" +
@@ -1645,13 +1728,42 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"fi\n" +
 		"install -m 0755 \"$CANDIDATE\" \"$TARGET.new\"\n" +
 		"mv \"$TARGET.new\" \"$TARGET\"\n" +
-		agentUpdateInstalledStep(payload.ResumeDownload) +
+		agentUpdateInstalled(payload, walk) +
 		agentUpdateKeepaliveStep(approval.Plan) +
 		"systemctl daemon-reload\n" +
 		agentUpdateGuardStep(approval.Plan) +
 		"RESTART_UNIT=\"lattice-agent-delayed-restart-$(date +%Y%m%d%H%M%S)-$$\"\n" +
 		agentUpdateRestartStep(approval.Plan) +
+		agentUpdateStageLine(walk, "done") +
 		"echo \"lattice agent update: installed $TARGET_VERSION and scheduled $SERVICE restart via $RESTART_UNIT\"\n", nil
+}
+
+// agentUpdateDownload renders where the download lands and how it is
+// fetched: the walk for a plan that carries the cutoff line, otherwise the
+// download the approval was planned with.
+func agentUpdateDownload(payload agentUpdatePayload, source string, walk bool) string {
+	if walk {
+		compressed := payload.CompressedSHA256 != ""
+		return agentUpdateWalkCandidateStep(compressed) +
+			agentUpdateWalkStep(payload) +
+			agentUpdateUnpackStep(compressed)
+	}
+	return agentUpdateCandidateStep(payload.ResumeDownload) +
+		agentUpdateFetchStep(source, payload.FallbackURL != "", payload.ResumeDownload)
+}
+
+func agentUpdateMismatch(payload agentUpdatePayload, walk bool) string {
+	if walk {
+		return agentUpdateWalkDigestMismatchStep(payload.CompressedSHA256 != "")
+	}
+	return agentUpdateDigestMismatchStep(payload.ResumeDownload)
+}
+
+func agentUpdateInstalled(payload agentUpdatePayload, walk bool) string {
+	if walk {
+		return agentUpdateWalkInstalledStep(payload.CompressedSHA256 != "")
+	}
+	return agentUpdateInstalledStep(payload.ResumeDownload)
 }
 
 // agentUpdateLeasePreflight stops a control-plane download before it starts on
@@ -1672,9 +1784,12 @@ func agentUpdateLeasePreflight(source string) string {
 
 // Fetch timeouts for the update download. Without them a node that cannot
 // reach the source (a CN node and github.com, observed 2026-09-02) sits in a
-// TCP connect that never completes, the task runs to its lease timeout, and
-// because the agent runs tasks on its report loop the node reads as offline
-// for the whole time. 20 s to connect keeps an unreachable source explicit.
+// TCP connect that never completes and the task runs to its lease timeout.
+// Agents before v0.3.10-alpha.1 ran tasks on their report loop, so such a
+// node also read as offline for the whole time; from v0.3.10-alpha.1 the
+// heartbeat runs on its own goroutine (node-agent 81ae17e) and the node stays
+// online, but the task still hangs. 20 s to connect keeps an unreachable
+// source explicit.
 //
 // The total was 300 s, which left half the task's own budget unused and failed
 // every node too slow to finish inside it. xuezhang-jp fetches at about 34 KiB/s
@@ -1687,8 +1802,9 @@ func agentUpdateLeasePreflight(source string) string {
 // node. 480 s spends the download budget that already exists and still leaves
 // two minutes of headroom, so a hung source fails inside the task rather than
 // at the lease. Raising it further means raising the task timeout, which cannot
-// go past ten minutes: the agent treats a larger value as out of range and
-// falls back to 30 s rather than clamping.
+// go past ten minutes on any agent: from v0.3.10-alpha.1 the agent clamps a
+// larger value to 600 s (node-agent c8de23e), and older agents treat it as out
+// of range and fall back to their 30 s default.
 //
 // A plan with a fallback URL makes two attempts, and two full 480 s attempts
 // cannot fit in 600 s. So the 480 s is a budget for the download as a whole:
@@ -1696,7 +1812,8 @@ func agentUpdateLeasePreflight(source string) string {
 // that attempt left. The failure the fallback exists for is a connect timeout
 // (2026-10-04, a gomami node whose agent reaches the control plane through a
 // relay the task cannot use), which spends 20 s and leaves 460 s, more than
-// the slowest uplink on the fleet needs.
+// the slowest uplink on the fleet needs. The source walk of a plan made now
+// (agentUpdateWalkStep) divides the same budget between its sources instead.
 //
 // The plan an operator approves states these limits, so it reads them from
 // here rather than repeating the numbers: the 300 s total stayed in the plan
@@ -2007,6 +2124,7 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 	// applied before its task result lands. A result cannot un-apply what the
 	// node has proven, so it is recorded as a task result and nothing else.
 	if approval.Status == model.ApprovalApplied {
+		s.recordAgentUpdateFetch(r, approval, payload, result)
 		return nil
 	}
 	policy, ok := s.store.AgentUpdatePolicy(payload.NodeID)
@@ -2043,6 +2161,7 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		return err
 	}
 	if !written {
+		s.recordAgentUpdateFetch(r, approval, payload, result)
 		return nil
 	}
 	if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
@@ -2055,11 +2174,34 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		Decision: decision,
 		Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
 	}
+	// What each source delivered, from the line the walk prints last. It is
+	// kept for success and failure alike: a slow download that finished is
+	// the measurement the next change to the sources needs.
+	if summary, ok := parseAgentFetchSummary(result.Stderr); ok {
+		ev.Metadata["fetch"] = summary
+	}
 	if decision == "deny" {
 		ev.Reason = policy.LastError
 	}
 	s.recordRequestAudit(r, ev)
 	return nil
+}
+
+// recordAgentUpdateFetch keeps the fetch summary of a result that arrives
+// after the node's own report already applied its approval. Those are often
+// the slow downloads that finished, the measurement the summary exists for.
+func (s *Server) recordAgentUpdateFetch(r *http.Request, approval model.Approval, payload agentUpdatePayload, result model.TaskResult) {
+	summary, ok := parseAgentFetchSummary(result.Stderr)
+	if !ok {
+		return
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   approval.NodeID,
+		Action:   "agent.update.fetch",
+		Decision: "observe",
+		Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID, "fetch": summary},
+	})
 }
 
 func agentUpdateAwaitingConfirmationReason(targetVersion string) string {

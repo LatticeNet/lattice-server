@@ -40,7 +40,9 @@ func TestAgentUpdateControlPlanePlanNamesThePinnedURLAsFallback(t *testing.T) {
 	if !strings.Contains(approval.Plan, "\nfallback_url: "+fallbackTestReleaseURL+"\n") {
 		t.Fatalf("the plan an operator approves must show the fallback URL:\n%s", approval.Plan)
 	}
-	if !strings.Contains(approval.Plan, "if the control-plane download fails, the node fetches fallback_url once, without the task lease") {
+	// A plan made now walks its sources, so the fallback is also used when
+	// the control plane is left early, and the second pass may return to it.
+	if !strings.Contains(approval.Plan, "if the control-plane download fails or is left early, the node fetches fallback_url without the task lease") {
 		t.Fatalf("the plan must say when the fallback is used and that it carries no lease:\n%s", approval.Plan)
 	}
 }
@@ -366,7 +368,7 @@ func runAgentUpdateFetch(t *testing.T, script string, r fetchStubRun) fetchStubO
 			t.Fatal(err)
 		}
 	}
-	tools := []string{"cat", "rm", "awk", "sha256sum", "shasum", "touch", "dirname", "mkdir", "chmod", "wc", "tail", "head"}
+	tools := []string{"cat", "rm", "awk", "sha256sum", "shasum", "touch", "dirname", "mkdir", "chmod", "wc", "tail", "head", "grep"}
 	if r.real {
 		tools = append(tools, r.fetcher)
 	}
@@ -386,6 +388,8 @@ func runAgentUpdateFetch(t *testing.T, script string, r fetchStubRun) fetchStubO
 		}
 	}
 	fetchStub := "#!/bin/sh\n" +
+		// The source walk asks wget whether it is GNU wget.
+		"if [ \"$1\" = --help ]; then echo '--https-only'; exit 0; fi\n" +
 		"out=''; prev=''; last=''; resume=0\n" +
 		"for a in \"$@\"; do\n" +
 		"  if [ \"$prev\" = -o ] || [ \"$prev\" = -O ]; then out=$a; fi\n" +
@@ -504,6 +508,15 @@ func runAgentUpdateFetch(t *testing.T, script string, r fetchStubRun) fetchStubO
 	return out
 }
 
+// approvalBeforeTheWalk returns the approval as it was planned before the
+// source walk: the same payload, a plan without the cutoff line. Approvals
+// like it are still open on the fleet and render the download they were
+// approved with.
+func approvalBeforeTheWalk(approval model.Approval) model.Approval {
+	approval.Plan = strings.Replace(approval.Plan, agentUpdateCutoffPlanLine+"\n", "", 1)
+	return approval
+}
+
 // approvalWithResume returns the approval as it would have been planned with
 // resumable downloads, or before they existed.
 func approvalWithResume(t *testing.T, approval model.Approval, resume bool) model.Approval {
@@ -521,9 +534,10 @@ func approvalWithResume(t *testing.T, approval model.Approval, resume bool) mode
 // plan with a fallback, under sh, with curl, wget and date replaced by stubs
 // that log their arguments and answer per URL. This is the part of the script
 // the fallback changes; the rest needs systemd and is covered elsewhere. Both
-// downloads run: the one approvals planned before resume still render, and
-// the resumable one every plan gets now. They differ only in what a failed
-// download leaves behind.
+// downloads that approvals planned before the source walk still render run:
+// the one planned before resume and the resumable one. They differ only in
+// what a failed download leaves behind. The walk every plan gets now has its
+// own tests in server_agent_update_walk_test.go.
 func TestAgentUpdateFallbackDownloadRunsInSh(t *testing.T) {
 	srv, _, st := newAgentArtifactServer(t)
 	data, _, _ := seedControlPlaneUpdate(t, srv, st)
@@ -532,6 +546,7 @@ func TestAgentUpdateFallbackDownloadRunsInSh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	planned = approvalBeforeTheWalk(planned)
 	for _, resume := range []bool{false, true} {
 		variant := "planned before resume"
 		if resume {

@@ -455,18 +455,18 @@ func TestVpnUserUsageViewTotalCoversPeriod(t *testing.T) {
 	}
 }
 
-// The regression this fixes. The legacy ProxyUser projection is rebuilt from
-// the identity on every report, so it holds the last delta rather than a
-// lifetime, and production showed a total of 534 beside a period of 1602 for
-// the same user at the same instant. The users list must read the day rows,
-// which carry the same attribution decisions as the period.
+// The regression this fixes. The legacy ProxyUser projection of an identity
+// was rebuilt on every report until the eligible set carried its stored
+// record, so it held the last delta rather than a lifetime, and production
+// showed a total of 534 beside a period of 1602 for the same user at the same
+// instant. Records written before that fix still hold such a delta. The users
+// list must read the day rows, which carry the same attribution decisions as
+// the period.
 func TestVpnUserUsageViewIgnoresStaleProxyUserProjection(t *testing.T) {
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	srv := usageTestServer(t, now)
 	f := seedUsageFleet(t, srv)
 	reportUsageFleet(t, srv, f)
-	// Two further reports, which is all it takes: the projection drops what
-	// it held and keeps only this round's delta.
 	mustApplyUsage(t, srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: 300,
 		InboundTraffic: map[string]model.ProxyTrafficCounter{"direct-a": counter(50, 90)}})
 	mustApplyUsage(t, srv, model.ProxyUsageSnapshot{NodeID: "node-a", CoreUptimeSec: 400,
@@ -478,9 +478,14 @@ func TestVpnUserUsageViewIgnoresStaleProxyUserProjection(t *testing.T) {
 		t.Fatalf("bob day rows: %v %+v", err, rows)
 	}
 	counted := rows[0].Uplink + rows[0].Downlink
+	// The projection as a report before the fix left it: the last delta only.
 	pu, ok := srv.store.ProxyUser(f.bob.ID)
-	if !ok || pu.UsedBytes >= counted {
-		t.Fatalf("fixture no longer reproduces the stale projection: projection=%d counted=%d", pu.UsedBytes, counted)
+	if !ok {
+		t.Fatal("bob has no projection")
+	}
+	pu.UsedBytes = (60 + 110) - (50 + 90)
+	if err := srv.store.UpsertProxyUser(pu); err != nil {
+		t.Fatal(err)
 	}
 
 	bob, ok := srv.getVpnUser(f.bob.ID)

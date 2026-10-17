@@ -216,6 +216,12 @@ func (s *Server) substoreBindPrepare(ctx context.Context, pluginID, subscription
 		Revision: revision, MemberRevisions: memberRevisions, Snapshot: snap})
 	if err != nil {
 		s.logger.Printf("sub-store bind: preview render failed for record %s (%s)", subscriptionID, subscriptionDiagnosticSummary(err))
+		// The plugin rendered and refused a chain that asked for the
+		// network: that refusal is the answer, whatever the snapshot did.
+		if substoreScriptNetworkRefused(err) {
+			return nil, s.substoreScriptNetworkRefusalFor(substoreScriptNetworkRender{SubscriptionID: subscriptionID, Revision: revision,
+				MemberRevisions: memberRevisions})
+		}
 		if snapErr != nil {
 			return nil, unavailable()
 		}

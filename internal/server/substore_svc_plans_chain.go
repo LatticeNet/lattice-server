@@ -76,11 +76,27 @@ func subStoreStagedKey(id string) string {
 // the document is missing, over the bound, does not decode or names another
 // record.
 func (s *Server) subStoreRecordSteps(id string, staged bool) ([]json.RawMessage, bool) {
-	type stepsDocument struct {
+	var doc struct {
 		ID        string            `json:"id"`
 		Process   []json.RawMessage `json:"process"`
 		Operators []json.RawMessage `json:"operators"`
 	}
+	raw, ok := s.subStoreRecordJSON(id, staged)
+	if !ok || json.Unmarshal(raw, &doc) != nil || doc.ID != id {
+		return nil, false
+	}
+	if len(doc.Process) > 0 {
+		return doc.Process, true
+	}
+	return doc.Operators, true
+}
+
+// subStoreRecordJSON is the record object of a record's live document, or
+// of its staged one taken out of its wrapper, as the store holds it and
+// bounded. ok is false when the document is missing, over the bound or, for
+// a staged one, does not decode; the caller decodes the record and checks
+// its id.
+func (s *Server) subStoreRecordJSON(id string, staged bool) (json.RawMessage, bool) {
 	key := subStoreRecordKey(id)
 	if staged {
 		key = subStoreStagedKey(id)
@@ -89,25 +105,16 @@ func (s *Server) subStoreRecordSteps(id string, staged bool) ([]json.RawMessage,
 	if !ok || len(entry.Value) == 0 || len(entry.Value) > usageMaxSubStoreRecordsLen {
 		return nil, false
 	}
-	var doc stepsDocument
-	if staged {
-		var wrapper struct {
-			Record stepsDocument `json:"record"`
-		}
-		if err := json.Unmarshal([]byte(entry.Value), &wrapper); err != nil {
-			return nil, false
-		}
-		doc = wrapper.Record
-	} else if err := json.Unmarshal([]byte(entry.Value), &doc); err != nil {
+	if !staged {
+		return json.RawMessage(entry.Value), true
+	}
+	var wrapper struct {
+		Record json.RawMessage `json:"record"`
+	}
+	if err := json.Unmarshal([]byte(entry.Value), &wrapper); err != nil || len(wrapper.Record) == 0 {
 		return nil, false
 	}
-	if doc.ID != id {
-		return nil, false
-	}
-	if len(doc.Process) > 0 {
-		return doc.Process, true
-	}
-	return doc.Operators, true
+	return wrapper.Record, true
 }
 
 // subStorePlanStep is one step as a plan sees it: a digest of its stored

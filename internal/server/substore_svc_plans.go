@@ -760,9 +760,14 @@ func subStoreBuildClearPlan(spec subStorePlanSpec, shares []model.SubscriptionSh
 func subStorePlanProposeError(err error) error {
 	var previewErr *subStorePlanPreviewError
 	var chainErr *errSubStorePlanChainUnreadable
+	var scriptNetwork *substoreScriptNetworkRefusal
 	switch {
 	case errors.As(err, &chainErr):
 		return subStorePlanChainProposeError(chainErr)
+	case errors.As(err, &scriptNetwork):
+		// Its own 409 with the record and the step, like the plan
+		// refusals above.
+		return scriptNetwork
 	case errors.Is(err, errSubStorePlanNotLive):
 		return rpcAPIError(http.StatusConflict, subStoreSvcErrConflict, "from_revision is not the record's live revision; propose from the live revision")
 	case errors.Is(err, errSubStorePlanNoPreviewer):

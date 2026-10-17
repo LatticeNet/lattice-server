@@ -63,8 +63,19 @@ func (s *Server) subStorePlanApprove(ctx context.Context, p principal, approval 
 		var err error
 		previews, err = s.subStorePlanDecisionPreviews(ctx, plan)
 		var previewErr *subStorePlanPreviewError
+		var scriptNetwork *substoreScriptNetworkRefusal
 		switch {
 		case err == nil:
+		case errors.As(err, &scriptNetwork):
+			// A record of the plan that moved makes the plan stale, as for
+			// any failed preview; otherwise the chain as it stands asks for
+			// the network and cannot render, and the operator sees why.
+			if moved := s.subStorePlanMovedReason(ctx, plan); moved != "" {
+				staleReason = moved
+				break
+			}
+			return approval, &approvalDecisionError{status: http.StatusConflict,
+				err: apiError(apiErrorFleetScriptNetworkUnavailable, scriptNetwork.Error()+"; the plan stays pending")}
 		case errors.Is(err, errSubStorePlanNotLive):
 			staleReason = subStorePlanStaleLive
 		case errors.Is(err, errSubStorePlanNoPreviewer):

@@ -230,3 +230,16 @@ export interface ShareRow {
   updated_at: string;
   rotated_at?: string;
 }
+
+export interface ScriptNetworkStep {
+  position: number;
+  type: string;
+}
+
+export interface ScriptNetworkRefusal {
+  code: string;
+  message: string;
+  request_id: string;
+  record?: string;
+  step?: ScriptNetworkStep;
+}

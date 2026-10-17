@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 )
@@ -132,6 +133,12 @@ func (s *Server) subStorePlanIdentities(ctx context.Context, subscriptionID, exp
 		if err != nil {
 			s.logger.Printf("sub-store plans: bind preview failed for record %s revision %s (%s)",
 				subscriptionID, side.Revision, subscriptionDiagnosticSummary(err))
+			// A chain the plugin refused for asking for the network is the
+			// one preview failure propose and the decision answer as it is.
+			var refusal *substoreScriptNetworkRefusal
+			if errors.As(err, &refusal) {
+				return nil, refusal
+			}
 			return nil, &subStorePlanPreviewError{revision: side.Revision, identityID: strings.Join(sorted, ",")}
 		}
 		for _, identityID := range sorted {

@@ -1,7 +1,8 @@
 // Command tsgen writes the TypeScript declarations of the core replies the
 // Sub-Store UI reads (design 28 S2): the bind preview, its entries and
 // exclusions, the plan status row, the plan proposal and the plan itself,
-// and the shares list entry. It reads the Go source of internal/server and
+// the shares list entry, and the error object of the
+// fleet_script_network_unavailable refusal. It reads the Go source of internal/server and
 // of the SDK's model package and follows each field's JSON tag, so the UI's
 // types are the server's wire, not a hand copy of it: a hand copy is how an
 // earlier draft lost label, node_id and clone.
@@ -39,6 +40,7 @@ var roots = []struct{ goName, tsName string }{
 	{"subStorePlansProposeReply", "PlansProposeReply"},
 	{"subStorePlan", "Plan"},
 	{"subStoreShareRow", "ShareRow"},
+	{"substoreScriptNetworkBody", "ScriptNetworkRefusal"},
 }
 
 func main() {

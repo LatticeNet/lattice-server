@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1636,6 +1637,119 @@ func TestPlanDeleteApplyRendersTagDependentCollection(t *testing.T) {
 	env.checkServed(t, e2eAliceID, "sing-box", rec.Body.String(), 2)
 	if env.runner.count("fetch", "tagged") == fetches {
 		t.Fatal("the collection was served without a fetch after the delete")
+	}
+}
+
+// networkScriptOperatorStep is a Script Operator that asks for the network
+// and swallows the refusal, as a script author's own error handling would,
+// then returns the nodes untouched. Its URL carries a marker no reply shows.
+func networkScriptOperatorStep() json.RawMessage {
+	return scriptOperatorStep(`async function operator(proxies) {
+		try { await $substore.http.get({ url: "https://collector.invalid/SR2-NET-MARKER?n=" + proxies.length, timeout: 100 }); } catch (failure) {}
+		return proxies;
+	}`)
+}
+
+// requireScriptNetworkRefusal holds a gateway reply to core's typed refusal:
+// 409, the code leading the message, the record and the step, and nothing
+// of the plugin's text, the script or a node.
+func (e *s2Env) requireScriptNetworkRefusal(t *testing.T, what string, code int, body []byte, record string, position int) {
+	t.Helper()
+	if code != http.StatusConflict {
+		t.Fatalf("%s: %d %.400s", what, code, body)
+	}
+	var reply struct {
+		Error substoreScriptNetworkBody `json:"error"`
+	}
+	if err := json.Unmarshal(body, &reply); err != nil {
+		t.Fatalf("%s: %v: %.400s", what, err, body)
+	}
+	got := reply.Error
+	if got.Code != apiErrorFleetScriptNetworkUnavailable || !strings.HasPrefix(got.Message, got.Code+": ") || got.RequestID == "" ||
+		got.Record != record || got.Step == nil || got.Step.Position != position || got.Step.Type != "Script Operator" {
+		t.Fatalf("%s: %s", what, body)
+	}
+	leaks := []string{"SR2-NET-MARKER", "collector.invalid", "function operator", "time(s)", model.PlanPlaceholderPrefix, catalogueOwnerUUID}
+	for _, row := range e.rows {
+		leaks = append(leaks, row.LineUUID, row.LineHashID, row.NodeID)
+	}
+	for _, leak := range leaks {
+		if leak != "" && strings.Contains(string(body), leak) {
+			t.Fatalf("%s: the refusal carries %q: %s", what, leak, body)
+		}
+	}
+}
+
+// TestScriptNetworkRefusalNamesTheStep (S2 security review, S2-SR-2, core
+// half): the real plugin refuses every render of a fleet-bound chain whose
+// Script Operator asks for the network, and core answers plans.propose,
+// bind.preview, and the editor's preview and preview_draft relays with the
+// typed refusal: 409, the record, the step by position and type, and none of
+// the plugin's text, the script or node data. A provider member's step in a
+// fleet-bound collection is named on that member, and a share of the
+// collection logs the refusal by its code alone.
+func TestScriptNetworkRefusalNamesTheStep(t *testing.T) {
+	env := newS2Env(t, 2, 2, 1)
+	logs := &lockedLog{}
+	env.srv.logger = log.New(logs, "", 0)
+	live := env.live(t, fleetRecord("fleet"))
+	env.createShare(t, "fleet", "alice-net", e2eAliceID)
+	var disabled map[string]any
+	if err := json.Unmarshal(scriptOperatorStep("function operator(proxies) { return proxies }"), &disabled); err != nil {
+		t.Fatal(err)
+	}
+	disabled["disabled"] = true
+	disabledStep, _ := json.Marshal(disabled)
+	saved := env.save(t, fleetRecord("fleet", disabledStep, networkScriptOperatorStep()))
+	if !saved.Staged || saved.BaseRevision != live {
+		t.Fatalf("the step was not staged over the live revision: %+v", saved)
+	}
+	code, body := env.gateway(t, subStorePlansService, "propose", map[string]any{"subscription_id": "fleet", "from_revision": live, "to_revision": saved.StagedRevision})
+	env.requireScriptNetworkRefusal(t, "propose", code, body, "fleet", 2)
+	code, body = env.gateway(t, substoreBindService, "preview", map[string]any{"subscription_id": "fleet", "revision": saved.StagedRevision, "identity_id": e2eAliceID})
+	env.requireScriptNetworkRefusal(t, "bind.preview of the staged revision", code, body, "fleet", 2)
+	code, body = env.gateway(t, s2Subscription, "preview", map[string]any{"subscription_id": "fleet", "operators": []json.RawMessage{networkScriptOperatorStep()}})
+	env.requireScriptNetworkRefusal(t, "preview of unsaved steps", code, body, "fleet", 1)
+	code, body = env.gateway(t, s2Subscription, "preview_draft", map[string]any{"source": "fleet", "operators": []json.RawMessage{disabledStep, networkScriptOperatorStep()}})
+	env.requireScriptNetworkRefusal(t, "preview_draft", code, body, "", 2)
+	// The live revision runs no script and still previews.
+	env.mustGateway(t, substoreBindService, "preview", map[string]any{"subscription_id": "fleet", "identity_id": e2eAliceID})
+
+	// A provider member's edit in a fleet-bound collection stages, and the
+	// plan previews the collection with the member at its staged revision:
+	// the refusal names the member and its step.
+	provider := func(process ...json.RawMessage) map[string]any {
+		rec := map[string]any{"id": "prov", "source": "local", "content": "trojan://provider-secret@198.51.100.9:443#provider-entry", "target": "URI"}
+		if len(process) > 0 {
+			rec["process"] = process
+		}
+		return rec
+	}
+	provLive := env.live(t, provider())
+	env.live(t, map[string]any{"id": "coll", "kind": "collection", "members": []string{"fleet", "prov"}, "target": "sing-box"})
+	env.createShare(t, "coll", "alice-coll", e2eAliceID)
+	provSaved := env.save(t, provider(networkScriptOperatorStep()))
+	if !provSaved.Staged || provSaved.BaseRevision != provLive {
+		t.Fatalf("the provider member's edit did not stage: %+v", provSaved)
+	}
+	code, body = env.gateway(t, subStorePlansService, "propose", map[string]any{"subscription_id": "prov", "from_revision": provLive, "to_revision": provSaved.StagedRevision})
+	env.requireScriptNetworkRefusal(t, "propose of the provider member", code, body, "prov", 1)
+
+	// A live fleet record whose chain asks for the network serves no share,
+	// and the serve path logs the refusal by its class and code.
+	env.live(t, fleetRecord("served", networkScriptOperatorStep()))
+	share := env.createShare(t, "served", "alice-served", e2eAliceID)
+	if rec := env.fetch(share, "sing-box"); rec.Code == http.StatusOK {
+		t.Fatalf("a share of a chain that asks for the network served: %.200s", rec.Body.String())
+	}
+	failed := logs.linesWith("render failed for share " + share.ID)
+	if len(failed) == 0 || !strings.Contains(failed[0], "code="+apiErrorFleetScriptNetworkUnavailable) {
+		t.Fatalf("the serve path's log does not name the refusal's code: %q", failed)
+	}
+	for _, leak := range []string{"SR2-NET-MARKER", "time(s)", "provider-secret"} {
+		if len(logs.linesWith(leak)) != 0 {
+			t.Fatalf("the log carries %q: %q", leak, logs.linesWith(leak))
+		}
 	}
 }
 

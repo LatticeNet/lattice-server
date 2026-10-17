@@ -4103,6 +4103,85 @@ func (s *Store) Approvals() []model.Approval {
 	return out
 }
 
+// OpenPluginApprovals returns the pending and approved approvals of one
+// plugin, grouped by node and newest first, copying only those. The agent
+// config pull reads it through a short-lived index, so one walk of the
+// approval table serves every node's pull instead of one walk per pull.
+func (s *Store) OpenPluginApprovals(plugin string) map[string][]model.Approval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string][]model.Approval{}
+	for _, a := range s.state.Approvals {
+		if a.Plugin == plugin && (a.Status == model.ApprovalPending || a.Status == model.ApprovalApproved) {
+			out[a.NodeID] = append(out[a.NodeID], a)
+		}
+	}
+	for _, list := range out {
+		sort.Slice(list, func(i, j int) bool { return list[i].CreatedAt.After(list[j].CreatedAt) })
+	}
+	return out
+}
+
+// NodeOpenPluginApprovals is OpenPluginApprovals for one node, read fresh.
+func (s *Store) NodeOpenPluginApprovals(nodeID, plugin string) []model.Approval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []model.Approval
+	for _, a := range s.state.Approvals {
+		if a.NodeID == nodeID && a.Plugin == plugin && (a.Status == model.ApprovalPending || a.Status == model.ApprovalApproved) {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out
+}
+
+// ApprovalTaskState reports whether a task created for approvalID is queued
+// and whether one is leased to a node now, without copying the task table.
+func (s *Store) ApprovalTaskState(approvalID string) (queued, leased bool) {
+	state := s.ApprovalTaskStates([]string{approvalID})[approvalID]
+	return state.Queued, state.Leased
+}
+
+// ApprovalTaskStateView is whether an approval has a queued task and whether
+// it has a leased one.
+type ApprovalTaskStateView struct {
+	Queued, Leased bool
+}
+
+// ApprovalTaskStates is ApprovalTaskState for several approvals in one walk
+// of the task table. Approvals with no queued or leased task are absent.
+func (s *Store) ApprovalTaskStates(approvalIDs []string) map[string]ApprovalTaskStateView {
+	out := map[string]ApprovalTaskStateView{}
+	want := map[string]bool{}
+	for _, id := range approvalIDs {
+		if id != "" {
+			want[id] = true
+		}
+	}
+	if len(want) == 0 {
+		return out
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.state.Tasks {
+		if !want[t.ApprovalID] {
+			continue
+		}
+		state := out[t.ApprovalID]
+		switch t.Status {
+		case model.TaskQueued:
+			state.Queued = true
+		case model.TaskLeased:
+			state.Leased = true
+		default:
+			continue
+		}
+		out[t.ApprovalID] = state
+	}
+	return out
+}
+
 // PutSession persists a session, pruning expired entries and enforcing the
 // session cap on every write so neither memory nor the state file grows
 // unbounded under credential-stuffing or churn.

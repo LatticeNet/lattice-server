@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -835,6 +836,40 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, errAgentBinaryDenied)
 		return
 	}
+	// No download outlives the task that asked for it, and the caller has
+	// already proven its lease, so the write deadline is the agent update
+	// task's own timeout.
+	s.serveAgentArtifact(w, r, agentArtifactServe{
+		action: "agent.binary.serve", node: node, ref: ref,
+		idKey: "task_id", id: task.ID,
+		deadline: time.Duration(approvalApplyTaskTimeoutSec(agentUpdatePlugin)) * time.Second,
+	})
+}
+
+// agentArtifactServe is what an authorized download route hands the shared
+// serving body: the audit action, the node and object it authorized, the id
+// that authorized it (the task for the lease route, the approval for the
+// prefetch route), and how long the response may take to write.
+type agentArtifactServe struct {
+	action   string
+	node     model.Node
+	ref      agentArtifactRef
+	idKey    string
+	id       string
+	deadline time.Duration
+	// audit, when set, folds the serve audit under auditKey; the refusals
+	// are never folded.
+	audit    *auditFailureThrottle
+	auditKey string
+}
+
+// serveAgentArtifact sends one stored object to a node a route has already
+// authorized for exactly ref. The bytes are held to the digest in their path
+// before any byte is written (once per decoded copy, which every download of
+// that object then shares), single byte ranges are answered with that digest
+// as the ETag, and every answer is audited.
+func (s *Server) serveAgentArtifact(w http.ResponseWriter, r *http.Request, sv agentArtifactServe) {
+	node, ref := sv.node, sv.ref
 	obj, ok := s.store.StaticObject(agentArtifactBucket, ref.objectPath())
 	if !ok {
 		// Honest degradation: the control plane says plainly that it does not
@@ -843,12 +878,12 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   node.ID,
-			Action:   "agent.binary.serve",
+			Action:   sv.action,
 			Decision: "deny",
 			Reason:   "artifact is not stored on the control plane",
 			Metadata: map[string]string{
 				"version": ref.Version, "os": ref.OS, "arch": ref.Arch,
-				"sha256": ref.SHA256, "task_id": task.ID,
+				"sha256": ref.SHA256, sv.idKey: sv.id,
 			},
 		})
 		writeError(w, http.StatusNotFound, errAgentArtifactNotFound)
@@ -858,13 +893,7 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	// sends. The node holds those bytes to the same digest before it
 	// decompresses them, and the result to the binary's own digest.
 	served := ref.servedSHA256()
-	data, decodeErr := base64.StdEncoding.DecodeString(obj.Content)
-	if decodeErr == nil {
-		sum := sha256.Sum256(data)
-		if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(served)) != 1 {
-			decodeErr = fmt.Errorf("stored digest %s does not match the pinned %s", hex.EncodeToString(sum[:]), served)
-		}
-	}
+	data, decodeErr := s.agentArtifactBytes.verified(ref.objectPath(), obj.Content, served)
 	if decodeErr != nil {
 		// A wrong or truncated copy is a control-plane defect, not a node error,
 		// and it must never reach a node that is about to install it as root.
@@ -874,12 +903,12 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		s.recordRequestAudit(r, model.AuditEvent{
 			ID:       id.New("audit"),
 			NodeID:   node.ID,
-			Action:   "agent.binary.serve",
+			Action:   sv.action,
 			Decision: "deny",
 			Reason:   "stored agent binary failed integrity verification: " + decodeErr.Error(),
 			Metadata: map[string]string{
 				"version": ref.Version, "os": ref.OS, "arch": ref.Arch,
-				"sha256": ref.SHA256, "task_id": task.ID,
+				"sha256": ref.SHA256, sv.idKey: sv.id,
 			},
 		})
 		writeError(w, http.StatusInternalServerError,
@@ -892,7 +921,7 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		"arch":    ref.Arch,
 		"sha256":  ref.SHA256,
 		"bytes":   strconv.Itoa(len(data)),
-		"task_id": task.ID,
+		sv.idKey:  sv.id,
 	}
 	if ref.GzipSHA256 != "" {
 		meta["compressed_sha256"] = ref.GzipSHA256
@@ -909,12 +938,25 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		r.Header.Del("Range")
 		meta["range_ignored"] = "multiple ranges; served the whole object"
 	}
-	s.recordRequestAudit(r, model.AuditEvent{
-		ID:       id.New("audit"),
-		NodeID:   node.ID,
-		Action:   "agent.binary.serve",
-		Metadata: meta,
-	})
+	emit := true
+	if sv.audit != nil {
+		var suppressed, dropped int
+		emit, suppressed, dropped = sv.audit.Allow(sv.auditKey, s.now())
+		if suppressed > 0 {
+			meta["suppressed_repeats"] = strconv.Itoa(suppressed)
+		}
+		if dropped > 0 {
+			meta["global_suppressed"] = strconv.Itoa(dropped)
+		}
+	}
+	if emit {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   node.ID,
+			Action:   sv.action,
+			Metadata: meta,
+		})
+	}
 	w.Header().Set("Content-Type", agentArtifactContentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
@@ -927,14 +969,11 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	// wire, so a resumed download continues stable bytes.
 	w.Header().Set("ETag", agentBinaryETag(served))
 	// The server's write timeout (60 s in cmd/lattice-server) is sized for API
-	// answers. A node on a
-	// slow uplink spends minutes on this one response, and without a longer
-	// deadline a direct connection would be cut after about a megabyte. The
-	// deadline is the agent update task's own timeout: no download outlives
-	// the task that asked for it, and the caller has already proven its lease.
-	// A writer that cannot take a deadline (a test recorder) keeps the
-	// server's.
-	deadline := time.Now().Add(time.Duration(approvalApplyTaskTimeoutSec(agentUpdatePlugin)) * time.Second)
+	// answers. A node on a slow uplink spends minutes on this one response,
+	// and without a longer deadline a direct connection would be cut after
+	// about a megabyte. The route chose the deadline. A writer that cannot
+	// take a deadline (a test recorder) keeps the server's.
+	deadline := time.Now().Add(sv.deadline)
 	if err := http.NewResponseController(w).SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		s.logger.Printf("agent binary write deadline not extended: node_id=%s version=%s: %v", node.ID, ref.Version, err)
 	}
@@ -947,6 +986,107 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	if sent.err != nil {
 		s.logger.Printf("agent binary write failed: node_id=%s version=%s after %d bytes: %v", node.ID, ref.Version, sent.n, sent.err)
 	}
+}
+
+// agentArtifactByteCache holds the verified, decoded bytes of the objects
+// the download routes served last. Every request used to decode its own copy
+// and keep it for as long as its response took, which on a slow line is many
+// minutes, so memory grew with the number of open downloads. Prefetch makes
+// that number the size of the fleet: a release plans an update for every
+// online node and every node starts fetching. One shared copy per object
+// bounds it instead, and it is decoded and hashed once rather than per
+// request.
+//
+// An entry is used only for the same object path, the same stored content
+// and the same digest, so a replaced or corrupted object is decoded and
+// verified afresh. Concurrent misses for one object decode it once, outside
+// the lock. Entries are kept within agentArtifactByteCacheBudget, most
+// recently used first; the newest entry is always kept, whatever its size.
+type agentArtifactByteCache struct {
+	mu      sync.Mutex
+	entries []*agentArtifactByteEntry
+	loading map[string]*agentArtifactByteLoad
+	// budget overrides agentArtifactByteCacheBudget in tests.
+	budget int
+}
+
+type agentArtifactByteEntry struct {
+	path, content, digest string
+	data                  []byte
+}
+
+type agentArtifactByteLoad struct {
+	content, digest string
+	done            chan struct{}
+	data            []byte
+	err             error
+}
+
+// agentArtifactByteCacheBudget fits a release's raw and compressed objects
+// for both platforms, or two releases' compressed ones during a rollout.
+const agentArtifactByteCacheBudget = 64 << 20
+
+// verified returns the bytes content decodes to, held to digest. The slice is
+// shared by every caller and must not be written to.
+func (c *agentArtifactByteCache) verified(path, content, digest string) ([]byte, error) {
+	c.mu.Lock()
+	for i, e := range c.entries {
+		if e.path == path && e.content == content && e.digest == digest {
+			copy(c.entries[1:i+1], c.entries[:i])
+			c.entries[0] = e
+			c.mu.Unlock()
+			return e.data, nil
+		}
+	}
+	if ld := c.loading[path]; ld != nil && ld.content == content && ld.digest == digest {
+		c.mu.Unlock()
+		<-ld.done
+		return ld.data, ld.err
+	}
+	ld := &agentArtifactByteLoad{content: content, digest: digest, done: make(chan struct{})}
+	if c.loading == nil {
+		c.loading = map[string]*agentArtifactByteLoad{}
+	}
+	c.loading[path] = ld
+	c.mu.Unlock()
+
+	data, err := decodeVerifiedAgentArtifact(content, digest)
+
+	c.mu.Lock()
+	if c.loading[path] == ld {
+		delete(c.loading, path)
+	}
+	if err == nil {
+		budget := c.budget
+		if budget <= 0 {
+			budget = agentArtifactByteCacheBudget
+		}
+		c.entries = append([]*agentArtifactByteEntry{{path: path, content: content, digest: digest, data: data}}, c.entries...)
+		total := 0
+		for i, e := range c.entries {
+			total += len(e.data)
+			if i > 0 && total > budget {
+				c.entries = c.entries[:i]
+				break
+			}
+		}
+	}
+	c.mu.Unlock()
+	ld.data, ld.err = data, err
+	close(ld.done)
+	return data, err
+}
+
+func decodeVerifiedAgentArtifact(content, digest string) ([]byte, error) {
+	data, err := base64.StdEncoding.DecodeString(content)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(data)
+	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(digest)) != 1 {
+		return nil, fmt.Errorf("stored digest %s does not match the pinned %s", hex.EncodeToString(sum[:]), digest)
+	}
+	return data, nil
 }
 
 // agentBinaryETag is the strong validator for one stored binary.

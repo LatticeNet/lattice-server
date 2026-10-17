@@ -70,7 +70,12 @@ func TestPathDegradedPagesOnlyUnderDownAndDegraded(t *testing.T) {
 	both := []store.MonitorPair{pathPair("mon-down"), pathPair("mon-dd")}
 	f.evaluate()
 	expectNotices(t, "after one finding", f.sweep())
-	f.tick(runsFor(okRun(100), both...))
+	if pass := f.tick(runsFor(okRun(100), both...)); pass.entered != 2 {
+		t.Fatalf("second evaluation = %+v", pass)
+	}
+	// The evaluator itself opens nothing for a check on down: the sweep
+	// would close such a row before it sent anything, so look before it.
+	expectNoPathDegradedRow(t, f.st, pathPair("mon-down"))
 	got := f.sweep()
 	expectNotices(t, "after entering", got, "path.degraded: Path degraded: mon-dd on cd-hs-sh")
 	if !strings.Contains(got[0].body, "Median 100 ms over the last 15 minutes") || !strings.Contains(got[0].body, "above its trigger of 80 ms (7-day median 40 ms)") ||
@@ -104,6 +109,49 @@ func TestPathDegradedPagesOnlyUnderDownAndDegraded(t *testing.T) {
 	if !ok || again.ID != inc.ID || again.Flaps != 1 {
 		t.Fatalf("reopened = %+v, first %s", again, inc.ID)
 	}
+}
+
+// expectNoPathDegradedRow fails when the incident store holds a
+// path.degraded row of any state for pair.
+func expectNoPathDegradedRow(t *testing.T, st *store.Store, pair store.MonitorPair) {
+	t.Helper()
+	key := pathDegradedKey(pair)
+	if rows := st.IncidentsWhere(func(inc store.Incident) bool { return inc.Key == key }); len(rows) != 0 {
+		t.Fatalf("path.degraded rows for %s/%s = %+v", pair.MonitorID, pair.NodeID, rows)
+	}
+}
+
+// A policy switched to down_and_degraded while a record is clearing opens
+// nothing: the condition is gone, and its leave would otherwise send a
+// recovery for an episode nobody was paged about.
+func TestPathDegradedPolicyOnWhileClearingOpensNothing(t *testing.T) {
+	f := slowFixture(t, t.TempDir(), "mon-x")
+	f.operatorCheck("mon-x", model.MonitorAlertDown, nil, "node-sh")
+	pair := pathPair("mon-x")
+	f.evaluate()
+	if pass := f.tick(runsFor(okRun(100), pair)); pass.entered != 1 {
+		t.Fatalf("second evaluation = %+v", pass)
+	}
+	cleared := false
+	for i := 0; i < 30 && !cleared; i++ {
+		cleared = f.tick(runsFor(okRun(40), pair)).cleared == 1
+	}
+	if !cleared {
+		t.Fatal("the path never started clearing")
+	}
+	mon, _ := f.st.Monitor("mon-x")
+	mon.Alert = model.MonitorAlertDownAndDegraded
+	if err := f.st.UpsertMonitor(mon); err != nil {
+		t.Fatal(err)
+	}
+	f.tick(runsFor(okRun(40), pair))
+	if c := pathCellFor(t, f.matrix(), "node-sh", "mon-x"); c.State != model.PathStateDegraded || c.Degraded.ClearingSince == nil {
+		t.Fatalf("still clearing: %+v", c.Degraded)
+	}
+	expectNoPathDegradedRow(t, f.st, pair)
+	f.clearUntilLeft(pair)
+	expectNoPathDegradedRow(t, f.st, pair)
+	expectNotices(t, "an episode that cleared before the policy paged", f.sweep())
 }
 
 // A record that entered while the path read down is quiet for its episode:
@@ -240,10 +288,13 @@ func TestPathSetAlertPolicy(t *testing.T) {
 		f := slowFixture(t, t.TempDir(), gen)
 		f.pathSet(model.LatencyProbeConfig{})
 		f.evaluate()
-		f.tick(runsFor(okRun(100), pair))
+		if pass := f.tick(runsFor(okRun(100), pair)); pass.entered != 1 {
+			t.Fatalf("second evaluation = %+v", pass)
+		}
 		if c := pathCellTo(t, f.matrix(), "node-sh", "node-jp"); c.State != model.PathStateDegraded {
 			t.Fatalf("generated path = %+v", c)
 		}
+		expectNoPathDegradedRow(t, f.st, pair)
 		f.tick(runsFor(failedRun, pair))
 		f.tick(runsFor(failedRun, pair))
 		f.tick(runsFor(failedRun, pair))
@@ -256,7 +307,10 @@ func TestPathSetAlertPolicy(t *testing.T) {
 		f := slowFixture(t, t.TempDir(), gen)
 		f.pathSet(model.LatencyProbeConfig{Alert: model.MonitorAlertDown, AlertAfter: 3})
 		f.evaluate()
-		f.tick(runsFor(okRun(100), pair))
+		if pass := f.tick(runsFor(okRun(100), pair)); pass.entered != 1 {
+			t.Fatalf("second evaluation = %+v", pass)
+		}
+		expectNoPathDegradedRow(t, f.st, pair)
 		f.tick(runsFor(failedRun, pair))
 		f.tick(runsFor(failedRun, pair))
 		if c := pathCellTo(t, f.matrix(), "node-sh", "node-jp"); c.State == model.PathStateDown {

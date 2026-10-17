@@ -264,12 +264,21 @@ func stepPathDegraded(e *pathDegradedEntry, found bool, reason string, loss *mod
 	}
 }
 
+// pathDegradedRecordStore is where the evaluator writes its records: the
+// server's store, or in a test one whose writes fail.
+type pathDegradedRecordStore interface {
+	PutPathDegradedRecord(store.MonitorPair, store.PathDegradedRecord) error
+	DeletePathDegradedRecord(store.MonitorPair) error
+}
+
 // pathDegradedState is the evaluator's state. The zero value is ready.
 type pathDegradedState struct {
 	loadOnce sync.Once
-	// evalMu holds one evaluation at a time; it guards entries.
+	// evalMu holds one evaluation at a time; it guards entries and records.
 	evalMu  sync.Mutex
 	entries map[store.MonitorPair]*pathDegradedEntry
+	// records is where transitions are written; nil is the server's store.
+	records pathDegradedRecordStore
 
 	baseMu   sync.Mutex
 	baseHour time.Time
@@ -450,10 +459,32 @@ type degradedJudged struct {
 	state, reason string
 }
 
-// pathDegradedPass reports one evaluation: the pairs it judged and the
-// transitions it wrote.
+// pathDegradedPass reports one evaluation: the pairs it judged, the
+// transitions it wrote and the writes that failed (each retried at the next
+// evaluation).
 type pathDegradedPass struct {
-	judged, entered, cleared, left, dropped int
+	judged, entered, cleared, left, dropped, failed int
+}
+
+// pathDegradedRecordsLocked is where the evaluation writes. The caller holds
+// evalMu.
+func (s *Server) pathDegradedRecordsLocked() pathDegradedRecordStore {
+	if r := s.pathDegraded.records; r != nil {
+		return r
+	}
+	return s.store
+}
+
+// writePathDegradedStep writes the transition step makes to pair's record:
+// next's record on entering or a clearing change, a delete on leaving.
+func writePathDegradedStep(records pathDegradedRecordStore, pair store.MonitorPair, step pathDegradedStep, next *pathDegradedEntry) error {
+	switch step {
+	case stepEnter, stepStartClearing, stepStopClearing:
+		return records.PutPathDegradedRecord(pair, next.rec)
+	case stepLeave:
+		return records.DeletePathDegradedRecord(pair)
+	}
+	return nil
 }
 
 // evaluatePathDegraded runs one evaluation at now.
@@ -524,18 +555,24 @@ func (s *Server) evaluatePathDegraded(now time.Time) pathDegradedPass {
 	// A pair that is no longer judged (paused, its check disabled or gone,
 	// its target no longer resolving, its source no longer running the
 	// kind) drops its entry, and its open incident closes with the reason.
+	// Memory follows the store: an entry whose record the store could not
+	// delete is kept, and the drop is tried again at the next evaluation.
+	records := s.pathDegradedRecordsLocked()
 	for pair, e := range d.entries {
 		if _, ok := judged[pair]; ok {
 			continue
 		}
-		delete(d.entries, pair)
 		if e.pending {
+			delete(d.entries, pair)
 			continue
 		}
-		pass.dropped++
-		if err := s.store.DeletePathDegradedRecord(pair); err != nil {
-			s.logger.Printf("degraded paths: drop %s/%s: %v", pair.MonitorID, pair.NodeID, err)
+		if err := records.DeletePathDegradedRecord(pair); err != nil {
+			pass.failed++
+			s.logger.Printf("degraded paths: drop %s/%s (kept, retried at the next evaluation): %v", pair.MonitorID, pair.NodeID, err)
+			continue
 		}
+		delete(d.entries, pair)
+		pass.dropped++
 		reason := "it is no longer measured"
 		if ue, ok := unjudged[pair]; ok {
 			if state, why := pathStateOf(ue, latest[pair], nodes, now); state == model.PathStateUnknown && why != "" {
@@ -553,15 +590,14 @@ func (s *Server) evaluatePathDegraded(now time.Time) pathDegradedPass {
 		quiet := j.state != model.PathStateUp
 		prior := d.entries[pair]
 		next, step := stepPathDegraded(prior, found, reason, loss, latency, quiet, now)
-		switch step {
-		case stepEnter, stepStartClearing, stepStopClearing:
-			if err := s.store.PutPathDegradedRecord(pair, next.rec); err != nil {
-				s.logger.Printf("degraded paths: write %s/%s: %v", pair.MonitorID, pair.NodeID, err)
-			}
-		case stepLeave:
-			if err := s.store.DeletePathDegradedRecord(pair); err != nil {
-				s.logger.Printf("degraded paths: delete %s/%s: %v", pair.MonitorID, pair.NodeID, err)
-			}
+		// Memory follows the store: a transition the store did not take is
+		// not made in memory either, so a restart reads what the server
+		// showed. The pair keeps its prior entry and the next evaluation
+		// makes the transition again.
+		if err := writePathDegradedStep(records, pair, step, next); err != nil {
+			pass.failed++
+			s.logger.Printf("degraded paths: write %s/%s (not applied, retried at the next evaluation): %v", pair.MonitorID, pair.NodeID, err)
+			next, step = prior, stepNone
 		}
 		switch step {
 		case stepEnter:

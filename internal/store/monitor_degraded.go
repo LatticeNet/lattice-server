@@ -51,57 +51,86 @@ type PathDegradedRecord struct {
 func (r PathDegradedRecord) Clearing() bool { return !r.ClearSince.IsZero() }
 
 // PathDegradedRecords reads every record. Pairs whose key does not parse are
-// skipped; nothing writes such a key.
+// skipped; nothing writes such a key. With the hot store the bolt read runs
+// outside the store lock (hotForMonitorRead), as M1's history reads do.
 func (s *Store) PathDegradedRecords() (map[MonitorPair]PathDegradedRecord, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runtimeBoltHot == nil {
-		out := make(map[MonitorPair]PathDegradedRecord, len(s.pathDegraded))
-		for pair, rec := range s.pathDegraded {
-			out[pair] = rec
-		}
-		return out, nil
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.PathDegradedRecords()
 	}
-	return s.runtimeBoltHot.PathDegradedRecords()
+	defer s.mu.Unlock()
+	out := make(map[MonitorPair]PathDegradedRecord, len(s.pathDegraded))
+	for pair, rec := range s.pathDegraded {
+		out[pair] = rec
+	}
+	return out, nil
 }
 
-// PutPathDegradedRecord writes one pair's record. A pair whose monitor no
-// longer exists is not written: a delete that ran while the evaluator was
-// judging the pair must not leave a record behind it.
+// monitorPairExistsLocked reports whether pair's monitor, and its node when
+// it names one, still exist.
+func (s *Store) monitorPairExistsLocked(pair MonitorPair) bool {
+	if _, ok := s.state.Monitors[pair.MonitorID]; !ok {
+		return false
+	}
+	if pair.NodeID != "" {
+		if _, ok := s.state.Nodes[pair.NodeID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// PutPathDegradedRecord writes one pair's record. A pair whose monitor or
+// node no longer exists is not written: a delete that ran while the
+// evaluator was judging the pair must not leave a record behind it.
+//
+// With the hot store the bolt write (its fsync included) runs outside the
+// store lock, so a slow disk holds up only other bolt writers, never every
+// store caller. The existence check is therefore made again after the
+// write: a delete that ran between the first check and the write removed
+// the pair's records before this one landed, so the record is taken back.
+// A delete after the second check removes it itself.
 func (s *Store) PutPathDegradedRecord(pair MonitorPair, rec PathDegradedRecord) error {
 	if err := validMonitorPair(pair.MonitorID, pair.NodeID); err != nil {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.state.Monitors[pair.MonitorID]; !ok {
-		return nil
-	}
-	if pair.NodeID != "" {
-		if _, ok := s.state.Nodes[pair.NodeID]; !ok {
+	hot, exists := s.runtimeBoltHot, s.monitorPairExistsLocked(pair)
+	if hot == nil {
+		defer s.mu.Unlock()
+		if !exists {
 			return nil
 		}
-	}
-	if s.runtimeBoltHot == nil {
 		if s.pathDegraded == nil {
 			s.pathDegraded = map[MonitorPair]PathDegradedRecord{}
 		}
 		s.pathDegraded[pair] = rec
 		return nil
 	}
-	return s.runtimeBoltHot.PutPathDegradedRecord(pair, rec)
+	s.mu.Unlock()
+	if !exists {
+		return nil
+	}
+	if err := hot.PutPathDegradedRecord(pair, rec); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	exists = s.monitorPairExistsLocked(pair)
+	s.mu.Unlock()
+	if exists {
+		return nil
+	}
+	return hot.DeletePathDegradedRecord(pair)
 }
 
 // DeletePathDegradedRecord removes one pair's record; a missing one is not
-// an error.
+// an error. With the hot store the bolt write runs outside the store lock.
 func (s *Store) DeletePathDegradedRecord(pair MonitorPair) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runtimeBoltHot == nil {
-		delete(s.pathDegraded, pair)
-		return nil
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.DeletePathDegradedRecord(pair)
 	}
-	return s.runtimeBoltHot.DeletePathDegradedRecord(pair)
+	defer s.mu.Unlock()
+	delete(s.pathDegraded, pair)
+	return nil
 }
 
 // PathDegradedDurable reports whether records survive a restart (the hot

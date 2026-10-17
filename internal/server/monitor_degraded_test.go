@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sort"
 	"testing"
@@ -323,8 +324,17 @@ func TestPathDegradedGateThresholdsAndScope(t *testing.T) {
 		c.Degraded.Loss.Sent < 30 || c.Degraded.Loss.Lost != 5 || c.Degraded.Loss.Trigger != 0.02 || c.Degraded.Latency != nil {
 		t.Fatalf("loss path = %+v", c.Degraded)
 	}
-	if c := pathCellFor(t, m, "", "mon-tls"); c.State == model.PathStateDegraded {
+	// A tls check holds a week at 40 ms and an hour at 100 ms, which would
+	// enter on latency, and is never judged.
+	if c := pathCellFor(t, m, "", "mon-tls"); c.State != model.PathStateUp || c.Degraded != nil || c.Reason != "" {
 		t.Fatalf("tls path = %+v", c)
+	}
+	recs, err := f.st.PathDegradedRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, held := recs[store.MonitorPair{MonitorID: "mon-tls"}]; held || len(recs) != 2 {
+		t.Fatalf("records = %+v, want mon-24 and mon-loss only", recs)
 	}
 	// The path set's latency factor 3 puts the trigger at 120 ms.
 	if c := pathCellTo(t, m, "node-sh", "node-jp"); c.State != model.PathStateUp || !c.Managed {
@@ -335,6 +345,228 @@ func TestPathDegradedGateThresholdsAndScope(t *testing.T) {
 	f.evaluate()
 	if c := pathCellTo(t, f.matrix(), "node-sh", "node-jp"); c.State != model.PathStateDegraded || c.Degraded.Latency.TriggerMs != 80 {
 		t.Fatalf("generated path under the default rule = %+v", c)
+	}
+}
+
+// pathDegradedEligible judges a path whose check can have results, and
+// never a tls check, whatever else holds: the term must not rest on a tls
+// path's empty source alone.
+func TestPathDegradedEligibleNeverJudgesTLS(t *testing.T) {
+	tcp := model.Monitor{ID: "mon-tcp", Type: model.MonitorTypeTCP, Enabled: true}
+	tls := model.Monitor{ID: "mon-tls", Type: model.MonitorTypeTLS, Enabled: true}
+	disabled := tcp
+	disabled.Enabled = false
+	entry := func(mon *model.Monitor, source string) pathEntry {
+		return pathEntry{cell: model.PathCell{Source: source, MonitorID: mon.ID}, monitor: mon, hasCheck: true}
+	}
+	for name, tc := range map[string]struct {
+		e    pathEntry
+		want bool
+	}{
+		"tcp":                {entry(&tcp, "node-sh"), true},
+		"tls from a source":  {entry(&tls, "node-sh"), false},
+		"tls from the plane": {entry(&tls, ""), false},
+		"no source":          {entry(&tcp, ""), false},
+		"disabled":           {entry(&disabled, "node-sh"), false},
+		"no check":           {pathEntry{cell: model.PathCell{Source: "node-sh"}}, false},
+		"paused":             {func() pathEntry { e := entry(&tcp, "node-sh"); e.paused = true; return e }(), false},
+		"gated":              {func() pathEntry { e := entry(&tcp, "node-sh"); e.gate = model.PathReasonAgentTooOld; return e }(), false},
+		"not probeable":      {func() pathEntry { e := entry(&tcp, "node-sh"); e.notProbeable = true; return e }(), false},
+	} {
+		if got := pathDegradedEligible(tc.e); got != tc.want {
+			t.Errorf("%s: eligible = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+// failingRecords passes the evaluator's record writes to the store, or
+// fails them while fail is set, counting every attempt.
+type failingRecords struct {
+	st         *store.Store
+	fail       bool
+	puts, dels int
+}
+
+func (r *failingRecords) PutPathDegradedRecord(pair store.MonitorPair, rec store.PathDegradedRecord) error {
+	r.puts++
+	if r.fail {
+		return errors.New("write monitor_path_degraded: input/output error")
+	}
+	return r.st.PutPathDegradedRecord(pair, rec)
+}
+
+func (r *failingRecords) DeletePathDegradedRecord(pair store.MonitorPair) error {
+	r.dels++
+	if r.fail {
+		return errors.New("write monitor_path_degraded: input/output error")
+	}
+	return r.st.DeletePathDegradedRecord(pair)
+}
+
+// failRecords routes the evaluator's writes through a failingRecords.
+func (f *degradedFixture) failRecords() *failingRecords {
+	r := &failingRecords{st: f.st}
+	d := &f.srv.pathDegraded
+	d.evalMu.Lock()
+	d.records = r
+	d.evalMu.Unlock()
+	return r
+}
+
+// stored is pair's stored record.
+func (f *degradedFixture) stored(pair store.MonitorPair) (store.PathDegradedRecord, bool) {
+	f.t.Helper()
+	recs, err := f.st.PathDegradedRecords()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	rec, ok := recs[pair]
+	return rec, ok
+}
+
+// A transition the store refuses is not made in memory either: the matrix,
+// the incident and the store keep reading the state before it, and the next
+// evaluation makes it again. Entering, starting to clear, leaving and a drop
+// each fail once and then go through.
+func TestPathDegradedFailedWritesKeepMemoryAsStored(t *testing.T) {
+	f := slowFixture(t, t.TempDir(), "mon-dd")
+	f.operatorCheck("mon-dd", model.MonitorAlertDownAndDegraded, nil, "node-sh")
+	pair := pathPair("mon-dd")
+	key := pathDegradedKey(pair)
+	recs := f.failRecords()
+	cell := func() model.PathCell { return pathCellFor(t, f.matrix(), "node-sh", "mon-dd") }
+	slow, fast := runsFor(okRun(100), pair), runsFor(okRun(40), pair)
+
+	f.evaluate()
+	recs.fail = true
+	if pass := f.tick(slow); pass.failed != 1 || pass.entered != 0 || recs.puts != 1 {
+		t.Fatalf("a refused enter = %+v, %d puts", pass, recs.puts)
+	}
+	if c := cell(); c.State != model.PathStateUp || c.Degraded != nil {
+		t.Fatalf("after a refused enter: %+v", c)
+	}
+	if _, held := f.stored(pair); held {
+		t.Fatal("a refused enter left a record")
+	}
+	if _, open := f.st.ActiveIncident(key); open {
+		t.Fatal("a refused enter opened path.degraded")
+	}
+	if pending := f.srv.pendingIncidents(f.now()); len(pending) != 1 || pending[0].Key != key {
+		t.Fatalf("pending after a refused enter = %+v", pending)
+	}
+	recs.fail = false
+	if pass := f.tick(slow); pass.entered != 1 || pass.failed != 0 {
+		t.Fatalf("the retried enter = %+v", pass)
+	}
+	rec, held := f.stored(pair)
+	if !held || !rec.Since.Equal(degradedBase) || !rec.EnteredAt.Equal(f.now()) {
+		t.Fatalf("stored after the retried enter = %+v", rec)
+	}
+	if c := cell(); c.State != model.PathStateDegraded || !c.Degraded.Since.Equal(degradedBase) {
+		t.Fatalf("after the retried enter: %+v", c.Degraded)
+	}
+	if _, open := f.st.ActiveIncident(key); !open {
+		t.Fatal("the retried enter opened nothing")
+	}
+
+	// Starting to clear is refused: both still read degraded, not clearing.
+	recs.fail = true
+	puts := recs.puts
+	for i := 0; i < 30 && recs.puts == puts; i++ {
+		f.tick(fast)
+	}
+	if recs.puts == puts {
+		t.Fatal("the path never tried to start clearing")
+	}
+	absentAt := f.now()
+	if c := cell(); c.State != model.PathStateDegraded || c.Degraded.ClearingSince != nil {
+		t.Fatalf("after a refused start of clearing: %+v", c.Degraded)
+	}
+	if rec, _ := f.stored(pair); rec.Clearing() {
+		t.Fatalf("stored after a refused start of clearing = %+v", rec)
+	}
+	recs.fail = false
+	if pass := f.tick(fast); pass.cleared != 1 || pass.failed != 0 {
+		t.Fatalf("the retried start of clearing = %+v", pass)
+	}
+	clearAt := f.now()
+	if !clearAt.Equal(absentAt.Add(time.Minute)) {
+		t.Fatalf("clearing began at %s, the refused try at %s", clearAt, absentAt)
+	}
+	if rec, _ := f.stored(pair); !rec.ClearSince.Equal(clearAt) {
+		t.Fatalf("stored clear_since = %s, want %s", rec.ClearSince, clearAt)
+	}
+	if c := cell(); c.Degraded.ClearingSince == nil || !c.Degraded.ClearingSince.Equal(clearAt) {
+		t.Fatalf("matrix clearing since = %+v", c.Degraded)
+	}
+
+	// Leaving is refused: the record stays in both, the incident stays
+	// open and owes nothing yet.
+	recs.fail = true
+	var pass pathDegradedPass
+	for f.now().Sub(clearAt) < model.PathDegradedLeaveAfter {
+		pass = f.tick(fast)
+	}
+	if pass.failed != 1 || pass.left != 0 || recs.dels != 1 {
+		t.Fatalf("a refused leave = %+v, %d deletes", pass, recs.dels)
+	}
+	if _, held := f.stored(pair); !held {
+		t.Fatal("a refused leave lost the record")
+	}
+	if c := cell(); c.State != model.PathStateDegraded || c.Degraded.ClearingSince == nil {
+		t.Fatalf("after a refused leave: %+v", c)
+	}
+	if _, open := f.st.ActiveIncident(key); !open {
+		t.Fatal("a refused leave resolved the incident")
+	}
+	recs.fail = false
+	if pass := f.tick(fast); pass.left != 1 || pass.failed != 0 {
+		t.Fatalf("the retried leave = %+v", pass)
+	}
+	if _, held := f.stored(pair); held {
+		t.Fatal("the retried leave kept the record")
+	}
+	if _, open := f.st.ActiveIncident(key); open {
+		t.Fatal("the retried leave left the incident open")
+	}
+
+	// A drop the store refuses keeps the entry, and the next evaluation
+	// drops it.
+	for i := 0; i < 20; i++ {
+		if _, held := f.stored(pair); held {
+			break
+		}
+		f.tick(slow)
+	}
+	if _, held := f.stored(pair); !held {
+		t.Fatal("slow again, the path did not enter")
+	}
+	mon, _ := f.st.Monitor("mon-dd")
+	mon.PausedNodeIDs = []string{"node-sh"}
+	if err := f.st.UpsertMonitor(mon); err != nil {
+		t.Fatal(err)
+	}
+	recs.fail = true
+	f.clock.advance(time.Minute)
+	if pass := f.evaluate(); pass.failed != 1 || pass.dropped != 0 {
+		t.Fatalf("a refused drop = %+v", pass)
+	}
+	if _, held := f.stored(pair); !held {
+		t.Fatal("a refused drop lost the record")
+	}
+	if _, kept := f.srv.pathDegradedSnapshot().entries[pair]; !kept {
+		t.Fatal("a refused drop forgot the entry")
+	}
+	recs.fail = false
+	f.clock.advance(time.Minute)
+	if pass := f.evaluate(); pass.dropped != 1 || pass.failed != 0 {
+		t.Fatalf("the retried drop = %+v", pass)
+	}
+	if _, held := f.stored(pair); held {
+		t.Fatal("the retried drop kept the record")
+	}
+	if _, kept := f.srv.pathDegradedSnapshot().entries[pair]; kept {
+		t.Fatal("the retried drop kept the entry")
 	}
 }
 

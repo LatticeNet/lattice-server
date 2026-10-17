@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	bolt "go.etcd.io/bbolt"
+
 	"github.com/LatticeNet/lattice-server/internal/secret"
 )
 
@@ -175,5 +177,87 @@ func TestPathDegradedRecordsInMemoryWithoutTheHotStore(t *testing.T) {
 	got, _ := s.PathDegradedRecords()
 	if _, ok := got[MonitorPair{"mon-a", "node-a"}]; len(got) != 1 || !ok {
 		t.Fatalf("records = %+v", got)
+	}
+}
+
+// A record write runs its bolt transaction outside the store lock: while
+// another bolt writer holds the file, a pending put and delete wait on bbolt
+// alone and every other store call goes on.
+func TestPathDegradedRecordWritesDoNotHoldTheStoreLock(t *testing.T) {
+	s := openHotStore(t, t.TempDir())
+	defer s.Close()
+	if err := s.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	seedMonitor(t, s, model.Monitor{ID: "mon-a", Type: model.MonitorTypeTCP, NodeIDs: []string{"node-a"}})
+	pair := MonitorPair{"mon-a", "node-a"}
+	held, release := make(chan struct{}), make(chan struct{})
+	writer := make(chan error, 1)
+	go func() {
+		writer <- s.runtimeBoltHot.db.Update(func(*bolt.Tx) error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	done := make(chan error, 2)
+	go func() {
+		done <- s.PutPathDegradedRecord(pair, PathDegradedRecord{Reason: model.PathReasonDegradedLoss})
+	}()
+	go func() { done <- s.DeletePathDegradedRecord(MonitorPair{"mon-a", "node-z"}) }()
+	// Both writes are now queued behind the held transaction, or about to
+	// be; neither may hold the store lock while they wait.
+	time.Sleep(50 * time.Millisecond)
+	read := make(chan struct{})
+	go func() {
+		s.Monitor("mon-a")
+		s.Nodes()
+		close(read)
+	}()
+	select {
+	case <-read:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("a store read waited on a degraded record write")
+	}
+	close(release)
+	if err := <-writer; err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got, _ := s.PathDegradedRecords(); len(got) != 1 || got[pair].Reason != model.PathReasonDegradedLoss {
+		t.Fatalf("records = %+v", got)
+	}
+}
+
+// Puts racing deletes of their monitor never leave a record behind: the
+// write checks again after it lands and takes back a record whose monitor a
+// delete removed meanwhile.
+func TestPathDegradedRecordPutRacingAMonitorDelete(t *testing.T) {
+	s := openHotStore(t, t.TempDir())
+	defer s.Close()
+	if err := s.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 30; i++ {
+		seedMonitor(t, s, model.Monitor{ID: "mon-a", Type: model.MonitorTypeTCP, NodeIDs: []string{"node-a"}})
+		put := make(chan error, 1)
+		go func() {
+			put <- s.PutPathDegradedRecord(MonitorPair{"mon-a", "node-a"}, PathDegradedRecord{Reason: model.PathReasonDegradedLatency})
+		}()
+		if err := s.DeleteMonitor("mon-a"); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-put; err != nil {
+			t.Fatal(err)
+		}
+		if got, err := s.PathDegradedRecords(); err != nil || len(got) != 0 {
+			t.Fatalf("round %d: records after the delete = %+v, %v", i, got, err)
+		}
 	}
 }

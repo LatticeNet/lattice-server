@@ -41,10 +41,30 @@ until git -C "$work" fetch -q --filter=tree:0 origin "$ref"; do
   sleep 30
 done
 
-if ! git -C "$work" merge-base --is-ancestor "$copies_added" "$ref" 2>/dev/null; then
-  echo "skip: dashboard.ref $ref predates the console's golden copies (lattice-dashboard $copies_added), so there is nothing to compare"
-  exit 0
+# The fetch brought every commit the ref reaches, so the ref predates the
+# copies exactly when the commit that added them is not in its history.
+# rev-list walks commits only, which the fetch holds, and a git error here
+# stops the check (set -e) instead of reading as "predates". Only a history
+# that starts at the ref and lacks that commit skips.
+history="$work/history.list"
+git -C "$work" rev-list "$ref" > "$history"
+if [ "$(head -n 1 "$history")" != "$ref" ]; then
+  echo "could not read the history of lattice-dashboard $ref" >&2
+  exit 1
 fi
+found=0
+grep -qx "$copies_added" "$history" || found=$?
+case "$found" in
+  0) ;;
+  1)
+    echo "skip: dashboard.ref $ref predates the console's golden copies (lattice-dashboard $copies_added), so there is nothing to compare"
+    exit 0
+    ;;
+  *)
+    echo "could not search the history of lattice-dashboard $ref" >&2
+    exit 1
+    ;;
+esac
 
 listing="$work/console.list"
 git -C "$work" ls-tree "$ref" "$console_dir/" > "$listing"

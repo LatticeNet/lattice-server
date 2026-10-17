@@ -269,7 +269,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	}
 	if req.Packets != nil {
 		if !model.MonitorKindSendsPackets(mon.Type) {
-			return model.Monitor{}, nil, false, errors.New("packets applies to icmp and beacon checks only")
+			return model.Monitor{}, nil, false, errMonitorPacketsKinds
 		}
 		if *req.Packets < 1 || *req.Packets > model.MonitorPacketsMax {
 			return model.Monitor{}, nil, false, fmt.Errorf("packets must be 1 to %d", model.MonitorPacketsMax)

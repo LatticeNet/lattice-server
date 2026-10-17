@@ -24,7 +24,7 @@ import (
 // A path is a (monitor, source) result pair. A generated latency path is
 // addressed by (source, target node) and joins every generated check that
 // reaches the target from the source, so its line continues across a method
-// change; in this release only the tcp check (mon_lat_<target>) exists. An
+// change between the tcp, icmp and beacon checks (latencyCheckMethods). An
 // operator's check is addressed by (monitor, source); a tls check's source
 // is the control plane, an empty node id.
 //
@@ -1079,6 +1079,13 @@ func icmpFiltered(method string, latest store.MonitorLatest) bool {
 // once one has come back, failures are failures.
 func beaconFiltered(method string, latest store.MonitorLatest) bool {
 	return method == model.MonitorTypeBeacon && !latest.Success && latest.LastOKAt.IsZero()
+}
+
+// pathFiltered reports whether a pair's failures read filtered rather than
+// down, by either rule. Such a pair never pages (resultMayPage), so it is
+// neither pending nor paged in the incident lists.
+func pathFiltered(method string, latest store.MonitorLatest) bool {
+	return icmpFiltered(method, latest) || beaconFiltered(method, latest)
 }
 
 // beaconTargetListenGate is beacon_not_listening while the target is

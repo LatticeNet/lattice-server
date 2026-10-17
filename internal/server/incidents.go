@@ -1084,7 +1084,7 @@ func (s *Server) adoptLegacyAlerts(now time.Time) {
 				policy := s.monitorPolicy(mon)
 				after := policy.after
 				if pair.Success || pair.FailStreak < after || !mon.Enabled || !monitorPairAssigned(mon, pair.NodeID) || !policy.pagesDown() ||
-					icmpFiltered(mon.Type, pair) {
+					pathFiltered(mon.Type, pair) {
 					continue
 				}
 				name, where := s.monitorNames(mon, pair.NodeID)

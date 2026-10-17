@@ -38,7 +38,7 @@ type VpnUser struct {
 	// from the user-day rows, never stored.
 	QuotaPeriod            string    `json:"quota_period,omitempty"`
 	QuotaResetDay          int       `json:"quota_reset_day,omitempty"`
-	ExpiresAt              time.Time `json:"expires_at,omitempty"`
+	ExpiresAt              time.Time `json:"expires_at,omitzero"`
 	Group                  string    `json:"group,omitempty"`
 	Comment                string    `json:"comment,omitempty"`
 	SubscriptionGeneration uint64    `json:"-"`
@@ -129,7 +129,7 @@ type vpnUserView struct {
 	QuotaBytes    int64               `json:"quota_bytes,omitempty"`
 	QuotaPeriod   string              `json:"quota_period,omitempty"`
 	QuotaResetDay int                 `json:"quota_reset_day,omitempty"`
-	ExpiresAt     time.Time           `json:"expires_at,omitempty"`
+	ExpiresAt     time.Time           `json:"expires_at,omitzero"`
 	Group         string              `json:"group,omitempty"`
 	Comment       string              `json:"comment,omitempty"`
 	Migrated      bool                `json:"migrated"`

@@ -168,6 +168,12 @@ func (s *Server) handleAgentUpdatePolicies(w http.ResponseWriter, r *http.Reques
 				"auto_plan":      fmt.Sprintf("%t", policy.AutoPlan),
 			},
 		})
+		// The store stamped created_at and updated_at on its own copy, and
+		// this one still holds year 1. Only the times are taken, so the body
+		// stays what this caller wrote.
+		if stored, ok := s.store.AgentUpdatePolicy(policy.NodeID); ok {
+			policy.CreatedAt, policy.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
+		}
 		writeJSON(w, http.StatusOK, policy)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

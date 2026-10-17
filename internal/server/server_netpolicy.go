@@ -32,7 +32,7 @@ type netPolicyView struct {
 	Rules          []model.NetRule `json:"rules"`
 	Enabled        bool            `json:"enabled"`
 	LastPlanSHA    string          `json:"last_plan_sha,omitempty"`
-	LastAppliedAt  time.Time       `json:"last_applied_at,omitempty"`
+	LastAppliedAt  time.Time       `json:"last_applied_at,omitzero"`
 	LastError      string          `json:"last_error,omitempty"`
 	UpdatedAt      time.Time       `json:"updated_at"`
 }

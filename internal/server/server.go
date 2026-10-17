@@ -1102,10 +1102,10 @@ type pluginInstallationView struct {
 	Available      bool                  `json:"available"`
 	Status         string                `json:"status"`
 	Runtime        *plugin.RuntimeStatus `json:"runtime,omitempty"`
-	VerifiedAt     time.Time             `json:"verified_at,omitempty"`
-	InstalledAt    time.Time             `json:"installed_at,omitempty"`
-	ActivatedAt    time.Time             `json:"activated_at,omitempty"`
-	DisabledAt     time.Time             `json:"disabled_at,omitempty"`
+	VerifiedAt     time.Time             `json:"verified_at,omitzero"`
+	InstalledAt    time.Time             `json:"installed_at,omitzero"`
+	ActivatedAt    time.Time             `json:"activated_at,omitzero"`
+	DisabledAt     time.Time             `json:"disabled_at,omitzero"`
 	CreatedAt      time.Time             `json:"created_at"`
 	UpdatedAt      time.Time             `json:"updated_at"`
 }
@@ -2811,8 +2811,8 @@ type nodeView struct {
 	StatusReason         string                   `json:"status_reason"`
 	Disabled             bool                     `json:"disabled,omitempty"`
 	AgentSourceAllowlist []string                 `json:"agent_source_allowlist,omitempty"`
-	TokenLastUsedAt      time.Time                `json:"token_last_used_at,omitempty"`
-	LastSeen             time.Time                `json:"last_seen"`
+	TokenLastUsedAt      time.Time                `json:"token_last_used_at,omitzero"`
+	LastSeen             time.Time                `json:"last_seen,omitzero"`
 	Metrics              model.Metrics            `json:"metrics"`
 	HostFacts            model.HostFacts          `json:"host_facts"`
 	Geo                  *model.NodeGeo           `json:"geo,omitempty"`
@@ -2848,7 +2848,7 @@ type agentRuntimeConfig struct {
 	ProxyUsageXrayBin     string    `json:"proxy_usage_xray_bin,omitempty"`
 	ProxyUsageXrayPattern string    `json:"proxy_usage_xray_pattern,omitempty"`
 	SingBoxStatsAPI       string    `json:"singbox_stats_api,omitempty"`
-	ReportedAt            time.Time `json:"reported_at,omitempty"`
+	ReportedAt            time.Time `json:"reported_at,omitzero"`
 }
 
 func (s *Server) toNodeView(n model.Node) nodeView {
@@ -4311,8 +4311,8 @@ type taskView struct {
 	RerunOfTaskID   string    `json:"rerun_of_task_id,omitempty"`
 	RerunOfNodeID   string    `json:"rerun_of_node_id,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
-	StartedAt       time.Time `json:"started_at,omitempty"`
-	FinishedAt      time.Time `json:"finished_at,omitempty"`
+	StartedAt       time.Time `json:"started_at,omitzero"`
+	FinishedAt      time.Time `json:"finished_at,omitzero"`
 	// Attempts, LeaseAgeSeconds and StalledReason summarise a single-target
 	// task; TargetStates carries the same per node for every leased task, so
 	// a fan-out row can say which node is on its third try. All omitted when
@@ -4671,7 +4671,7 @@ type taskExecContextView struct {
 	NonRoot      bool      `json:"non_root,omitempty"`
 	RootExec     bool      `json:"root_exec,omitempty"`
 	ExecDisabled bool      `json:"exec_disabled,omitempty"`
-	ReportedAt   time.Time `json:"reported_at,omitempty"`
+	ReportedAt   time.Time `json:"reported_at,omitzero"`
 }
 
 type taskResultView struct {
@@ -5173,6 +5173,10 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "kv.put", Scope: "kv:write", Metadata: map[string]string{"bucket": req.Bucket, "key": req.Key}})
+		if stored, ok := s.store.KVEntry(entry.Bucket, entry.Key); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			entry.UpdatedAt = stored.UpdatedAt
+		}
 		writeJSON(w, http.StatusOK, entry)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -5245,6 +5249,10 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "static.put", Scope: "static:write", Metadata: map[string]string{"bucket": req.Bucket, "path": clean}})
+		if stored, ok := s.store.StaticObject(obj.Bucket, obj.Path); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			obj.UpdatedAt = stored.UpdatedAt
+		}
 		writeJSON(w, http.StatusOK, obj)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -5910,6 +5918,10 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			metadata["fallback_channel_id"] = opts.FallbackChannelID
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: metadata})
+		if stored, ok := s.store.NotifyChannel(channel.ID); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			channel.CreatedAt, channel.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
+		}
 		health, _ := s.store.NotifyChannelHealth(channel.ID)
 		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, opts, s.now()))
 	default:
@@ -6012,6 +6024,10 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 			metadata["quiet_hours"] = qh.Start + "-" + qh.End + " " + qh.TimeZone
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: metadata})
+		if stored, ok := s.store.NotifyRule(rule.ID); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			rule.CreatedAt, rule.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
+		}
 		writeJSON(w, http.StatusOK, toNotifyRuleView(rule, opts))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -6384,7 +6400,7 @@ type ddnsView struct {
 	LastIPv4        string    `json:"last_ipv4,omitempty"`
 	LastIPv6        string    `json:"last_ipv6,omitempty"`
 	LastTarget      string    `json:"last_target,omitempty"`
-	LastRunAt       time.Time `json:"last_run_at,omitempty"`
+	LastRunAt       time.Time `json:"last_run_at,omitzero"`
 	LastError       string    `json:"last_error,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
@@ -6504,6 +6520,10 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider, "record_type": ddnsRecordTypeLabel(req), "comment_mode": ddnsCommentModeLabel(req)}})
+		if stored, ok := s.store.DDNSProfile(req.ID); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			req.CreatedAt, req.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
+		}
 		view := toDDNSView(req)
 		view.Warnings = s.ddnsSaveWarnings(r.Context(), req)
 		writeJSON(w, http.StatusOK, view)
@@ -7878,6 +7898,10 @@ func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "tunnel.create", Scope: "tunnel:admin", Metadata: map[string]string{"tunnel_id": req.ID}})
+		if stored, ok := s.store.Tunnel(req.ID); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			req.CreatedAt, req.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
+		}
 		writeJSON(w, http.StatusOK, req)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

@@ -60,8 +60,8 @@ type machineView struct {
 	AutoRoll         bool                 `json:"auto_roll"`
 	RemindDaysBefore []int                `json:"remind_days_before,omitempty"`
 	RemindersEnabled bool                 `json:"reminders_enabled"`
-	CreatedAt        time.Time            `json:"created_at,omitempty"`
-	UpdatedAt        time.Time            `json:"updated_at,omitempty"`
+	CreatedAt        time.Time            `json:"created_at,omitzero"`
+	UpdatedAt        time.Time            `json:"updated_at,omitzero"`
 }
 
 type machineProfileRequest struct {

@@ -27,8 +27,8 @@ type storageTokenView struct {
 	Kind       string    `json:"kind"`
 	Access     string    `json:"access"`
 	Buckets    []string  `json:"buckets,omitempty"`
-	RevokedAt  time.Time `json:"revoked_at,omitempty"`
-	LastUsedAt time.Time `json:"last_used_at,omitempty"`
+	RevokedAt  time.Time `json:"revoked_at,omitzero"`
+	LastUsedAt time.Time `json:"last_used_at,omitzero"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
@@ -120,6 +120,10 @@ func (s *Server) handleStorageBuckets(w http.ResponseWriter, r *http.Request, p 
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "storage.bucket.upsert", Scope: storageAdminScope(kind), Metadata: map[string]string{"kind": kind, "bucket": bucket.Name}})
+		if stored, ok := s.store.StorageBucket(kind, bucket.Name); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			bucket.CreatedAt, bucket.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
+		}
 		writeJSON(w, http.StatusOK, bucket)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -178,6 +182,10 @@ func (s *Server) handleStorageBindings(w http.ResponseWriter, r *http.Request, p
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "storage.binding.upsert", Scope: storageAdminScope(kind), Metadata: map[string]string{"kind": kind, "bucket": binding.Bucket, "hostname": binding.Hostname}})
+		if stored, ok := s.store.StorageBinding(binding.ID); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			binding.CreatedAt, binding.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
+		}
 		writeJSON(w, http.StatusOK, binding)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -262,6 +270,10 @@ func (s *Server) handleStorageTokens(w http.ResponseWriter, r *http.Request, p p
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "storage.token.create", Scope: storageAdminScope(kind), Metadata: map[string]string{"kind": kind, "token_id": token.ID, "access": token.Access}})
+		if stored, ok := s.store.StorageAccessToken(token.ID); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			token.CreatedAt, token.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
+		}
 		writeJSON(w, http.StatusOK, storageTokenCreateResponse{storageTokenView: toStorageTokenView(token), Token: plaintext})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -355,6 +367,10 @@ func (s *Server) serveKVBinding(w http.ResponseWriter, r *http.Request, record p
 		if err := s.store.PutKV(entry); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if stored, ok := s.store.KVEntry(entry.Bucket, entry.Key); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			entry.UpdatedAt = stored.UpdatedAt
 		}
 		writeJSON(w, http.StatusOK, entry)
 	default:

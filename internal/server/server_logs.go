@@ -243,6 +243,10 @@ func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request, p prin
 				"enabled":   strconv.FormatBool(ls.Enabled),
 			},
 		})
+		if stored, ok := s.store.LogSource(ls.ID); ok {
+			// The store's stamped times only; the body stays this caller's write.
+			ls.CreatedAt, ls.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
+		}
 		writeJSON(w, http.StatusOK, ls)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -379,9 +383,9 @@ type logSourceStatsView struct {
 	Enabled      bool      `json:"enabled"`
 	Lines        uint64    `json:"lines"`
 	Bytes        uint64    `json:"bytes"`
-	FirstAt      time.Time `json:"first_at,omitempty"`
-	LastAt       time.Time `json:"last_at,omitempty"`
-	LastIngestAt time.Time `json:"last_ingest_at,omitempty"`
+	FirstAt      time.Time `json:"first_at,omitzero"`
+	LastAt       time.Time `json:"last_at,omitzero"`
+	LastIngestAt time.Time `json:"last_ingest_at,omitzero"`
 	RotID        string    `json:"rot_id,omitempty"`
 }
 

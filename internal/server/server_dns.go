@@ -43,7 +43,7 @@ type dnsDeploymentView struct {
 	// Listeners, CertNotAfter and Drift describe an external (observed) engine
 	// and stay empty for engines Lattice deploys itself.
 	Listeners        []model.DNSListener `json:"listeners,omitempty"`
-	CertNotAfter     time.Time           `json:"cert_not_after,omitempty"`
+	CertNotAfter     time.Time           `json:"cert_not_after,omitzero"`
 	Drift            *dnsDriftView       `json:"drift,omitempty"`
 	Hostname         string              `json:"hostname,omitempty"`
 	PublishIPv4      bool                `json:"publish_ipv4"`
@@ -55,9 +55,9 @@ type dnsDeploymentView struct {
 	EngineVersion    string              `json:"engine_version,omitempty"`
 	LastIPv4         string              `json:"last_ipv4,omitempty"`
 	LastIPv6         string              `json:"last_ipv6,omitempty"`
-	LastAppliedAt    time.Time           `json:"last_applied_at,omitempty"`
+	LastAppliedAt    time.Time           `json:"last_applied_at,omitzero"`
 	LastError        string              `json:"last_error,omitempty"`
-	LastPublishedAt  time.Time           `json:"last_published_at,omitempty"`
+	LastPublishedAt  time.Time           `json:"last_published_at,omitzero"`
 	LastPublishError string              `json:"last_publish_error,omitempty"`
 	Disabled         bool                `json:"disabled,omitempty"`
 	CreatedAt        time.Time           `json:"created_at"`

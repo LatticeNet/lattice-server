@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -633,6 +634,12 @@ func (s *Server) fetchAgentReleaseBinary(rawURL string) ([]byte, error) {
 // then checks against the approval the requesting task is executing. A node can
 // therefore only ever fetch the exact object its own approved update names, and
 // cannot enumerate the bucket or reach any other static object through here.
+//
+// It answers byte ranges, so a node on a slow uplink can continue a download
+// an earlier attempt cut off instead of starting over. A range request passes
+// every check a full one does, in the same order and before any byte is
+// written: the route limiter, the lease, the node's own artifact and platform,
+// the throttled denial audit, and the integrity check of the stored copy.
 func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -696,30 +703,70 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 			errors.New("the stored agent binary failed integrity verification and was not served"))
 		return
 	}
+	// One range per request. A multi-range request would be answered as
+	// multipart/byteranges, which no fetcher the apply script uses ever sends,
+	// so it is served as the whole object instead: the most a request can
+	// cost is one copy of the binary, ranged or not.
+	if strings.Contains(r.Header.Get("Range"), ",") {
+		r.Header.Del("Range")
+	}
+	meta := map[string]string{
+		"version": ref.Version,
+		"os":      ref.OS,
+		"arch":    ref.Arch,
+		"sha256":  ref.SHA256,
+		"bytes":   strconv.Itoa(len(data)),
+		"task_id": task.ID,
+	}
+	if requested := strings.TrimSpace(r.Header.Get("Range")); requested != "" {
+		meta["range"] = auditTruncate(requested, 64)
+	}
 	s.recordRequestAudit(r, model.AuditEvent{
-		ID:     id.New("audit"),
-		NodeID: node.ID,
-		Action: "agent.binary.serve",
-		Metadata: map[string]string{
-			"version": ref.Version,
-			"os":      ref.OS,
-			"arch":    ref.Arch,
-			"sha256":  ref.SHA256,
-			"bytes":   strconv.Itoa(len(data)),
-			"task_id": task.ID,
-		},
+		ID:       id.New("audit"),
+		NodeID:   node.ID,
+		Action:   "agent.binary.serve",
+		Metadata: meta,
 	})
 	w.Header().Set("Content-Type", agentArtifactContentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-	w.WriteHeader(http.StatusOK)
-	if r.Method == http.MethodHead {
-		return
+	// The pinned digest is the validator. It names exactly these bytes, which
+	// were verified against it above, so an If-Range carrying it resumes and
+	// one carrying anything else gets the whole object rather than a range of
+	// different bytes to splice onto what the caller already has.
+	w.Header().Set("ETag", agentBinaryETag(ref.SHA256))
+	// ServeContent answers a single satisfiable range with 206, an
+	// unsatisfiable one with 416, and everything else, HEAD included, with the
+	// whole object. No modification time is given, so only the ETag decides
+	// the conditional headers.
+	sent := &agentBinaryWriter{ResponseWriter: w}
+	http.ServeContent(sent, r, "", time.Time{}, bytes.NewReader(data))
+	if sent.err != nil {
+		s.logger.Printf("agent binary write failed: node_id=%s version=%s after %d bytes: %v", node.ID, ref.Version, sent.n, sent.err)
 	}
-	if _, err := w.Write(data); err != nil {
-		s.logger.Printf("agent binary write failed: node_id=%s version=%s: %v", node.ID, ref.Version, err)
+}
+
+// agentBinaryETag is the strong validator for one stored binary.
+func agentBinaryETag(sha256Hex string) string {
+	return `"` + sha256Hex + `"`
+}
+
+// agentBinaryWriter remembers how much of a download reached the connection
+// and the first write error, so a node that disconnects mid-download is still
+// logged with how far it got.
+type agentBinaryWriter struct {
+	http.ResponseWriter
+	n   int64
+	err error
+}
+
+func (w *agentBinaryWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	w.n += int64(n)
+	if err != nil && w.err == nil {
+		w.err = err
 	}
+	return n, err
 }
 
 // auditAgentBinaryDenied records a download this route refused. The route is

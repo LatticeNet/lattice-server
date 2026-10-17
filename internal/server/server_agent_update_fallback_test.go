@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -230,6 +232,7 @@ func approveAgentUpdateOverHTTP(t *testing.T, handler http.Handler, cookies []*h
 
 // A control-plane approval planned before fallbacks existed carries no
 // fallback_url and renders the download it was approved with, byte for byte.
+// It predates resumable downloads too.
 func TestAgentUpdateControlPlaneApprovalWithoutFallbackKeepsItsDownload(t *testing.T) {
 	srv, _, st := newAgentArtifactServer(t)
 	seedControlPlaneUpdate(t, srv, st)
@@ -239,6 +242,7 @@ func TestAgentUpdateControlPlaneApprovalWithoutFallbackKeepsItsDownload(t *testi
 		t.Fatal(err)
 	}
 	payload.FallbackURL = ""
+	payload.ResumeDownload = false
 	approval.Action = agentUpdateApprovalAction(payload)
 	if strings.Contains(approval.Action, "fallback") {
 		t.Fatal("an empty fallback must not appear in the encoded payload")
@@ -299,69 +303,124 @@ func TestAgentUpdatePayloadValidatesTheFallbackURL(t *testing.T) {
 
 // fetchStubRun describes one run of the rendered download under sh with stub
 // fetchers. cpURL and fbURL are the URLs the stub answers for; anything else
-// exits 97.
+// exits 97. A stub given -C - (curl) or -c (wget) continues the output file
+// from its current length, as the real fetchers do against a server that
+// answers ranges; without them it writes the file from the start.
 type fetchStubRun struct {
 	fetcher        string
 	cpURL, fbURL   string
 	cpExit, fbExit int
 	cpBody, fbBody []byte
-	elapsed        int
+	// cpCut and fbCut, when positive, are the byte of the body at which that
+	// source stops sending, the way a cut connection or a spent budget stops
+	// it. The exit status is still cpExit or fbExit.
+	cpCut, fbCut int
+	elapsed      int
 	// date is "" for a stub that reports 1000 then 1000+elapsed, "absent" for
-	// none on PATH, and "no-epoch" for one that prints %s literally, as a date
-	// without %s support does.
+	// none on PATH, "no-epoch" for one that prints %s literally, as a date
+	// without %s support does, and "host" for the host's own date.
 	date string
+	// kept seeds the file a resumable download continues, as an earlier
+	// attempt would have left it. prepare runs after that, with the install
+	// directory and the kept file's path, to plant anything else.
+	kept    []byte
+	prepare func(installDir, candidate string)
+	// real puts the host's own fetcher on PATH instead of the stub, trusting
+	// the CA in caFile, and points the script's URL and FALLBACK_URL at cpURL
+	// and fbURL. env adds to or replaces the stand-in task lease.
+	real   bool
+	caFile string
+	env    []string
 }
 
 type fetchStubOutcome struct {
-	exit     int
-	stderr   string
-	calls    []string
-	received []byte
-	leftover bool
-	dir      string
+	exit           int
+	stdout, stderr string
+	calls          []string
+	received       []byte
+	leftover       bool
+	dir            string
+	// candidate is the file the download wrote: the per-task temp file for a
+	// script planned before resume, the kept file beside the install path in
+	// installDir for a resumable one.
+	candidate  string
+	installDir string
 }
+
+var expectSHALineRe = regexp.MustCompile(`(?m)^EXPECT_SHA='([0-9a-f]{64})'$`)
 
 // runAgentUpdateFetch runs the download and digest check cut from a rendered
 // script under sh. PATH holds only the stubs and the tools the fragment uses,
-// so the host's real curl, wget and date can never answer instead. touch is
-// there too, so that a URL which escaped its quoting and ran a command would
-// leave a file behind. The working directory is the run's own temp dir.
+// so the host's real curl, wget and date can never answer instead unless the
+// run asks for them. touch is there too, so that a URL which escaped its
+// quoting and ran a command would leave a file behind. The working directory
+// is the run's own temp dir, and a resumable script installs under it.
 func runAgentUpdateFetch(t *testing.T, script string, r fetchStubRun) fetchStubOutcome {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")
 	work := filepath.Join(dir, "work")
-	for _, d := range []string{bin, work} {
+	installDir := filepath.Join(dir, "install")
+	for _, d := range []string{bin, work, installDir} {
 		if err := os.Mkdir(d, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, tool := range []string{"cat", "rm", "awk", "sha256sum", "shasum", "touch"} {
-		if path, err := exec.LookPath(tool); err == nil {
-			if err := os.Symlink(path, filepath.Join(bin, tool)); err != nil {
-				t.Fatal(err)
+	tools := []string{"cat", "rm", "awk", "sha256sum", "shasum", "touch", "dirname", "mkdir", "chmod", "wc", "tail", "head"}
+	if r.real {
+		tools = append(tools, r.fetcher)
+	}
+	if r.date == "host" {
+		tools = append(tools, "date")
+	}
+	for _, tool := range tools {
+		path, err := exec.LookPath(tool)
+		if err != nil {
+			if tool == r.fetcher {
+				t.Skipf("no %s on this host", tool)
 			}
+			continue
+		}
+		if err := os.Symlink(path, filepath.Join(bin, tool)); err != nil {
+			t.Fatal(err)
 		}
 	}
 	fetchStub := "#!/bin/sh\n" +
-		"out=''; prev=''; last=''\n" +
-		"for a in \"$@\"; do if [ \"$prev\" = -o ] || [ \"$prev\" = -O ]; then out=$a; fi; prev=$a; last=$a; done\n" +
+		"out=''; prev=''; last=''; resume=0\n" +
+		"for a in \"$@\"; do\n" +
+		"  if [ \"$prev\" = -o ] || [ \"$prev\" = -O ]; then out=$a; fi\n" +
+		"  if [ \"$prev\" = -C ] && [ \"$a\" = - ]; then resume=1; fi\n" +
+		"  if [ \"$a\" = -c ]; then resume=1; fi\n" +
+		"  prev=$a; last=$a\n" +
+		"done\n" +
 		"printf '%s\\n' \"$*\" >>\"$STUB_CALLS\"\n" +
 		"case \"$last\" in\n" +
-		"  \"$STUB_CP_URL\") if [ -r \"$STUB_CP_BODY\" ]; then cat \"$STUB_CP_BODY\" >\"$out\"; else printf partial >\"$out\"; fi; code=$STUB_CP_EXIT ;;\n" +
-		"  \"$STUB_FB_URL\") [ -r \"$STUB_FB_BODY\" ] && cat \"$STUB_FB_BODY\" >\"$out\"; code=$STUB_FB_EXIT ;;\n" +
+		"  \"$STUB_CP_URL\") body=$STUB_CP_BODY; code=$STUB_CP_EXIT; cut=$STUB_CP_CUT ;;\n" +
+		"  \"$STUB_FB_URL\") body=$STUB_FB_BODY; code=$STUB_FB_EXIT; cut=$STUB_FB_CUT ;;\n" +
 		"  *) echo \"stub: unexpected url $last\" >&2; exit 97 ;;\n" +
 		"esac\n" +
+		"if [ -r \"$body\" ]; then\n" +
+		"  from=0\n" +
+		"  if [ \"$resume\" = 1 ] && [ -f \"$out\" ]; then from=$(($(wc -c <\"$out\"))); else : >\"$out\"; fi\n" +
+		"  end=$(($(wc -c <\"$body\")))\n" +
+		"  if [ \"$cut\" -gt 0 ] && [ \"$cut\" -lt \"$end\" ]; then end=$cut; fi\n" +
+		"  if [ \"$end\" -gt \"$from\" ]; then tail -c +$((from + 1)) \"$body\" | head -c $((end - from)) >>\"$out\"; fi\n" +
+		"elif [ \"$last\" = \"$STUB_CP_URL\" ]; then\n" +
+		"  printf partial >\"$out\"\n" +
+		"fi\n" +
 		"if [ \"$code\" != 0 ]; then echo \"stub: ($code) Connection timed out after 20002 milliseconds\" >&2; fi\n" +
 		"exit \"$code\"\n"
-	stubs := map[string]string{r.fetcher: fetchStub}
+	stubs := map[string]string{}
+	if !r.real {
+		stubs[r.fetcher] = fetchStub
+	}
 	switch r.date {
 	case "":
 		stubs["date"] = "#!/bin/sh\n" +
 			"if [ -e \"$STUB_DATE_STATE\" ]; then echo $((1000 + STUB_ELAPSED)); else : >\"$STUB_DATE_STATE\"; echo 1000; fi\n"
 	case "no-epoch":
 		stubs["date"] = "#!/bin/sh\necho '%s'\n"
-	case "absent":
+	case "absent", "host":
 	default:
 		t.Fatalf("unknown date mode %q", r.date)
 	}
@@ -380,8 +439,28 @@ func runAgentUpdateFetch(t *testing.T, script string, r fetchStubRun) fetchStubO
 			t.Fatal(err)
 		}
 	}
+	candidate := filepath.Join(work, "lattice-agent")
+	resumable := strings.Contains(script, "PARTIAL_DIR=")
+	if resumable {
+		m := expectSHALineRe.FindStringSubmatch(script)
+		if m == nil {
+			t.Fatalf("no EXPECT_SHA in the script:\n%s", script)
+		}
+		candidate = filepath.Join(installDir, agentUpdatePartialPrefix+m[1])
+	}
+	if r.kept != nil {
+		if !resumable {
+			t.Fatal("only a resumable script keeps a download between attempts")
+		}
+		if err := os.WriteFile(candidate, r.kept, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if r.prepare != nil {
+		r.prepare(installDir, candidate)
+	}
 	calls := filepath.Join(dir, "calls")
-	cmd := exec.Command("sh", "-c", agentUpdateFetchFragment(t, script, work))
+	cmd := exec.Command("sh", "-c", agentUpdateFetchFragment(t, script, work, filepath.Join(installDir, "lattice-agent"), r))
 	cmd.Dir = dir
 	cmd.Env = []string{
 		"PATH=" + bin,
@@ -394,13 +473,24 @@ func runAgentUpdateFetch(t *testing.T, script string, r fetchStubRun) fetchStubO
 		"STUB_FB_EXIT=" + strconv.Itoa(r.fbExit),
 		"STUB_CP_BODY=" + cpPath,
 		"STUB_FB_BODY=" + fbPath,
+		"STUB_CP_CUT=" + strconv.Itoa(r.cpCut),
+		"STUB_FB_CUT=" + strconv.Itoa(r.fbCut),
 		"STUB_DATE_STATE=" + filepath.Join(dir, "date-state"),
 		"STUB_ELAPSED=" + strconv.Itoa(r.elapsed),
 	}
-	var stderr strings.Builder
+	if r.real {
+		wgetrc := filepath.Join(dir, "wgetrc")
+		if err := os.WriteFile(wgetrc, []byte("ca_certificate = "+r.caFile+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cmd.Env = append(cmd.Env, "CURL_CA_BUNDLE="+r.caFile, "WGETRC="+wgetrc)
+	}
+	cmd.Env = append(cmd.Env, r.env...)
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
-	out := fetchStubOutcome{stderr: stderr.String(), dir: dir}
+	out := fetchStubOutcome{stdout: stdout.String(), stderr: stderr.String(), dir: dir, candidate: candidate, installDir: installDir}
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		out.exit = exitErr.ExitCode()
 	} else if err != nil {
@@ -409,28 +499,55 @@ func runAgentUpdateFetch(t *testing.T, script string, r fetchStubRun) fetchStubO
 	if raw, err := os.ReadFile(calls); err == nil {
 		out.calls = strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
 	}
-	out.received, err = os.ReadFile(filepath.Join(work, "lattice-agent"))
+	out.received, err = os.ReadFile(candidate)
 	out.leftover = err == nil
 	return out
+}
+
+// approvalWithResume returns the approval as it would have been planned with
+// resumable downloads, or before they existed.
+func approvalWithResume(t *testing.T, approval model.Approval, resume bool) model.Approval {
+	t.Helper()
+	payload, err := agentUpdatePayloadFromApproval(approval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload.ResumeDownload = resume
+	approval.Action = agentUpdateApprovalAction(payload)
+	return approval
 }
 
 // Runs the download and digest check exactly as rendered for a control-plane
 // plan with a fallback, under sh, with curl, wget and date replaced by stubs
 // that log their arguments and answer per URL. This is the part of the script
-// the fallback changes; the rest needs systemd and is covered elsewhere.
+// the fallback changes; the rest needs systemd and is covered elsewhere. Both
+// downloads run: the one approvals planned before resume still render, and
+// the resumable one every plan gets now. They differ only in what a failed
+// download leaves behind.
 func TestAgentUpdateFallbackDownloadRunsInSh(t *testing.T) {
 	srv, _, st := newAgentArtifactServer(t)
 	data, _, _ := seedControlPlaneUpdate(t, srv, st)
-	approval, _ := controlPlaneApprovalFor(st, "node-a")
-	script, err := agentUpdateApplyScript(approval, artifactTestPublicURL)
+	planned, _ := controlPlaneApprovalFor(st, "node-a")
+	payload, err := agentUpdatePayloadFromApproval(planned)
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := agentUpdatePayloadFromApproval(approval)
-	if err != nil {
-		t.Fatal(err)
+	for _, resume := range []bool{false, true} {
+		variant := "planned before resume"
+		if resume {
+			variant = "resumable"
+		}
+		script, err := agentUpdateApplyScript(approvalWithResume(t, planned, resume), artifactTestPublicURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Run(variant, func(t *testing.T) {
+			testAgentUpdateFallbackDownload(t, script, payload, data, resume)
+		})
 	}
+}
 
+func testAgentUpdateFallbackDownload(t *testing.T, script string, payload agentUpdatePayload, data []byte, resume bool) {
 	run := func(t *testing.T, r fetchStubRun) fetchStubOutcome {
 		t.Helper()
 		r.cpURL, r.fbURL = payload.BinaryURL, payload.FallbackURL
@@ -448,10 +565,36 @@ func TestAgentUpdateFallbackDownloadRunsInSh(t *testing.T) {
 			t.Fatalf("the fallback must carry no task credential: %q", o.calls[1])
 		}
 	}
+	// keptOrRemoved checks what a failed download leaves: nothing before
+	// resume, and the bytes received so far, root-only, with it.
+	keptOrRemoved := func(t *testing.T, o fetchStubOutcome, want string) {
+		t.Helper()
+		if !resume {
+			if o.leftover {
+				t.Fatal("the partial control-plane download must be removed")
+			}
+			return
+		}
+		if !o.leftover || string(o.received) != want {
+			t.Fatalf("a failed download must keep what it received for the next attempt: leftover %t, have %q, want %q", o.leftover, o.received, want)
+		}
+		info, err := os.Stat(o.candidate)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Fatalf("the kept download is mode %v, want 0600", info.Mode().Perm())
+		}
+		if !strings.Contains(o.stderr, "bytes received so far for the next attempt to continue") {
+			t.Fatalf("the task output must say the download was kept, stderr:\n%s", o.stderr)
+		}
+	}
+	resumeFlag := map[string]string{"curl": " -C - ", "wget": " -c "}
+	cut := len(data) / 3
 
 	for _, fetcher := range []string{"curl", "wget"} {
 		t.Run(fetcher+"/control plane fails, fallback verified", func(t *testing.T) {
-			o := run(t, fetchStubRun{fetcher: fetcher, cpExit: 28, fbBody: data})
+			o := run(t, fetchStubRun{fetcher: fetcher, cpBody: data, cpCut: cut, cpExit: 28, fbBody: data})
 			if o.exit != 0 || string(o.received) != string(data) {
 				t.Fatalf("exit %d, received %d bytes, stderr:\n%s", o.exit, len(o.received), o.stderr)
 			}
@@ -471,25 +614,31 @@ func TestAgentUpdateFallbackDownloadRunsInSh(t *testing.T) {
 			if fetcher == "wget" && (strings.Contains(o.calls[1], "--max-redirect=0") || !strings.Contains(o.calls[1], "--https-only ")) {
 				t.Fatalf("wget fallback must follow release redirects over HTTPS only: %q", o.calls[1])
 			}
+			for _, call := range o.calls {
+				if strings.Contains(call, resumeFlag[fetcher]) != resume {
+					t.Fatalf("resume %t but the fetch was %q", resume, call)
+				}
+			}
 		})
 		t.Run(fetcher+"/fallback bytes fail the digest", func(t *testing.T) {
-			o := run(t, fetchStubRun{fetcher: fetcher, cpExit: 28, fbBody: []byte("not the pinned binary")})
+			o := run(t, fetchStubRun{fetcher: fetcher, cpBody: data, cpCut: cut, cpExit: 28, fbBody: []byte("not the pinned binary")})
 			if o.exit == 0 || !strings.Contains(o.stderr, "sha256 mismatch expected="+payload.SHA256) {
 				t.Fatalf("a fallback download must be held to the pinned digest: exit %d stderr:\n%s", o.exit, o.stderr)
 			}
 			leaseOnlyOnFirst(t, o)
+			if resume && o.leftover {
+				t.Fatal("a download that fails the digest must be deleted, not kept for the next attempt")
+			}
 		})
 		t.Run(fetcher+"/fallback fails too", func(t *testing.T) {
-			o := run(t, fetchStubRun{fetcher: fetcher, cpExit: 28, fbExit: 22})
+			o := run(t, fetchStubRun{fetcher: fetcher, cpBody: data, cpCut: cut, cpExit: 28, fbExit: 22})
 			if o.exit != 22 {
 				t.Fatalf("a failed fallback must fail the task with its own status, got %d stderr:\n%s", o.exit, o.stderr)
 			}
 			leaseOnlyOnFirst(t, o)
-			// The control-plane stub left a partial file and the fallback
-			// wrote nothing, so a file here is the partial one.
-			if o.leftover {
-				t.Fatal("the partial control-plane download must be removed before the fallback")
-			}
+			// The control plane sent its first third and the fallback sent
+			// nothing, so that is all a kept file can hold.
+			keptOrRemoved(t, o, string(data[:cut]))
 		})
 		t.Run(fetcher+"/control plane succeeds", func(t *testing.T) {
 			o := run(t, fetchStubRun{fetcher: fetcher, cpBody: data, fbBody: data})
@@ -516,7 +665,7 @@ func TestAgentUpdateFallbackDownloadRunsInSh(t *testing.T) {
 				}
 			})
 			t.Run(fetcher+"/date "+date+", control plane fails", func(t *testing.T) {
-				o := run(t, fetchStubRun{fetcher: fetcher, cpExit: 28, fbBody: data, date: date})
+				o := run(t, fetchStubRun{fetcher: fetcher, cpBody: data, cpCut: cut, cpExit: 28, fbBody: data, date: date})
 				if o.exit != 0 || string(o.received) != string(data) {
 					t.Fatalf("exit %d, received %d bytes, stderr:\n%s", o.exit, len(o.received), o.stderr)
 				}
@@ -528,25 +677,23 @@ func TestAgentUpdateFallbackDownloadRunsInSh(t *testing.T) {
 		}
 	}
 	t.Run("curl/budget spent", func(t *testing.T) {
-		o := run(t, fetchStubRun{fetcher: "curl", cpExit: 28, fbBody: data, elapsed: 470})
+		o := run(t, fetchStubRun{fetcher: "curl", cpBody: data, cpCut: cut, cpExit: 28, fbBody: data, elapsed: 470})
 		if o.exit != 1 || len(o.calls) != 1 {
 			t.Fatalf("with 10 s of the budget left the fallback must not start: exit %d calls %q stderr:\n%s", o.exit, o.calls, o.stderr)
 		}
 		if !strings.Contains(o.stderr, "control-plane download failed with 10s of the 480 s download budget left; not falling back") {
 			t.Fatalf("the skipped fallback must be explained, stderr:\n%s", o.stderr)
 		}
-		if o.leftover {
-			t.Fatal("the partial control-plane download must be removed")
-		}
+		keptOrRemoved(t, o, string(data[:cut]))
 	})
 	t.Run("curl/fallback gets the remaining budget", func(t *testing.T) {
-		o := run(t, fetchStubRun{fetcher: "curl", cpExit: 28, fbBody: data, elapsed: 20})
+		o := run(t, fetchStubRun{fetcher: "curl", cpBody: data, cpCut: cut, cpExit: 28, fbBody: data, elapsed: 20})
 		if o.exit != 0 || len(o.calls) != 2 || !strings.Contains(o.calls[1], "--max-time 460 ") {
 			t.Fatalf("after a 20 s connect timeout the fallback gets 460 s: exit %d calls %q stderr:\n%s", o.exit, o.calls, o.stderr)
 		}
 	})
 	t.Run("curl/clock stepped back", func(t *testing.T) {
-		o := run(t, fetchStubRun{fetcher: "curl", cpExit: 28, fbBody: data, elapsed: -300})
+		o := run(t, fetchStubRun{fetcher: "curl", cpBody: data, cpCut: cut, cpExit: 28, fbBody: data, elapsed: -300})
 		if o.exit != 0 || len(o.calls) != 2 || !strings.Contains(o.calls[1], "--max-time 460 ") {
 			t.Fatalf("a clock that went backwards must not stretch the fallback past the budget: exit %d calls %q stderr:\n%s", o.exit, o.calls, o.stderr)
 		}
@@ -558,7 +705,8 @@ func TestAgentUpdateFallbackDownloadRunsInSh(t *testing.T) {
 // keeps $(...) and single quotes when every other character in the path is a
 // legal URL character, and percent-encodes the whole path, $( included, once
 // one character needs it; a backtick always does. Each case is decoded
-// through the approval the way a node's script is, rendered, and run.
+// through the approval the way a node's script is, rendered, and run, with
+// the download planned before resume and the resumable one.
 func TestAgentUpdateScriptQuotesURLsThatCarryShellSyntax(t *testing.T) {
 	srv, _, st := newAgentArtifactServer(t)
 	data, _, _ := seedControlPlaneUpdate(t, srv, st)
@@ -574,67 +722,86 @@ func TestAgentUpdateScriptQuotesURLsThatCarryShellSyntax(t *testing.T) {
 		{"command substitution and quote", "https://downloads.example.com/$(touch$IFS'pwned-fb')/it's", "$(touch$IFS'pwned-fb')/it's"},
 		{"backtick", "https://downloads.example.com/`touch$IFS'pwned-tick'`", "%60touch$IFS%27pwned-tick%27%60"},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			payload := base
-			payload.BinaryURL += "/$(touch$IFS'pwned-cp')/it's"
-			payload.FallbackURL = tc.fallback
-			approval.Action = agentUpdateApprovalAction(payload)
-			decoded, err := agentUpdatePayloadFromApproval(approval)
-			if err != nil {
-				t.Fatalf("the URLs must survive validation for this test to mean anything: %v", err)
-			}
-			if !strings.HasSuffix(decoded.BinaryURL, "/$(touch$IFS'pwned-cp')/it's") || !strings.Contains(decoded.FallbackURL, tc.survives) {
-				t.Fatalf("normalization changed what this test relies on: binary_url %q fallback_url %q", decoded.BinaryURL, decoded.FallbackURL)
-			}
-			script, err := agentUpdateApplyScript(approval, artifactTestPublicURL)
-			if err != nil {
-				t.Fatal(err)
-			}
-			for _, want := range []string{
-				"\nURL=" + shellQuote(decoded.BinaryURL) + "\n",
-				"\nFALLBACK_URL=" + shellQuote(decoded.FallbackURL) + "\n",
-			} {
-				if !strings.Contains(script, want) {
-					t.Fatalf("script must assign %q single-quoted:\n%s", strings.TrimSpace(want), script)
+		for _, resume := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/resume=%t", tc.name, resume), func(t *testing.T) {
+				payload := base
+				payload.BinaryURL += "/$(touch$IFS'pwned-cp')/it's"
+				payload.FallbackURL = tc.fallback
+				payload.ResumeDownload = resume
+				approval.Action = agentUpdateApprovalAction(payload)
+				decoded, err := agentUpdatePayloadFromApproval(approval)
+				if err != nil {
+					t.Fatalf("the URLs must survive validation for this test to mean anything: %v", err)
 				}
-			}
-			for _, fetcher := range []string{"curl", "wget"} {
-				o := runAgentUpdateFetch(t, script, fetchStubRun{
-					fetcher: fetcher, cpURL: decoded.BinaryURL, fbURL: decoded.FallbackURL, cpExit: 28, fbBody: data,
-				})
-				for _, name := range []string{"pwned-cp", "pwned-fb", "pwned-tick"} {
-					if _, err := os.Stat(filepath.Join(o.dir, name)); err == nil {
-						t.Fatalf("%s: a URL ran a command on the node and created %s", fetcher, name)
+				if !strings.HasSuffix(decoded.BinaryURL, "/$(touch$IFS'pwned-cp')/it's") || !strings.Contains(decoded.FallbackURL, tc.survives) {
+					t.Fatalf("normalization changed what this test relies on: binary_url %q fallback_url %q", decoded.BinaryURL, decoded.FallbackURL)
+				}
+				script, err := agentUpdateApplyScript(approval, artifactTestPublicURL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, want := range []string{
+					"\nURL=" + shellQuote(decoded.BinaryURL) + "\n",
+					"\nFALLBACK_URL=" + shellQuote(decoded.FallbackURL) + "\n",
+				} {
+					if !strings.Contains(script, want) {
+						t.Fatalf("script must assign %q single-quoted:\n%s", strings.TrimSpace(want), script)
 					}
 				}
-				if o.exit != 0 || string(o.received) != string(data) {
-					t.Fatalf("%s: exit %d, received %d bytes, stderr:\n%s", fetcher, o.exit, len(o.received), o.stderr)
+				for _, fetcher := range []string{"curl", "wget"} {
+					// The control plane sends the first bytes and fails, so
+					// the resumable download continues them from the fallback
+					// and the other one starts the fallback over.
+					o := runAgentUpdateFetch(t, script, fetchStubRun{
+						fetcher: fetcher, cpURL: decoded.BinaryURL, fbURL: decoded.FallbackURL,
+						cpBody: data, cpCut: 7, cpExit: 28, fbBody: data,
+					})
+					for _, name := range []string{"pwned-cp", "pwned-fb", "pwned-tick"} {
+						if _, err := os.Stat(filepath.Join(o.dir, name)); err == nil {
+							t.Fatalf("%s: a URL ran a command on the node and created %s", fetcher, name)
+						}
+					}
+					if o.exit != 0 || string(o.received) != string(data) {
+						t.Fatalf("%s: exit %d, received %d bytes, stderr:\n%s", fetcher, o.exit, len(o.received), o.stderr)
+					}
+					if len(o.calls) != 2 || !strings.HasSuffix(o.calls[0], decoded.BinaryURL) || !strings.HasSuffix(o.calls[1], decoded.FallbackURL) {
+						t.Fatalf("%s: the fetchers must receive the URLs verbatim: %q", fetcher, o.calls)
+					}
 				}
-				if len(o.calls) != 2 || !strings.HasSuffix(o.calls[0], decoded.BinaryURL) || !strings.HasSuffix(o.calls[1], decoded.FallbackURL) {
-					t.Fatalf("%s: the fetchers must receive the URLs verbatim: %q", fetcher, o.calls)
-				}
-			}
-		})
+			})
+		}
 	}
 }
 
 // agentUpdateFetchFragment cuts the download and digest check out of a
 // rendered apply script, with the variables they read, so they run without
-// systemd or /proc.
-func agentUpdateFetchFragment(t *testing.T, script, work string) string {
+// systemd or /proc. The umask is the script's own, and TARGET is the install
+// path a resumable download keeps its file beside. A run against a real
+// server gets that server's URLs in place of the planned ones.
+func agentUpdateFetchFragment(t *testing.T, script, work, target string, r fetchStubRun) string {
 	t.Helper()
 	var header []string
 	for _, line := range strings.Split(script, "\n") {
-		for _, prefix := range []string{"URL=", "FALLBACK_URL=", "EXPECT_SHA="} {
-			if strings.HasPrefix(line, prefix) {
-				header = append(header, line)
-			}
+		switch {
+		case r.real && strings.HasPrefix(line, "URL="):
+			header = append(header, "URL="+shellQuote(r.cpURL))
+		case r.real && strings.HasPrefix(line, "FALLBACK_URL="):
+			header = append(header, "FALLBACK_URL="+shellQuote(r.fbURL))
+		case strings.HasPrefix(line, "URL="), strings.HasPrefix(line, "FALLBACK_URL="), strings.HasPrefix(line, "EXPECT_SHA="):
+			header = append(header, line)
 		}
 	}
 	start := strings.Index(script, "CANDIDATE=\"$WORK/lattice-agent\"\n")
+	if start < 0 {
+		start = strings.Index(script, "PARTIAL_DIR=$(dirname \"$TARGET\")\n")
+	}
 	end := strings.Index(script, "chmod 0755 \"$CANDIDATE\"\n")
-	if len(header) != 3 || start < 0 || end < start {
+	if end < 0 {
+		end = strings.Index(script, "chmod 0700 \"$CANDIDATE\"\n")
+	}
+	if len(header) < 2 || start < 0 || end < start {
 		t.Fatalf("cannot find the download in the script (header %q, start %d, end %d):\n%s", header, start, end, script)
 	}
-	return "set -e\nWORK=" + shellQuote(work) + "\n" + strings.Join(header, "\n") + "\n" + script[start:end]
+	return "set -e\numask 077\nWORK=" + shellQuote(work) + "\nTARGET=" + shellQuote(target) + "\n" +
+		strings.Join(header, "\n") + "\n" + script[start:end]
 }

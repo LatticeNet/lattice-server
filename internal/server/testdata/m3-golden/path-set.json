@@ -1,0 +1,135 @@
+{
+  "config": {
+    "enabled": true,
+    "interval_sec": 60,
+    "timeout_sec": 5,
+    "sources": [
+      "node-fra",
+      "node-hk",
+      "node-sh"
+    ],
+    "auto_targets": true,
+    "alert": "down_and_degraded",
+    "alert_after": 3,
+    "degraded": {
+      "loss_percent": 3,
+      "latency_factor": 2.5
+    },
+    "version": 1,
+    "updated_at": "2026-09-14T09:35:00Z",
+    "updated_by": "user_admin"
+  },
+  "stored": true,
+  "default_source_name": "cd-hs-sh",
+  "nodes": [
+    {
+      "node_id": "node-sh",
+      "name": "cd-hs-sh",
+      "country": "CN",
+      "region": "mainland",
+      "source": true,
+      "target": "none",
+      "target_reason": "mainland"
+    },
+    {
+      "node_id": "node-fra",
+      "name": "fra-2",
+      "country": "DE",
+      "region": "outside_mainland",
+      "source": true,
+      "target": "probed",
+      "target_reason": "auto",
+      "endpoint": "203.0.113.4:443",
+      "protocol": "vless",
+      "line_name": "vless-reality-443",
+      "monitor_id": "mon_lat_node-fra",
+      "icmp_target": "203.0.113.4"
+    },
+    {
+      "node_id": "node-hk",
+      "name": "hk-edge",
+      "country": "HK",
+      "region": "outside_mainland",
+      "source": true,
+      "target": "probed",
+      "target_reason": "auto",
+      "endpoint": "203.0.113.2:443",
+      "protocol": "vless",
+      "line_name": "vless-reality-443",
+      "monitor_id": "mon_lat_node-hk",
+      "icmp_target": "203.0.113.2"
+    },
+    {
+      "node_id": "node-jp",
+      "name": "tyo-3",
+      "country": "JP",
+      "region": "outside_mainland",
+      "source": false,
+      "target": "probed",
+      "target_reason": "auto",
+      "endpoint": "203.0.113.3:443",
+      "protocol": "vless",
+      "line_name": "vless-reality-443",
+      "monitor_id": "mon_lat_node-jp",
+      "icmp_target": "203.0.113.3"
+    }
+  ],
+  "pairs": [
+    {
+      "source": "node-hk",
+      "target": "node-fra",
+      "enabled": true,
+      "active": true,
+      "monitor_id": "mon_lat_node-fra",
+      "method": "tcp"
+    },
+    {
+      "source": "node-sh",
+      "target": "node-fra",
+      "enabled": true,
+      "active": true,
+      "monitor_id": "mon_lat_node-fra",
+      "method": "tcp"
+    },
+    {
+      "source": "node-fra",
+      "target": "node-hk",
+      "enabled": true,
+      "active": true,
+      "monitor_id": "mon_lat_node-hk",
+      "method": "tcp"
+    },
+    {
+      "source": "node-sh",
+      "target": "node-hk",
+      "enabled": true,
+      "active": true,
+      "monitor_id": "mon_lat_node-hk",
+      "method": "tcp"
+    },
+    {
+      "source": "node-fra",
+      "target": "node-jp",
+      "enabled": true,
+      "active": true,
+      "monitor_id": "mon_lat_node-jp",
+      "method": "tcp"
+    },
+    {
+      "source": "node-hk",
+      "target": "node-jp",
+      "enabled": true,
+      "active": true,
+      "monitor_id": "mon_lat_node-jp",
+      "method": "tcp"
+    },
+    {
+      "source": "node-sh",
+      "target": "node-jp",
+      "enabled": true,
+      "active": true,
+      "monitor_id": "mon_lat_node-jp",
+      "method": "tcp"
+    }
+  ]
+}

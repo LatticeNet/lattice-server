@@ -42,10 +42,14 @@ func writeHotHistory(t testing.TB, path string, recs []store.MonitorResultRecord
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(recs) > 0 {
-		if _, err := bs.RecordMonitorResults(recs, store.DefaultMonitorHistoryLimits()); err != nil {
+	// In batches: the golden fleet's 100 000 rows took 70 s under the race
+	// detector in one bolt transaction and under 20 s in 5000s.
+	for len(recs) > 0 {
+		n := min(len(recs), 5000)
+		if _, err := bs.RecordMonitorResults(recs[:n], store.DefaultMonitorHistoryLimits()); err != nil {
 			t.Fatal(err)
 		}
+		recs = recs[n:]
 	}
 	if err := bs.Close(); err != nil {
 		t.Fatal(err)

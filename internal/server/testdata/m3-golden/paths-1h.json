@@ -1,0 +1,347 @@
+{
+  "window": "1h",
+  "observed_at": "2026-09-14T09:47:00Z",
+  "degraded_at": "2026-09-14T09:47:00Z",
+  "sources": [
+    {
+      "node_id": "",
+      "name": "Control plane",
+      "region": ""
+    },
+    {
+      "node_id": "node-sh",
+      "name": "cd-hs-sh",
+      "region": "mainland"
+    },
+    {
+      "node_id": "node-fra",
+      "name": "fra-2",
+      "region": "outside_mainland"
+    },
+    {
+      "node_id": "node-hk",
+      "name": "hk-edge",
+      "region": "outside_mainland"
+    }
+  ],
+  "targets": [
+    {
+      "node_id": "node-fra",
+      "name": "fra-2",
+      "region": "outside_mainland",
+      "country": "DE"
+    },
+    {
+      "node_id": "node-hk",
+      "name": "hk-edge",
+      "region": "outside_mainland",
+      "country": "HK"
+    },
+    {
+      "node_id": "node-jp",
+      "name": "tyo-3",
+      "region": "outside_mainland",
+      "country": "JP"
+    }
+  ],
+  "paths": [
+    {
+      "source": "node-hk",
+      "target_node": "node-fra",
+      "target": "203.0.113.4:443",
+      "monitor_id": "mon_lat_node-fra",
+      "managed": true,
+      "method": "tcp",
+      "state": "up",
+      "reason": "",
+      "p50_ms": 158,
+      "p95_ms": 158,
+      "jitter_ms": 0,
+      "loss": 0,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 158.8,
+        "loss": 0
+      },
+      "last_at": "2026-09-14T09:47:00Z"
+    },
+    {
+      "source": "node-sh",
+      "target_node": "node-fra",
+      "target": "203.0.113.4:443",
+      "monitor_id": "mon_lat_node-fra",
+      "managed": true,
+      "method": "tcp",
+      "state": "up",
+      "reason": "",
+      "p50_ms": 212,
+      "p95_ms": 212,
+      "jitter_ms": 0,
+      "loss": 0,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 210,
+        "loss": 0
+      },
+      "last_at": "2026-09-14T09:47:00Z"
+    },
+    {
+      "source": "node-fra",
+      "target_node": "node-hk",
+      "target": "203.0.113.2:443",
+      "monitor_id": "mon_lat_node-hk",
+      "managed": true,
+      "method": "tcp",
+      "state": "up",
+      "reason": "",
+      "p50_ms": 163,
+      "p95_ms": 163,
+      "jitter_ms": 0,
+      "loss": 0,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 162,
+        "loss": 0
+      },
+      "last_at": "2026-09-14T09:47:00Z"
+    },
+    {
+      "source": "node-sh",
+      "target_node": "node-hk",
+      "target": "203.0.113.2:443",
+      "monitor_id": "mon_lat_node-hk",
+      "managed": true,
+      "method": "tcp",
+      "state": "down",
+      "reason": "",
+      "p50_ms": 38,
+      "p95_ms": 38,
+      "jitter_ms": 0,
+      "loss": 0.0492,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 38,
+        "loss": 0
+      },
+      "last_at": "2026-09-14T09:47:00Z"
+    },
+    {
+      "source": "node-fra",
+      "target_node": "node-jp",
+      "target": "203.0.113.3:443",
+      "monitor_id": "mon_lat_node-jp",
+      "managed": true,
+      "method": "tcp",
+      "state": "degraded",
+      "reason": "degraded_latency",
+      "p50_ms": 140,
+      "p95_ms": 140,
+      "jitter_ms": 1.6,
+      "loss": 0,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 40.1,
+        "loss": 0
+      },
+      "last_at": "2026-09-14T09:47:00Z",
+      "degraded": {
+        "since": "2026-09-14T09:35:00Z",
+        "evaluated_at": "2026-09-14T09:43:00Z",
+        "clearing_since": "2026-09-14T09:44:00Z",
+        "latency": {
+          "p50_ms": 140,
+          "runs": 16,
+          "baseline_ms": 40,
+          "trigger_ms": 100
+        }
+      }
+    },
+    {
+      "source": "node-hk",
+      "target_node": "node-jp",
+      "target": "203.0.113.3:443",
+      "monitor_id": "mon_lat_node-jp",
+      "managed": true,
+      "method": "tcp",
+      "state": "degraded",
+      "reason": "degraded_latency",
+      "p50_ms": 140,
+      "p95_ms": 140,
+      "jitter_ms": 0,
+      "loss": 0,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 52,
+        "loss": 0
+      },
+      "last_at": "2026-09-14T09:47:00Z",
+      "degraded": {
+        "since": "2026-09-14T09:35:00Z",
+        "evaluated_at": "2026-09-14T09:47:00Z",
+        "latency": {
+          "p50_ms": 140,
+          "runs": 16,
+          "baseline_ms": 52,
+          "trigger_ms": 130
+        }
+      }
+    },
+    {
+      "source": "node-sh",
+      "target_node": "node-jp",
+      "target": "203.0.113.3:443",
+      "monitor_id": "mon_lat_node-jp",
+      "managed": true,
+      "method": "tcp",
+      "state": "degraded",
+      "reason": "degraded_loss",
+      "p50_ms": 40,
+      "p95_ms": 40,
+      "jitter_ms": 0,
+      "loss": 0.082,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 40,
+        "loss": 0.0333
+      },
+      "last_at": "2026-09-14T09:47:00Z",
+      "degraded": {
+        "since": "2026-09-14T09:35:00Z",
+        "evaluated_at": "2026-09-14T09:47:00Z",
+        "loss": {
+          "value": 0.082,
+          "baseline": 0.0003,
+          "trigger": 0.03,
+          "sent": 61,
+          "lost": 5
+        }
+      }
+    },
+    {
+      "source": "",
+      "target_node": "",
+      "target": "lattice.example.net:443",
+      "monitor_id": "mon-cert",
+      "managed": false,
+      "method": "tls",
+      "state": "up",
+      "reason": "",
+      "p50_ms": 85,
+      "p95_ms": 85,
+      "jitter_ms": 0,
+      "loss": 0,
+      "samples": 1,
+      "expected": 1,
+      "prev": {
+        "p50_ms": 85,
+        "loss": 0
+      },
+      "last_at": "2026-09-14T09:15:00Z"
+    },
+    {
+      "source": "node-fra",
+      "target_node": "node-jp",
+      "target": "203.0.113.3",
+      "monitor_id": "mon-ping-jp",
+      "managed": false,
+      "method": "icmp",
+      "state": "unknown",
+      "reason": "icmp_not_permitted",
+      "p50_ms": null,
+      "p95_ms": null,
+      "jitter_ms": null,
+      "loss": null,
+      "samples": 0,
+      "expected": 60,
+      "prev": null,
+      "last_at": null
+    },
+    {
+      "source": "node-hk",
+      "target_node": "node-jp",
+      "target": "203.0.113.3",
+      "monitor_id": "mon-ping-jp",
+      "managed": false,
+      "method": "icmp",
+      "state": "up",
+      "reason": "",
+      "p50_ms": 50,
+      "p95_ms": 50,
+      "jitter_ms": 0,
+      "loss": 0,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 50,
+        "loss": 0
+      },
+      "last_at": "2026-09-14T09:47:00Z"
+    },
+    {
+      "source": "node-hk",
+      "target_node": "node-jp",
+      "target": "203.0.113.3:443",
+      "monitor_id": "mon-web",
+      "managed": false,
+      "method": "tcp",
+      "state": "up",
+      "reason": "",
+      "p50_ms": 51,
+      "p95_ms": 51,
+      "jitter_ms": 0,
+      "loss": 0,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 51.5,
+        "loss": 0
+      },
+      "last_at": "2026-09-14T09:47:00Z"
+    },
+    {
+      "source": "node-sh",
+      "target_node": "node-jp",
+      "target": "203.0.113.3:443",
+      "monitor_id": "mon-web",
+      "managed": false,
+      "method": "tcp",
+      "state": "degraded",
+      "reason": "degraded_loss_latency",
+      "p50_ms": 140,
+      "p95_ms": 140,
+      "jitter_ms": 0,
+      "loss": 0.082,
+      "samples": 61,
+      "expected": 60,
+      "prev": {
+        "p50_ms": 40,
+        "loss": 0.0333
+      },
+      "last_at": "2026-09-14T09:47:00Z",
+      "degraded": {
+        "since": "2026-09-14T09:35:00Z",
+        "evaluated_at": "2026-09-14T09:47:00Z",
+        "loss": {
+          "value": 0.082,
+          "baseline": 0.0003,
+          "trigger": 0.05,
+          "sent": 61,
+          "lost": 5
+        },
+        "latency": {
+          "p50_ms": 140,
+          "runs": 16,
+          "baseline_ms": 40,
+          "trigger_ms": 90
+        }
+      }
+    }
+  ]
+}

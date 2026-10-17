@@ -57,7 +57,21 @@ RUN apk add --no-cache ca-certificates su-exec tzdata \
     && chown 65532:65532 /run/lattice-probe \
     && chmod 0770 /run/lattice-probe
 
-COPY --from=build /out/lattice-server /usr/local/bin/lattice-server
+# Design 30: the server runs each plugin child as its own uid, which needs
+# CAP_SETUID and CAP_SETGID, and reaps that child across the uid with
+# CAP_KILL. The three are file capabilities on the binary, permitted and
+# effective but never inheritable or ambient: they land on the server's own
+# execve whoever execs it (su-exec included), and a plugin child's execve of
+# an artifact without file capabilities computes an empty set. They apply
+# only while the container keeps no-new-privileges off; with it on, the
+# server starts with none and every plugin drop fails closed. setcap comes
+# from libcap and is removed again in the same step. The binary is installed
+# in the layer that sets the capability, so the image carries one copy.
+RUN --mount=type=bind,from=build,source=/out/lattice-server,target=/tmp/lattice-server \
+    apk add --no-cache --virtual .setcap libcap-utils \
+    && install -m 0755 /tmp/lattice-server /usr/local/bin/lattice-server \
+    && setcap cap_setuid,cap_setgid,cap_kill+ep /usr/local/bin/lattice-server \
+    && apk del .setcap
 COPY --from=dashboard /src/dashboard/dist /app/dashboard
 COPY docker-entrypoint.sh /usr/local/bin/lattice-entrypoint
 RUN chmod 0755 /usr/local/bin/lattice-entrypoint

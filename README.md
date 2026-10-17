@@ -234,13 +234,31 @@ and keeps the newest 10 stale untagged versions by default as a rollback buffer.
 
 The container leaves `LATTICE_MASTER_KEY_FILE` unset by default so first boot can
 generate `/var/lib/lattice/master.key` automatically. Set it only when restoring
-or mounting a pre-existing key. The entrypoint fixes ownership of the mounted
-data directory before dropping privileges to the `lattice` user.
+or mounting a pre-existing key. The entrypoint chowns the mounted data
+directory to `lattice` when `lattice` does not own it yet (a fresh bind mount),
+then drops privileges to the `lattice` user. A data directory `lattice` already
+owns is left as it is, contents included, so an ordinary boot needs no
+`CAP_CHOWN`.
 
 Manifest-v2 plugins require a writable private extraction cache, for example
 `LATTICE_PLUGIN_BUNDLE_CACHE_DIR=/var/lib/lattice/plugin-bundles`. Keep this
 separate from both the read-only plugin source mount (`LATTICE_PLUGIN_DIR`) and
 the executable working directories (`LATTICE_PLUGIN_RUNTIME_DIR`).
+
+System plugin children can run as their own uid instead of the server's
+(design 30). Set `LATTICE_PLUGIN_UID_BASE` (1000 or higher) and optionally
+`LATTICE_PLUGIN_UID_RANGE` (default 1024): each plugin then runs as a uid from
+that range, with the same number as its gid and no supplementary groups, so it
+cannot read the server's `0600` files, open the probe socket, or signal the
+server or another plugin. The server refuses to start when the range contains
+its own uid, one of its groups, or 65532 (lattice-probe). Unset keeps plugins on
+the server's uid. The image gives `/usr/local/bin/lattice-server` the file
+capabilities `cap_setuid,cap_setgid,cap_kill` for this, so the container must
+not set `no-new-privileges`: with it the server starts with no capabilities and
+every plugin fails to start. The runtime directory and every directory under it
+down to a plugin's generation are `0711`, and the staged artifact is `0555`, all
+owned by the server; the runner refuses to exec an artifact when any of them has
+another mode or owner.
 
 Dashboard static serving is cache-aware: `index.html`, SPA fallback routes, and
 `theme-init.js` are served with `Cache-Control: no-cache`; content-hashed Vite

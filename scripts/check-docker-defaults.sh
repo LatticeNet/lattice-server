@@ -64,4 +64,20 @@ do
   fi
 done
 
+# Design 30: the server binary carries exactly the three file capabilities
+# the plugin uid drop needs, and the entrypoint chowns the data directory
+# only when lattice does not own it yet, so no CAP_CHOWN is needed to boot.
+if ! grep -Fq "setcap cap_setuid,cap_setgid,cap_kill+ep /usr/local/bin/lattice-server" "$dockerfile"; then
+  echo "Dockerfile must set cap_setuid,cap_setgid,cap_kill+ep on /usr/local/bin/lattice-server (design 30)." >&2
+  exit 1
+fi
+if grep -Eq "setcap [^ ]*(\+[a-z]*i|=[a-z]*i)" "$dockerfile"; then
+  echo "Dockerfile must not grant the server inheritable capabilities: a plugin child could inherit them." >&2
+  exit 1
+fi
+if ! grep -Fq 'if [ "$(stat -c %u "$data_dir")" != "$(id -u lattice)" ]; then' "$entrypoint"; then
+  echo "$entrypoint must chown the data directory only when lattice does not own it (design 30)." >&2
+  exit 1
+fi
+
 sh -n "$entrypoint"

@@ -2124,8 +2124,7 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 	// applied before its task result lands. A result cannot un-apply what the
 	// node has proven, so it is recorded as a task result and nothing else.
 	if approval.Status == model.ApprovalApplied {
-		s.recordAgentUpdateFetch(r, approval, payload, result)
-		return nil
+		return s.recordAgentUpdateFetch(r, approval, payload, result)
 	}
 	policy, ok := s.store.AgentUpdatePolicy(payload.NodeID)
 	if !ok {
@@ -2161,8 +2160,14 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		return err
 	}
 	if !written {
-		s.recordAgentUpdateFetch(r, approval, payload, result)
-		return nil
+		return s.recordAgentUpdateFetch(r, approval, payload, result)
+	}
+	// What each source delivered, from the line the walk prints last. It is
+	// kept for success and failure alike: a slow download that finished is
+	// the measurement the next change to the sources needs.
+	summary, fetch, hasFetch := s.agentUpdateFetchRecord(approval, payload, result)
+	if hasFetch {
+		policy.LastFetch = &fetch
 	}
 	if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
 		return err
@@ -2174,10 +2179,7 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		Decision: decision,
 		Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID},
 	}
-	// What each source delivered, from the line the walk prints last. It is
-	// kept for success and failure alike: a slow download that finished is
-	// the measurement the next change to the sources needs.
-	if summary, ok := parseAgentFetchSummary(result.Stderr); ok {
+	if hasFetch {
 		ev.Metadata["fetch"] = summary
 	}
 	if decision == "deny" {
@@ -2190,10 +2192,22 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 // recordAgentUpdateFetch keeps the fetch summary of a result that arrives
 // after the node's own report already applied its approval. Those are often
 // the slow downloads that finished, the measurement the summary exists for.
-func (s *Server) recordAgentUpdateFetch(r *http.Request, approval model.Approval, payload agentUpdatePayload, result model.TaskResult) {
-	summary, ok := parseAgentFetchSummary(result.Stderr)
+//
+// The policy write touches last_fetch alone, under the store lock: this path
+// runs exactly when the report that applied the approval is writing the
+// policy's applied version, and a read here followed by a whole-policy write
+// could put the old version back. A policy deleted meanwhile is not
+// re-created for it.
+func (s *Server) recordAgentUpdateFetch(r *http.Request, approval model.Approval, payload agentUpdatePayload, result model.TaskResult) error {
+	summary, fetch, ok := s.agentUpdateFetchRecord(approval, payload, result)
 	if !ok {
-		return
+		return nil
+	}
+	if _, err := s.store.MutateAgentUpdatePolicy(payload.NodeID, func(policy *model.AgentUpdatePolicy) bool {
+		policy.LastFetch = &fetch
+		return true
+	}); err != nil {
+		return err
 	}
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID:       id.New("audit"),
@@ -2202,6 +2216,21 @@ func (s *Server) recordAgentUpdateFetch(r *http.Request, approval model.Approval
 		Decision: "observe",
 		Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID, "fetch": summary},
 	})
+	return nil
+}
+
+// agentUpdateFetchRecord reads the fetch summary out of a task result: the
+// line the audit keeps, and the record the policy keeps as last_fetch, stamped
+// with the approval, its target and when the control plane received it.
+func (s *Server) agentUpdateFetchRecord(approval model.Approval, payload agentUpdatePayload, result model.TaskResult) (string, model.AgentUpdateFetch, bool) {
+	summary, fetch, ok := parseAgentFetchSummary(result.Stderr)
+	if !ok {
+		return "", model.AgentUpdateFetch{}, false
+	}
+	fetch.ApprovalID = approval.ID
+	fetch.TargetVersion = payload.TargetVersion
+	fetch.At = s.now().UTC()
+	return summary, fetch, true
 }
 
 func agentUpdateAwaitingConfirmationReason(targetVersion string) string {

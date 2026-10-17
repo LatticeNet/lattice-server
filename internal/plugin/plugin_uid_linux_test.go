@@ -679,12 +679,7 @@ func assertGone(t *testing.T, what string, pid int) {
 // With CAP_CHOWN (root), every owner mutation in the staged chain is made
 // for real and refused, beside the mode checks the portable test covers.
 func TestStagedChainRefusesARealOwnerChange(t *testing.T) {
-	if os.Geteuid() != 0 {
-		if os.Getenv("LATTICE_TEST_REQUIRE_UID_DROP") == "1" && os.Getenv("LATTICE_TEST_ALLOW_NO_CHOWN") != "1" {
-			t.Fatal("changing an owner needs root")
-		}
-		t.Skip("changing an owner needs root")
-	}
+	requireRoot(t, "changing an owner needs root")
 	f := newIsolationFixture(t)
 	log := &recordingLog{}
 	r := isolationRunner(t, f, &PluginUIDRange{Base: 200000, Size: 64})

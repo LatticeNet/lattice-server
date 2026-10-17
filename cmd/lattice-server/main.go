@@ -154,6 +154,13 @@ func main() {
 	default:
 		log.Printf("at-rest encryption: enabled (key source: %s)", keyRes.Source)
 	}
+	// Design 30: a plugin whose uid owns a data file or the master key would
+	// own the server's secrets, so the drop is not armed over such a file.
+	if pluginUIDs != nil {
+		if err := pluginUIDs.CheckOwnership(dataDir, keyRes.KeyFilePath); err != nil {
+			log.Fatal(err)
+		}
+	}
 
 	st, err := store.OpenWithCipher(dataPath, keyRes.Cipher)
 	if err != nil {

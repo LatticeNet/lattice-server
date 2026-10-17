@@ -272,28 +272,30 @@ func TestSystemRunnerAssignsTheCredentialAtPrepare(t *testing.T) {
 	}
 }
 
-// The staged chain is 0711 from the runtime root down and the artifact 0555,
-// all owned by the server, whatever modes the root had before.
+// With the drop on, the staged chain is 0711 from the runtime root down and
+// the artifact 0555, all owned by the server, whatever modes the root had
+// before. The check runs before every exec; the Linux tests exec for real.
 func TestSystemRunnerStagesTheRelaxedChain(t *testing.T) {
 	runtimeDir := filepath.Join(t.TempDir(), "plugin-runtime")
 	// A runtime root made before design 30.
 	if err := os.Mkdir(runtimeDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	// Every refusal below counts toward the circuit breaker; keep it out of
-	// the way so each one reaches the staged check.
-	r := newRunner(t, SystemRunnerOptions{RuntimeDir: runtimeDir, CrashThreshold: 1000})
+	r := newRunner(t, SystemRunnerOptions{RuntimeDir: runtimeDir, PluginUIDs: &PluginUIDRange{Base: 400000, Size: 8}})
 	loaded := makeBundle(t, "p.chain", "#!/bin/sh\nread line\necho '{\"ok\":true}'\n", "")
 	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 3, Loaded: loaded}); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.ActivateGeneration(loaded.Manifest.ID, 3); err != nil {
-		t.Fatal(err)
-	}
+	r.mu.Lock()
+	st := r.st[loaded.Manifest.ID][3]
+	r.mu.Unlock()
 	owner := uint32(os.Geteuid())
 	pluginDir := filepath.Join(runtimeDir, loaded.Manifest.ID)
 	genDir := filepath.Join(pluginDir, "generation-3")
 	artifact := filepath.Join(genDir, "artifact")
+	if st.execPath != artifact {
+		t.Fatalf("staged at %s, want %s", st.execPath, artifact)
+	}
 	for path, want := range map[string]os.FileMode{runtimeDir: stagedDirMode, pluginDir: stagedDirMode, genDir: stagedDirMode, artifact: stagedArtifactMode} {
 		info, err := os.Lstat(path)
 		if err != nil {
@@ -306,11 +308,8 @@ func TestSystemRunnerStagesTheRelaxedChain(t *testing.T) {
 			t.Fatalf("%s is owned by %d, want the server's %d", path, uid, owner)
 		}
 	}
-	invoke := func() error {
-		_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 3, Action: "plan"})
-		return err
-	}
-	if err := invoke(); err != nil {
+	check := func() error { return r.checkStagedArtifact(loaded.Manifest.ID, 3, st.execPath, st.execSHA256) }
+	if err := check(); err != nil {
 		t.Fatalf("the staged chain as written: %v", err)
 	}
 
@@ -321,7 +320,7 @@ func TestSystemRunnerStagesTheRelaxedChain(t *testing.T) {
 			if err := os.Chmod(path, mode); err != nil {
 				t.Fatal(err)
 			}
-			if err := invoke(); !errors.Is(err, errStagedArtifactChanged) {
+			if err := check(); !errors.Is(err, errStagedArtifactChanged) {
 				t.Fatalf("%s at %s: got %v, want a refusal", path, mode, err)
 			}
 			if err := os.Chmod(path, stagedDirMode); err != nil {
@@ -333,25 +332,25 @@ func TestSystemRunnerStagesTheRelaxedChain(t *testing.T) {
 		if err := os.Chmod(artifact, mode); err != nil {
 			t.Fatal(err)
 		}
-		if err := invoke(); !errors.Is(err, errStagedArtifactChanged) {
+		if err := check(); !errors.Is(err, errStagedArtifactChanged) {
 			t.Fatalf("artifact at %s: got %v, want a refusal", mode, err)
 		}
 		if err := os.Chmod(artifact, stagedArtifactMode); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := invoke(); err != nil {
+	if err := check(); err != nil {
 		t.Fatalf("the restored chain: %v", err)
 	}
 
 	// An owner other than the server's uid is refused for the chain and the
 	// artifact alike. Changing the owner needs root, so the runner is told
 	// to expect another uid instead; the Linux root test chowns for real.
-	r.serverUID = owner + 1
-	if err := invoke(); !errors.Is(err, errStagedArtifactChanged) || !strings.Contains(err.Error(), "owned by uid") {
+	r.layout.owner = owner + 1
+	if err := check(); !errors.Is(err, errStagedArtifactChanged) || !strings.Contains(err.Error(), "owned by uid") {
 		t.Fatalf("a chain owned by another uid: got %v, want a refusal", err)
 	}
-	r.serverUID = owner
+	r.layout.owner = owner
 
 	// A symlink in place of the plugin directory is refused even when it
 	// points at an identical chain.
@@ -364,6 +363,62 @@ func TestSystemRunnerStagesTheRelaxedChain(t *testing.T) {
 	}
 	if err := stagedChainMatches(runtimeDir, genDir, owner); !errors.Is(err, errStagedArtifactChanged) {
 		t.Fatalf("a symlinked plugin directory: got %v, want a refusal", err)
+	}
+}
+
+// With the drop off, the runner stages and checks exactly as before design
+// 30: a 0700 working directory and a 0700 artifact, the operator's runtime
+// root left at the mode it has, and nothing above the artifact checked.
+func TestSystemRunnerUnsetKeepsThePrivateLayout(t *testing.T) {
+	runtimeDir := filepath.Join(t.TempDir(), "plugin-runtime")
+	if err := os.Mkdir(runtimeDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(runtimeDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	r := newRunner(t, SystemRunnerOptions{RuntimeDir: runtimeDir, CrashThreshold: 1000})
+	loaded := makeBundle(t, "p.private", "#!/bin/sh\nread line\necho '{\"ok\":true}'\n", "")
+	if _, err := r.Prepare(t.Context(), RunnerStartRequest{PluginID: loaded.Manifest.ID, Generation: 2, Loaded: loaded}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ActivateGeneration(loaded.Manifest.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	pluginDir := filepath.Join(runtimeDir, loaded.Manifest.ID)
+	genDir := filepath.Join(pluginDir, "generation-2")
+	artifact := filepath.Join(genDir, "artifact")
+	for path, want := range map[string]os.FileMode{runtimeDir: 0o750, pluginDir: 0o700, genDir: 0o700, artifact: 0o700} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != want {
+			t.Fatalf("%s is %s, want %04o as before design 30", path, info.Mode(), want)
+		}
+	}
+	invoke := func() error {
+		_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: loaded.Manifest.ID, Generation: 2, Action: "plan"})
+		return err
+	}
+	if err := invoke(); err != nil {
+		t.Fatalf("the private layout as written: %v", err)
+	}
+	// The root and the plugin directory are not checked, as before.
+	for _, path := range []string{runtimeDir, pluginDir} {
+		if err := os.Chmod(path, 0o777); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := invoke(); err != nil {
+		t.Fatalf("an operator's root at 0777 with the drop off: %v", err)
+	}
+	// The artifact keeps the exact 0700 rule; the isolated 0555 is refused.
+	if err := os.Chmod(artifact, stagedArtifactMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := invoke(); !errors.Is(err, errStagedArtifactChanged) {
+		t.Fatalf("a 0555 artifact with the drop off: got %v, want a refusal", err)
 	}
 }
 

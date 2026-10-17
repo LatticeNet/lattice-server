@@ -1245,10 +1245,7 @@ func TestSystemRunnerV2ReplenishRefusesTamperedArtifact(t *testing.T) {
 	waitIdle()
 	canary := filepath.Join(t.TempDir(), "tampered-ran")
 	staged := filepath.Join(runtimeDir, id, "generation-1", "artifact")
-	if err := os.WriteFile(staged+".planted", []byte("#!/bin/sh\ntouch "+canary+"\n"), stagedArtifactMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(staged+".planted", stagedArtifactMode); err != nil {
+	if err := os.WriteFile(staged+".planted", []byte("#!/bin/sh\ntouch "+canary+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(staged+".planted", staged); err != nil {
@@ -1278,17 +1275,8 @@ func TestSystemRunnerV1RefusesTamperedStagedArtifact(t *testing.T) {
 	if rsp, err := startInvoke(t, r, loaded, "plan", nil); err != nil || !rsp.OK {
 		t.Fatalf("untouched artifact: response=%+v err=%v", rsp, err)
 	}
-	// The staged artifact is 0555, so the rewrite plants a file of the same
-	// mode and owner and renames it over, leaving only the SHA pin to refuse it.
 	canary := filepath.Join(t.TempDir(), "tampered-ran")
-	staged := filepath.Join(runtimeDir, "p.v1tamper", "artifact")
-	if err := os.WriteFile(staged+".planted", []byte("#!/bin/sh\ntouch "+canary+"\n"), stagedArtifactMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(staged+".planted", stagedArtifactMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(staged+".planted", staged); err != nil {
+	if err := os.WriteFile(filepath.Join(runtimeDir, "p.v1tamper", "artifact"), []byte("#!/bin/sh\ntouch "+canary+"\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: "p.v1tamper", Action: "plan"})
@@ -1312,14 +1300,7 @@ func TestStagedArtifactMatches(t *testing.T) {
 	body := []byte("#!/bin/sh\nexit 0\n")
 	want := DigestSHA256(body)
 	owner := uint32(os.Geteuid())
-	good := filepath.Join(dir, "artifact")
-	if err := writeFileAtomic(good, body, stagedArtifactMode); err != nil {
-		t.Fatal(err)
-	}
-	if err := stagedArtifactMatches(good, want, owner); err != nil {
-		t.Fatalf("the staged file as written: %v", err)
-	}
-
+	isolated := isolatedStagedLayout(owner)
 	withMode := func(name string, mode os.FileMode) string {
 		path := filepath.Join(dir, name)
 		if err := os.WriteFile(path, body, 0o600); err != nil {
@@ -1330,6 +1311,14 @@ func TestStagedArtifactMatches(t *testing.T) {
 		}
 		return path
 	}
+	private := withMode("private", stagedPrivateMode)
+	if err := stagedArtifactMatches(private, want, privateStagedLayout); err != nil {
+		t.Fatalf("a 0700 file with the drop off: %v", err)
+	}
+	good := withMode("isolated", stagedArtifactMode)
+	if err := stagedArtifactMatches(good, want, isolated); err != nil {
+		t.Fatalf("a 0555 file with the drop on: %v", err)
+	}
 	link := filepath.Join(dir, "link")
 	if err := os.Symlink(good, link); err != nil {
 		t.Fatal(err)
@@ -1338,22 +1327,29 @@ func TestStagedArtifactMatches(t *testing.T) {
 	if err := syscall.Mkfifo(fifo, 0o555); err != nil {
 		t.Fatal(err)
 	}
+	foreign := isolatedStagedLayout(owner + 1)
 	for name, tc := range map[string]struct {
 		path, digest string
-		owner        uint32
+		layout       stagedLayout
 	}{
-		"other bytes":                  {good, DigestSHA256([]byte("other")), owner},
-		"no recorded hash":             {good, "", owner},
-		"the pre-design-30 mode 0700":  {withMode("strict", 0o700), want, owner},
-		"group or world writable 0775": {withMode("loose", 0o775), want, owner},
-		"owner writable 0755":          {withMode("writable", 0o755), want, owner},
-		"setuid 4555":                  {withMode("setuid", os.ModeSetuid|0o555), want, owner},
-		"owned by another uid":         {good, want, owner + 1},
-		"symlink to the same bytes":    {link, want, owner},
-		"fifo":                         {fifo, want, owner},
-		"missing":                      {filepath.Join(dir, "gone"), want, owner},
+		"drop off: other bytes":                 {private, DigestSHA256([]byte("other")), privateStagedLayout},
+		"drop off: no recorded hash":            {private, "", privateStagedLayout},
+		"drop off: mode other than 0700":        {withMode("loose", 0o755), want, privateStagedLayout},
+		"drop off: the isolated mode 0555":      {good, want, privateStagedLayout},
+		"drop off: symlink to the same bytes":   {link, want, privateStagedLayout},
+		"drop off: fifo":                        {fifo, want, privateStagedLayout},
+		"drop off: missing":                     {filepath.Join(dir, "gone"), want, privateStagedLayout},
+		"drop on: other bytes":                  {good, DigestSHA256([]byte("other")), isolated},
+		"drop on: the private mode 0700":        {private, want, isolated},
+		"drop on: group or world writable 0775": {withMode("writable", 0o775), want, isolated},
+		"drop on: owner writable 0755":          {withMode("owner-writable", 0o755), want, isolated},
+		"drop on: setuid 4555":                  {withMode("setuid", os.ModeSetuid|0o555), want, isolated},
+		"drop on: owned by another uid":         {good, want, foreign},
+		"drop on: symlink to the same bytes":    {link, want, isolated},
+		"drop on: fifo":                         {fifo, want, isolated},
+		"drop on: missing":                      {filepath.Join(dir, "gone"), want, isolated},
 	} {
-		if err := stagedArtifactMatches(tc.path, tc.digest, tc.owner); !errors.Is(err, errStagedArtifactChanged) {
+		if err := stagedArtifactMatches(tc.path, tc.digest, tc.layout); !errors.Is(err, errStagedArtifactChanged) {
 			t.Fatalf("%s: got %v, want a refusal", name, err)
 		}
 	}

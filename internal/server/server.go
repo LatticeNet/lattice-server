@@ -110,9 +110,8 @@ type Options struct {
 	// publisher signature.
 	PluginTrust plugin.TrustPolicy
 	// PluginRuntimeDir, when set, enables the Tier-2 system runner: each system
-	// plugin gets a confined working dir under this path (0711 directories,
-	// a 0555 artifact, design 30) and its verified artifact is executed there
-	// (design-08). Empty keeps the noop runner (broker
+	// plugin gets a confined 0700 working dir under this path and its verified
+	// artifact is executed there (design-08). Empty keeps the noop runner (broker
 	// armed, artifact NOT executed) — the deliberate default.
 	PluginRuntimeDir string
 	// PluginRuntimeEnv is the explicit environment-variable allowlist forwarded
@@ -123,7 +122,8 @@ type Options struct {
 	// retirement. Nil uses the system runner's safe host defaults.
 	PluginRuntimePool *plugin.SystemPoolConfig
 	// PluginUIDs, when set, runs each system plugin child as its own uid
-	// from this range (design 30, LATTICE_PLUGIN_UID_BASE). Nil keeps
+	// from this range (design 30, LATTICE_PLUGIN_UID_BASE). It needs
+	// PluginRuntimeDir: New refuses one without the other. Nil keeps
 	// children on the server's uid.
 	PluginUIDs *plugin.PluginUIDRange
 	// PublicURL is the externally-reachable base URL of this server (scheme +
@@ -692,6 +692,12 @@ func New(opts Options) (*Server, error) {
 		if err := plugin.ValidateSystemPoolConfig(*opts.PluginRuntimePool); err != nil {
 			return nil, fmt.Errorf("configure plugin runtime: %w", err)
 		}
+	}
+	// Per-plugin uids apply only to the system runner. Without a runtime dir
+	// no plugin child runs at all, and an operator who set the base believes
+	// isolation is on, so the combination is refused rather than ignored.
+	if opts.PluginUIDs != nil && strings.TrimSpace(opts.PluginRuntimeDir) == "" {
+		return nil, errors.New("configure plugin runtime: LATTICE_PLUGIN_UID_BASE is set but LATTICE_PLUGIN_RUNTIME_DIR is not; per-plugin uids apply only to the system runner, so set the runtime dir or unset the base")
 	}
 	if opts.Logger == nil {
 		opts.Logger = log.Default()

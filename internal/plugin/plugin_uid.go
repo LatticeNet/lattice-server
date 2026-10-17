@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +54,9 @@ func (r PluginUIDRange) Last() uint32 { return r.Base + r.Size - 1 }
 
 func (r PluginUIDRange) String() string { return fmt.Sprintf("%d-%d", r.Base, r.Last()) }
 
+// contains reports whether v, as a uid or a gid, falls in the range.
+func (r PluginUIDRange) contains(v uint32) bool { return v >= r.Base && v <= r.Last() }
+
 // ParsePluginUIDRange reads the LATTICE_PLUGIN_UID_BASE and
 // LATTICE_PLUGIN_UID_RANGE settings. An empty base turns the drop off and
 // returns nil; a range without a base is refused rather than ignored, since
@@ -67,12 +72,15 @@ func ParsePluginUIDRange(base, size string) (*PluginUIDRange, error) {
 	}
 	b, err := strconv.ParseUint(base, 10, 32)
 	if err != nil {
-		return nil, fmt.Errorf("invalid LATTICE_PLUGIN_UID_BASE %q: want a uid of at least %d", base, MinPluginUIDBase)
+		return nil, fmt.Errorf("invalid LATTICE_PLUGIN_UID_BASE %q: want a uid of at least %d: %w", base, MinPluginUIDBase, err)
 	}
 	rng := PluginUIDRange{Base: uint32(b), Size: DefaultPluginUIDRange}
 	if size != "" {
 		n, err := strconv.ParseUint(size, 10, 32)
-		if err != nil || n == 0 {
+		if err != nil {
+			return nil, fmt.Errorf("invalid LATTICE_PLUGIN_UID_RANGE %q: want a positive number of uids: %w", size, err)
+		}
+		if n == 0 {
 			return nil, fmt.Errorf("invalid LATTICE_PLUGIN_UID_RANGE %q: want a positive number of uids", size)
 		}
 		rng.Size = uint32(n)
@@ -129,7 +137,7 @@ func (r PluginUIDRange) validate(id processIdentity) error {
 	if err := r.validateBounds(); err != nil {
 		return err
 	}
-	inRange := func(v uint32) bool { return v >= r.Base && v <= r.Last() }
+	inRange := r.contains
 	for _, uid := range id.UIDs {
 		if inRange(uid) {
 			return fmt.Errorf("plugin uid range %s contains the server's own uid %d; a plugin on that uid would own the server's files", r, uid)
@@ -147,6 +155,57 @@ func (r PluginUIDRange) validate(id processIdentity) error {
 	}
 	if inRange(probeGroupID) {
 		return fmt.Errorf("plugin uid range %s contains %d, lattice-probe's uid and gid; a plugin on it could open the probe socket", r, probeGroupID)
+	}
+	return nil
+}
+
+// CheckOwnership refuses to arm the drop while any of paths, or anything
+// under one of them, is owned by a uid or a group inside the range: a plugin
+// assigned that uid would own the server's file. The data directory and the
+// master key are the paths that matter; a restore, copy or extract run as a
+// host user whose uid falls in the range leaves exactly this behind, and the
+// container entrypoint is not the only way to start the server. Each path is
+// resolved once and the walk below it follows no symlink. A directory the
+// server cannot read is skipped after its own owner is checked: the server's
+// data is readable to the server. An empty or missing path is skipped.
+func (r PluginUIDRange) CheckOwnership(paths ...string) error {
+	for _, p := range paths {
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		root, err := filepath.EvalSymlinks(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("check the ownership of %s before dropping plugin uids: %w", p, err)
+		}
+		err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				if errors.Is(walkErr, fs.ErrPermission) && d != nil && d.IsDir() {
+					return filepath.SkipDir
+				}
+				return walkErr
+			}
+			info, err := d.Info()
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			st, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return nil
+			}
+			if r.contains(st.Uid) || r.contains(st.Gid) {
+				return fmt.Errorf("%s is owned by %d:%d, inside the plugin uid range %s, so the plugin assigned that uid would own it; chown it to the server before setting LATTICE_PLUGIN_UID_BASE", path, st.Uid, st.Gid, r)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -3,10 +3,12 @@ package server
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
 
 // A change plan that moves the beacon's port leaves the agent reporting
@@ -114,5 +116,149 @@ func TestBeaconApprovalSurvivesARestart(t *testing.T) {
 	}
 	if bt, _ := st2.BeaconTarget("node-t"); bt.Companion == nil || !slices.Contains(bt.Companion.Allow, "203.0.113.122/32") {
 		t.Fatalf("the applied companion = %+v", bt.Companion)
+	}
+}
+
+// replanOf finds node-t in a matrix's replan list.
+func replanOf(t *testing.T, srv *Server) *model.BeaconReplan {
+	t.Helper()
+	m, err := srv.pathMatrixFor(beaconAdmin(), model.PathWindowHour, srv.now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.BeaconReplans == nil {
+		t.Fatal("the matrix carries no beacon_replans list")
+	}
+	for i := range m.BeaconReplans {
+		if m.BeaconReplans[i].NodeID == "node-t" {
+			return &m.BeaconReplans[i]
+		}
+	}
+	return nil
+}
+
+// When a source is added to or removed from a NetGuard node's beacon, the
+// beacon view and the matrix name the node that needs a change plan and the
+// request that files it; sending that request as it is plans the current
+// sources with the port, bind and endpoint unchanged, and once its approval
+// applies nothing is pending. Nothing is filed or applied on its own.
+func TestBeaconReplanNamesTheNodeAndThePlanRequest(t *testing.T) {
+	srv, handler, st := beaconFleet(t)
+	if _, err := st.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "node-t", Managed: true}); err != nil {
+		t.Fatal(err)
+	}
+	srv.replaceAgentCapabilities("node-t", []string{netGuardManagedSHACapability})
+	applyCompanion := func(approval model.Approval) {
+		t.Helper()
+		approved, err := decideBeacon(srv, approval, beaconAdmin())
+		if err != nil {
+			t.Fatal(err)
+		}
+		tasks := tasksFor(srv, approved.ID)
+		if len(tasks) != 1 {
+			t.Fatalf("tasks = %+v", tasks)
+		}
+		if err := srv.handleBeaconTaskResult(httptestRequest(), approved, tasks[0], model.TaskResult{TaskID: tasks[0].ID, NodeID: "node-t",
+			Stdout: netGuardManagedSHAResultPrefix + strings.Repeat("ab", 32) + "\n", FinishedAt: srv.now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	code, out, raw := planBeacon(t, handler, model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionEnable})
+	if code != 200 {
+		t.Fatalf("enable = %d %s", code, raw)
+	}
+	applyCompanion(out.Approval)
+	listenAsPlanned(t, srv, st)
+	if r := replanOf(t, srv); r != nil {
+		t.Fatalf("a beacon whose sources match its plan needs a replan: %+v", r)
+	}
+	if view := srv.beaconView(beaconAdmin(), nodeOf(t, st, "node-t"), srv.now()); view.Replan != nil {
+		t.Fatalf("view replan = %+v", view.Replan)
+	}
+	applied, _ := st.BeaconTarget("node-t")
+
+	// A source pinned to the beacon is added.
+	upsertNodes(t, st, model.Node{ID: "node-d", Name: "delta", PublicIP: "203.0.113.24", Online: true, ProbeMethods: []string{"beacon", "http", "icmp", "tcp"}})
+	listenAsPlanned(t, srv, st)
+	saveBeaconPathSet(t, srv, st, model.LatencyProbeConfig{
+		Enabled: true, Sources: []string{"node-a", "node-b", "node-c", "node-d"}, IncludeTargets: []string{"node-t"}, Method: model.LatencyMethodAuto,
+		SourceMethods: map[string]string{"node-d": model.LatencyMethodBeacon},
+	})
+	want := model.BeaconReplan{NodeID: "node-t", Name: "target", Reason: model.PathReasonFirewallPending, Added: []string{"node-d"}, Removed: []string{},
+		Request: model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionChange}}
+	r := replanOf(t, srv)
+	if r == nil || string(mustJSON(t, *r)) != string(mustJSON(t, want)) {
+		t.Fatalf("matrix replan = %+v, want %+v", r, want)
+	}
+	view := srv.beaconView(beaconAdmin(), nodeOf(t, st, "node-t"), srv.now())
+	if view.Replan == nil || string(mustJSON(t, *view.Replan)) != string(mustJSON(t, want)) {
+		t.Fatalf("view replan = %+v, want %+v", view.Replan, want)
+	}
+	if _, ok := st.Approval(applied.AppliedApprovalID); !ok || len(tasksFor(srv, applied.AppliedApprovalID)) != 1 {
+		t.Fatal("the replan filed or applied something on its own")
+	}
+
+	// One click: the request as it is.
+	code, out, raw = planBeacon(t, handler, r.Request)
+	if code != 200 {
+		t.Fatalf("the replan request = %d %s", code, raw)
+	}
+	if out.Plan.Beacon.Port != applied.Settings.Port || out.Plan.Beacon.Bind != applied.Settings.Bind || out.Plan.Beacon.Endpoint != applied.Settings.Endpoint {
+		t.Fatalf("the replan moved the beacon: %+v, applied %+v", out.Plan.Beacon, applied.Settings)
+	}
+	var planned []string
+	for _, src := range out.Plan.Sources {
+		planned = append(planned, src.NodeID)
+	}
+	if !slices.Equal(planned, []string{"node-a", "node-b", "node-d"}) || out.Plan.NetGuard == nil || !slices.Contains(out.Plan.NetGuard.Allow, "203.0.113.24/32") {
+		t.Fatalf("the replan's sources = %v, allow %+v", planned, out.Plan.NetGuard)
+	}
+	if r := replanOf(t, srv); r == nil || r.PendingApprovalID != out.Approval.ID {
+		t.Fatalf("while the plan waits the replan = %+v, want it to name approval %s", r, out.Approval.ID)
+	}
+	applyCompanion(out.Approval)
+	if r := replanOf(t, srv); r != nil {
+		t.Fatalf("after the plan applied the replan = %+v", r)
+	}
+
+	// A source leaves: NetGuard still admits it until a plan.
+	saveBeaconPathSet(t, srv, st, model.LatencyProbeConfig{
+		Enabled: true, Sources: []string{"node-b", "node-c", "node-d"}, IncludeTargets: []string{"node-t"}, Method: model.LatencyMethodAuto,
+		SourceMethods: map[string]string{"node-d": model.LatencyMethodBeacon},
+	})
+	if r := replanOf(t, srv); r == nil || r.Reason != model.PathReasonFirewallPending || len(r.Added) != 0 || !slices.Equal(r.Removed, []string{"node-a"}) {
+		t.Fatalf("after node-a left the replan = %+v", r)
+	}
+	// A token that may not read node-a learns a plan is needed, not who left.
+	confined := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"monitor:read"}, ServerAllowlist: []string{"node-t", "node-b", "node-d"}}}
+	if view := srv.beaconView(confined, nodeOf(t, st, "node-t"), srv.now()); view.Replan == nil || len(view.Replan.Removed) != 0 {
+		t.Fatalf("confined view replan = %+v", view.Replan)
+	}
+}
+
+// Without NetGuard an added source waits for its approval and a source that
+// leaves needs no plan: the table drops it at the target's next pull.
+func TestBeaconReplanWithoutNetGuard(t *testing.T) {
+	srv, handler, st := beaconFleet(t)
+	enableBeacon(t, srv, handler, model.BeaconPlanRequest{})
+	listenAsPlanned(t, srv, st)
+	saveBeaconPathSet(t, srv, st, model.LatencyProbeConfig{
+		Enabled: true, Sources: []string{"node-b", "node-c"}, IncludeTargets: []string{"node-t"}, Method: model.LatencyMethodAuto,
+	})
+	if r := replanOf(t, srv); r != nil {
+		t.Fatalf("a source that left an internet beacon needs a replan: %+v", r)
+	}
+	upsertNodes(t, st, model.Node{ID: "node-d", Name: "delta", PublicIP: "203.0.113.24", Online: true, ProbeMethods: []string{"beacon", "http", "icmp", "tcp"}})
+	listenAsPlanned(t, srv, st)
+	saveBeaconPathSet(t, srv, st, model.LatencyProbeConfig{
+		Enabled: true, Sources: []string{"node-b", "node-c", "node-d"}, IncludeTargets: []string{"node-t"}, Method: model.LatencyMethodAuto,
+		SourceMethods: map[string]string{"node-d": model.LatencyMethodBeacon},
+	})
+	r := replanOf(t, srv)
+	if r == nil || r.Reason != model.PathReasonBeaconSourcePending || !slices.Equal(r.Added, []string{"node-d"}) || len(r.Removed) != 0 {
+		t.Fatalf("an added source on an internet beacon = %+v", r)
+	}
+	if code, _, raw := planBeacon(t, handler, r.Request); code != 200 {
+		t.Fatalf("the replan request = %d %s", code, raw)
 	}
 }

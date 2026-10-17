@@ -1130,11 +1130,12 @@ func (s *Server) pathMatrixFor(p principal, window string, now time.Time) (model
 		}
 	}
 	out := model.PathMatrix{
-		Window:     window,
-		ObservedAt: now,
-		Sources:    []model.PathSource{},
-		Targets:    []model.PathTarget{},
-		Paths:      make([]model.PathCell, 0, len(entries)),
+		Window:        window,
+		ObservedAt:    now,
+		Sources:       []model.PathSource{},
+		Targets:       []model.PathTarget{},
+		Paths:         make([]model.PathCell, 0, len(entries)),
+		BeaconReplans: s.beaconReplans(p, nodes, now),
 	}
 	degraded := s.pathDegradedSnapshot()
 	if !degraded.evaluatedAt.IsZero() {

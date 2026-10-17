@@ -5425,8 +5425,8 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		if req.Alert == "" {
 			req.Alert = model.MonitorAlertDown
 		}
-		if req.AlertAfter < 0 || req.AlertAfter > model.MonitorAlertAfterMax {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax))
+		if err := validMonitorAlertAfter(req.AlertAfter); err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		// Sources are paused through an edit of a check that exists, and

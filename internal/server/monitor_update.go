@@ -100,6 +100,19 @@ func degradedRuleSummary(r *model.MonitorDegradedRule) string {
 	return strings.Join(parts, ",")
 }
 
+// validMonitorAlertAfter is the one alert_after rule a create, an edit and a
+// path set save apply: 1 to model.MonitorAlertAfterMax, or 0 for the default
+// (model.MonitorAlertAfterDefault). A create cannot tell an absent field from
+// zero, so zero must mean the default there, and an edit reads it the same
+// way rather than refusing what a create accepts. Zero is stored as given and
+// reads as the default (store.MonitorAlertAfter).
+func validMonitorAlertAfter(n int) error {
+	if n < 0 || n > model.MonitorAlertAfterMax {
+		return fmt.Errorf("alert_after must be 1 to %d, or 0 for the default (%d)", model.MonitorAlertAfterMax, model.MonitorAlertAfterDefault)
+	}
+	return nil
+}
+
 // validMonitorTiming checks the interval and timeout a save stores.
 func validMonitorTiming(intervalSec, timeoutSec int) error {
 	if intervalSec < monitorMinIntervalSec || intervalSec > monitorMaxIntervalSec {
@@ -339,11 +352,11 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 		next.Degraded = rule
 	}
 	if req.AlertAfter != nil {
-		if *req.AlertAfter < 1 || *req.AlertAfter > model.MonitorAlertAfterMax {
-			return model.Monitor{}, nil, false, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax)
+		if err := validMonitorAlertAfter(*req.AlertAfter); err != nil {
+			return model.Monitor{}, nil, false, err
 		}
-		note("alert_after", *req.AlertAfter != store.MonitorAlertAfter(mon))
 		next.AlertAfter = *req.AlertAfter
+		note("alert_after", store.MonitorAlertAfter(next) != store.MonitorAlertAfter(mon))
 	}
 	if req.Enabled != nil {
 		note("enabled", *req.Enabled != mon.Enabled)

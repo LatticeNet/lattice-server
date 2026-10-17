@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/http"
 	"slices"
 	"strings"
@@ -97,6 +98,47 @@ func TestCheckSaveErrorsNameTheKindsAccepted(t *testing.T) {
 		_, reason := targets.resolve(kind, "n", "")
 		if named, resolved := slices.Contains(monitorNodeTargetKinds, kind), reason != "unsupported_kind"; named != resolved {
 			t.Errorf("the target_node error names %s: %v, but the resolver takes the kind: %v", kind, named, resolved)
+		}
+	}
+}
+
+// A create and an edit apply one alert_after rule: 0 means the default on
+// both, and both refuse the same values with the same answer.
+func TestAlertAfterZeroMeansTheDefaultOnCreateAndEdit(t *testing.T) {
+	_, handler, st := newInventoryServer(t)
+	cookies, csrf := loginSession(t, handler)
+	upsertNodes(t, st, model.Node{ID: "node-a", Name: "a"})
+	res := doJSON(t, handler, http.MethodPost, "/api/monitors", `{"name":"x","type":"tcp","target":"203.0.113.9:443","node_ids":["node-a"],"alert_after":0}`, cookies, csrf)
+	created := decodeMonitorView(t, res)
+	if res.StatusCode != http.StatusOK || created.AlertAfter != model.MonitorAlertAfterDefault {
+		t.Fatalf("create with 0 = %d %+v", res.StatusCode, created)
+	}
+	res = doJSON(t, handler, http.MethodPost, "/api/monitors/update", `{"id":"`+created.ID+`","version":1,"alert_after":5}`, cookies, csrf)
+	if v := decodeMonitorView(t, res); res.StatusCode != http.StatusOK || v.AlertAfter != 5 {
+		t.Fatalf("edit to 5 = %d %+v", res.StatusCode, v)
+	}
+	res = doJSON(t, handler, http.MethodPost, "/api/monitors/update", `{"id":"`+created.ID+`","version":2,"alert_after":0}`, cookies, csrf)
+	edited := decodeMonitorView(t, res)
+	if res.StatusCode != http.StatusOK || edited.AlertAfter != model.MonitorAlertAfterDefault || edited.Version != 3 {
+		t.Fatalf("edit back to 0 = %d %+v; a create takes 0 as the default and an edit must too", res.StatusCode, edited)
+	}
+	for _, bad := range []string{"-1", "21"} {
+		create := doJSON(t, handler, http.MethodPost, "/api/monitors", `{"name":"y","type":"tcp","target":"203.0.113.9:443","node_ids":["node-a"],"alert_after":`+bad+`}`, cookies, csrf)
+		createBody := readBody(t, create)
+		edit := doJSON(t, handler, http.MethodPost, "/api/monitors/update", `{"id":"`+created.ID+`","version":3,"alert_after":`+bad+`}`, cookies, csrf)
+		editBody := readBody(t, edit)
+		message := func(body string) string {
+			var out struct {
+				Error struct {
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			_ = json.Unmarshal([]byte(body), &out)
+			return out.Error.Message
+		}
+		if create.StatusCode != http.StatusBadRequest || edit.StatusCode != http.StatusBadRequest || message(createBody) != message(editBody) ||
+			!strings.Contains(message(createBody), "or 0 for the default") {
+			t.Fatalf("alert_after %s: create %d %s, edit %d %s", bad, create.StatusCode, createBody, edit.StatusCode, editBody)
 		}
 	}
 }

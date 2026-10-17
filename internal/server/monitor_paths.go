@@ -115,8 +115,9 @@ func (t pathTier) resolution() time.Duration {
 // pathSeriesStep is the step rule. The tier is the finest that covers span:
 // raw rows up to an hour, five-minute rollups up to fineDays, one-hour
 // rollups beyond. The step is the smallest multiple of the tier's resolution
-// that keeps the series within pathSeriesMaxPoints (a window holds
-// ceil(span/step) steps, pathSeriesFrom) and that is no shorter than the
+// that keeps span/step under pathSeriesMaxPoints, one step to spare (a
+// window holds ceil(span/step) steps, pathSeriesFrom; the console's
+// expectedStepSeconds mirrors this rule), and that is no shorter than the
 // interval, so every whole step expects a run.
 func pathSeriesStep(span time.Duration, fineDays int, interval time.Duration) (pathTier, time.Duration) {
 	tier := pathTierCoarse
@@ -128,7 +129,7 @@ func pathSeriesStep(span time.Duration, fineDays int, interval time.Duration) (p
 	}
 	base := tier.resolution()
 	k := int64(1)
-	if per := int64(base) * pathSeriesMaxPoints; int64(span) > per {
+	if per := int64(base) * (pathSeriesMaxPoints - 1); int64(span) > per {
 		k = (int64(span) + per - 1) / per
 	}
 	if interval > base {

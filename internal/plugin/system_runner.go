@@ -1657,20 +1657,29 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 		// prefers value_base64 whenever it is present, so past a small debug
 		// threshold the raw duplicate is dropped. (2026-08-11: every plugin call
 		// 502'd once the sub-store store grew past it.)
+		// sha256 is the stored value's digest, which a conditional kv.put
+		// passes back as if_match (kv_compare.go).
 		resp := struct {
 			OK          bool   `json:"ok"`
 			Value       string `json:"value,omitempty"`
 			ValueBase64 string `json:"value_base64,omitempty"`
+			SHA256      string `json:"sha256,omitempty"`
 		}{OK: ok, ValueBase64: base64.StdEncoding.EncodeToString(value)}
 		if len(value) <= 64<<10 {
 			resp.Value = string(value)
 		}
+		if ok {
+			resp.SHA256 = KVValueDigest(value)
+		}
 		return json.Marshal(resp)
 	case "kv.put":
+		// IfMatch is a pointer so an empty if_match (a create) is told apart
+		// from no if_match at all (an unconditional write).
 		var req struct {
-			Key         string `json:"key"`
-			Value       string `json:"value,omitempty"`
-			ValueBase64 string `json:"value_base64,omitempty"`
+			Key         string  `json:"key"`
+			Value       string  `json:"value,omitempty"`
+			ValueBase64 string  `json:"value_base64,omitempty"`
+			IfMatch     *string `json:"if_match,omitempty"`
 		}
 		if err := json.Unmarshal(call.Params, &req); err != nil {
 			return nil, fmt.Errorf("kv.put params: %w", err)
@@ -1682,6 +1691,12 @@ func dispatchHostCall(ctx context.Context, broker *Broker, call systemHostCall) 
 				return nil, fmt.Errorf("kv.put value_base64: %w", err)
 			}
 			value = decoded
+		}
+		if req.IfMatch != nil {
+			if err := broker.KVPutIfMatch(ctx, req.Key, value, *req.IfMatch); err != nil {
+				return nil, err
+			}
+			return json.RawMessage(`{}`), nil
 		}
 		if err := broker.KVPut(ctx, req.Key, value); err != nil {
 			return nil, err

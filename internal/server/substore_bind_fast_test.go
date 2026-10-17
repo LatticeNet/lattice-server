@@ -1,0 +1,221 @@
+package server
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/url"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
+)
+
+// legacyParseSubstoreNodeObject is parseSubstoreNodeObject before its
+// strictjson fast path: the token walk alone.
+func legacyParseSubstoreNodeObject(raw json.RawMessage) (substoreNodeObject, error) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return substoreNodeObject{}, errors.New("node is not a JSON object")
+	}
+	obj := substoreNodeObject{values: map[string]json.RawMessage{}}
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return substoreNodeObject{}, errors.New("node key is not a string")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return substoreNodeObject{}, err
+		}
+		if _, dup := obj.values[key]; dup {
+			return substoreNodeObject{}, errors.New("node repeats a key")
+		}
+		obj.keys = append(obj.keys, key)
+		obj.values[key] = value
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		return substoreNodeObject{}, errors.New("node object is not closed")
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		return substoreNodeObject{}, errors.New("node has trailing data")
+	}
+	return obj, nil
+}
+
+func sameNodeObject(t *testing.T, raw []byte) {
+	t.Helper()
+	got, gotErr := parseSubstoreNodeObject(raw)
+	want, wantErr := legacyParseSubstoreNodeObject(raw)
+	if (gotErr == nil) != (wantErr == nil) || (gotErr != nil && gotErr.Error() != wantErr.Error()) {
+		t.Fatalf("node %q: error %v, the token walk %v", raw, gotErr, wantErr)
+	}
+	if gotErr == nil && (!reflect.DeepEqual(got.keys, want.keys) || !reflect.DeepEqual(got.values, want.values)) {
+		t.Fatalf("node %q: %v %v, the token walk %v %v", raw, got.keys, got.values, want.keys, want.values)
+	}
+}
+
+var nodeObjectCorpus = []string{
+	`{"name":"a","type":"vless","port":443,"reality-opts":{"public-key":"k","short-id":"0a"},"tags":["x"]}`,
+	` {"a" : 1 , "b":[1, 2]} `, `{"a":{"b":1,"b":2}}`, `{"a":1,"a":2}`, `{"a":1e999}`, `{"a":1,"a":2}`,
+	`{}`, `[]`, `"x"`, `{"a":1}{}`, `{"a":1} x`, `{"a":}`, `{"a":1,}`, ``, "{\"\xff\":1}", `{"a":"<b>"}`,
+}
+
+func TestParseSubstoreNodeObjectMatchesTheTokenWalk(t *testing.T) {
+	for _, raw := range nodeObjectCorpus {
+		sameNodeObject(t, []byte(raw))
+	}
+}
+
+func FuzzParseSubstoreNodeObjectMatchesTheTokenWalk(f *testing.F) {
+	for _, raw := range nodeObjectCorpus {
+		f.Add([]byte(raw))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		sameNodeObject(t, raw)
+	})
+}
+
+func sameRenderReply(t *testing.T, raw []byte) {
+	t.Helper()
+	got, gotErr := decodePluginRenderReply(raw)
+	var want pluginRenderReply
+	wantErr := json.Unmarshal(raw, &want)
+	if (gotErr == nil) != (wantErr == nil) || gotErr != nil && gotErr.Error() != wantErr.Error() {
+		t.Fatalf("reply %q: error %v, json.Unmarshal %v", raw, gotErr, wantErr)
+	}
+	if gotErr == nil && !reflect.DeepEqual(got, want) {
+		t.Fatalf("reply %q: %+v, json.Unmarshal %+v", raw, got, want)
+	}
+}
+
+var renderReplyCorpus = []string{
+	`{"content":"","content_type":"application/json","target":"sing-box","plan":{"kind":"nodes","nodes":[]},"live_revision":"r","node_count":3}`,
+	`{"content":"x","headers":{"a":"b"}}`, `{"Content":"x"}`, `{"content":"x","CONTENT":"y"}`, `{"content":1}`, `{"plan":null}`,
+	`{"content":"a","content":"b"}`, `{"ſontent":"x"}`, `{"headers":{"a":1}}`, `[]`, `null`, `{"plan":{"a":1,"a":2}}`, `{"content":"x"} y`,
+}
+
+func TestDecodePluginRenderReplyIsJSONUnmarshal(t *testing.T) {
+	for _, raw := range renderReplyCorpus {
+		sameRenderReply(t, []byte(raw))
+	}
+}
+
+func FuzzDecodePluginRenderReplyIsJSONUnmarshal(f *testing.F) {
+	for _, raw := range renderReplyCorpus {
+		f.Add([]byte(raw))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		sameRenderReply(t, raw)
+	})
+}
+
+// legacyLineCatalogueSecretForms is lineCatalogueSecretForms before it
+// skipped the JSON-escaped copy of a form that escaping leaves unchanged.
+func legacyLineCatalogueSecretForms(secret string) []string {
+	raws := [][]byte{[]byte(secret)}
+	forms := []string{secret, url.QueryEscape(secret), url.PathEscape(secret)}
+	if dashless := strings.ReplaceAll(secret, "-", ""); dashless != secret {
+		if id, err := hex.DecodeString(dashless); err == nil && len(id) == 16 {
+			forms = append(forms, dashless)
+			raws = append(raws, id)
+		}
+	}
+	for _, raw := range raws {
+		forms = append(forms, base64.RawStdEncoding.EncodeToString(raw), base64.RawURLEncoding.EncodeToString(raw))
+	}
+	for _, form := range slices.Clone(forms) {
+		if escaped, err := json.Marshal(form); err == nil {
+			forms = append(forms, string(escaped[1:len(escaped)-1]))
+		}
+	}
+	return forms
+}
+
+// The owner and identity checks look for the same needles as before.
+func TestLineCatalogueSecretsFindTheSameNeedles(t *testing.T) {
+	for _, secret := range []string{"8f0c2a9e-41d7-4b3c-8a5e-1f2d3c4b5a69", "s3cr3t/Pa55+w0rd=Id&x", `quote"back\slash`, "tab\there", "<html>&", "é-ü", " line", "\xff\xfe\xfd\xfc", "a\ufffdbc", "plain"} {
+		got := newLineCatalogueSecrets([]string{secret}).needles
+		var legacy lineCatalogueSecrets
+		seen := map[string]bool{}
+		for _, form := range legacyLineCatalogueSecretForms(secret) {
+			if needle := strings.ToLower(form); !seen[needle] {
+				seen[needle] = true
+				legacy.needles = append(legacy.needles, []byte(needle))
+			}
+		}
+		if !reflect.DeepEqual(got, legacy.needles) {
+			t.Fatalf("secret %q: needles %q, before %q", secret, got, legacy.needles)
+		}
+	}
+}
+
+func sameKnownMembers(t *testing.T, raw []byte) {
+	t.Helper()
+	var got, want model.ConvertReply
+	targets := map[string]any{"content": &got.Content, "content_type": &got.ContentType, "target": &got.Target,
+		"node_count": &got.NodeCount, "headers": &got.Headers, "log": &got.Log}
+	if !decodeKnownMembers(raw, targets) {
+		return
+	}
+	if err := json.Unmarshal(raw, &want); err != nil {
+		t.Fatalf("reply %q: decodeKnownMembers admits what json.Unmarshal refuses: %v", raw, err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("reply %q: %+v, json.Unmarshal %+v", raw, got, want)
+	}
+}
+
+var knownMembersCorpus = []string{
+	`{"content":"{\n  \"outbounds\": []\n}","content_type":"application/json","target":"sing-box","node_count":2,"headers":{"a":"b"},"log":[{"level":"info","message":"m"}]}`,
+	`{"content":"x","extra":{"a":[1]}}`, `{"Content":"x"}`, `{"content":"x","CONTENT":"y"}`, `{"node_count":"2"}`, `{"content":null}`,
+	`{"log":[{"level":"info","x":1}]}`, `{"content":"\ud800"}`, "{\"content\":\"\xff\"}", `{"content":"a","content":"b"}`, `[]`,
+}
+
+func TestDecodeKnownMembersIsJSONUnmarshal(t *testing.T) {
+	for _, raw := range knownMembersCorpus {
+		sameKnownMembers(t, []byte(raw))
+	}
+}
+
+func FuzzDecodeKnownMembersIsJSONUnmarshal(f *testing.F) {
+	for _, raw := range knownMembersCorpus {
+		f.Add([]byte(raw))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		sameKnownMembers(t, raw)
+	})
+}
+
+// The selection memo answers what substoreBindSnapshotSelection reads, for
+// every snapshot, and keeps at most its size.
+func TestSubstoreBindSelectionMemoAnswersTheSnapshotsSelection(t *testing.T) {
+	var memo substoreBindSelectionMemo
+	snapshot := func(i int) model.SubscriptionSnapshot {
+		return model.SubscriptionSnapshot{Raw: fmt.Sprintf(`{"catalogue_version":"lcv1-%064d","rows":[{"line_uuid":"%08d-0000-4000-8000-000000000000"}]}`, i, i)}
+	}
+	for round := 0; round < 2; round++ {
+		for i := 0; i < substoreBindSelectionMemoSize+10; i++ {
+			snap := snapshot(i)
+			wantVersion, wantSelected := substoreBindSnapshotSelection(snap)
+			gotVersion, gotSelected := memo.read(subscriptionContentHash(snap.Raw), snap)
+			if gotVersion != wantVersion || !reflect.DeepEqual(gotSelected, wantSelected) || len(gotSelected) != 1 {
+				t.Fatalf("snapshot %d: %q %v, want %q %v", i, gotVersion, gotSelected, wantVersion, wantSelected)
+			}
+		}
+	}
+	if len(memo.entries) != substoreBindSelectionMemoSize || len(memo.order) != substoreBindSelectionMemoSize {
+		t.Fatalf("the memo holds %d entries (%d in order), bound %d", len(memo.entries), len(memo.order), substoreBindSelectionMemoSize)
+	}
+	other := model.SubscriptionSnapshot{Raw: `not a document`}
+	if version, selected := memo.read(subscriptionContentHash(other.Raw), other); version != "" || selected != nil {
+		t.Fatalf("a snapshot that is not a catalogue document reads %q %v", version, selected)
+	}
+}

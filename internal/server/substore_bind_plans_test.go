@@ -50,8 +50,14 @@ func TestApplyRevisionRefusedOutsideAnApprovedApply(t *testing.T) {
 	if n := env.fake.count(subStoreApplyRevisionMethod); n != 0 {
 		t.Fatalf("the plugin's apply_revision ran %d times", n)
 	}
+	// A schedule naming either core-only method is refused, each with the
+	// reason for its own core path.
 	err = env.srv.pluginTaskScheduleMethodAllowed(subStorePluginID, subStorePluginID+"/subscription", subStoreApplyRevisionMethod)
-	if err == nil || !strings.Contains(err.Error(), "approved plan apply") {
-		t.Fatalf("a schedule naming apply_revision was admitted: %v", err)
+	if err == nil || !strings.Contains(err.Error(), subStoreCoreOnlyReason) {
+		t.Fatalf("a schedule naming apply_revision was admitted, or refused for the wrong reason: %v", err)
+	}
+	err = env.srv.pluginTaskScheduleMethodAllowed(subStorePluginID, subStorePluginID+"/subscription", subStoreFetchMethod)
+	if err == nil || !strings.Contains(err.Error(), subStoreFetchCoreOnlyReason) {
+		t.Fatalf("a schedule naming fetch was admitted, or refused for the wrong reason: %v", err)
 	}
 }

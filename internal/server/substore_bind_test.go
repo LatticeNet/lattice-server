@@ -176,7 +176,7 @@ func (e *bindEnv) bindRunWith(t testing.TB, plan model.SelectionPlan, selected m
 	if !ok {
 		t.Fatal("bind identity missing")
 	}
-	return substoreBindPlan(decoded, u, catalogue, selected)
+	return substoreBindPlan(decoded, u, catalogue, substoreBindInputs{selected: selected})
 }
 
 // reasons maps each excluded plan index to its reason.
@@ -288,12 +288,12 @@ func TestSubstoreBindServerAllowedSet(t *testing.T) {
 		"[2001:db9::7]": true, "2001:db9:0::7": true,
 		"stale.ddns.example": false, "203.0.114.8": false, "": false, "attacker.example": false,
 	} {
-		if got := substoreBindServerAllowed(server, tmpl, row); got != want {
+		if got := substoreBindServerAllowed(server, tmpl, row, nil); got != want {
 			t.Fatalf("server %q allowed = %v, want %v", server, got, want)
 		}
 	}
 	named := store.LineClientTemplate{Host: "line.example", Port: 443}
-	if !substoreBindServerAllowed("line.example", named, model.LineCatalogueRow{}) || substoreBindServerAllowed("203.0.114.7", named, model.LineCatalogueRow{}) {
+	if !substoreBindServerAllowed("line.example", named, model.LineCatalogueRow{}, nil) || substoreBindServerAllowed("203.0.114.7", named, model.LineCatalogueRow{}, nil) {
 		t.Fatal("a template host name is allowed by name only")
 	}
 }
@@ -875,7 +875,7 @@ func TestSubstoreBindRefusesAPlanWithoutASelection(t *testing.T) {
 		bindNodesPlan(t, e.rows),
 		{Kind: model.SelectionPlanKindDocument, Nodes: bindNodesPlan(t, e.rows).Nodes, Document: "proxies: []\n"},
 	} {
-		result := substoreBindPlan(plan, e.identity, catalogue, nil)
+		result := substoreBindPlan(plan, e.identity, catalogue, substoreBindInputs{})
 		if result.Refused != substoreBindRefusedSelection || len(result.nodes) != 0 || result.document != nil || len(result.Entries) != 0 {
 			t.Fatalf("a %s plan without a selection: refused %q, %d nodes, entries %+v", plan.Kind, result.Refused, len(result.nodes), result.Entries)
 		}
@@ -894,7 +894,7 @@ func TestSubstoreBindRefusesAPlanWithoutASelection(t *testing.T) {
 	// A plan of provider nodes alone binds no credential and needs none.
 	provider := model.SelectionPlan{Kind: model.SelectionPlanKindNodes, Nodes: []model.SelectionPlanNode{
 		{Provider: true, Node: json.RawMessage(`{"name":"p","type":"trojan","server":"p.example","port":443,"password":"provider-own"}`)}}}
-	if result := substoreBindPlan(provider, e.identity, catalogue, nil); result.Refused != "" || len(result.nodes) != 1 {
+	if result := substoreBindPlan(provider, e.identity, catalogue, substoreBindInputs{}); result.Refused != "" || len(result.nodes) != 1 {
 		t.Fatalf("a provider plan: refused %q", result.Refused)
 	}
 }
@@ -943,7 +943,7 @@ func BenchmarkSubstoreBindThousandLines(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if result := substoreBindPlan(plan, u, catalogue, selected); len(result.nodes) != len(e.rows) {
+		if result := substoreBindPlan(plan, u, catalogue, substoreBindInputs{selected: selected}); len(result.nodes) != len(e.rows) {
 			b.Fatalf("%d of %d nodes bound", len(result.nodes), len(e.rows))
 		}
 	}

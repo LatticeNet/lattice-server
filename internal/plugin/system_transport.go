@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -56,11 +55,6 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 	if t == nil || t.stdin == nil || t.scanner == nil {
 		return outcome, fmt.Errorf("worker transport unavailable")
 	}
-	frame := stdioJSONV2Frame{Protocol: 2, Kind: "invoke", Generation: generation, InvocationID: invocation}
-	frame.Request, _ = json.Marshal(struct {
-		Action  string          `json:"action"`
-		Payload json.RawMessage `json:"payload,omitempty"`
-	}{req.Action, req.Payload})
 	stdoutLimit, hostCallLimit := HostMaxInvokeStdoutBytes, HostMaxInvokeHostCalls
 	stderrLimit := HostMaxInvokeStderrBytes
 	if len(budgets) > 0 {
@@ -78,7 +72,11 @@ func (t *systemWorkerTransport) invokeV2(ctx context.Context, generation uint64,
 	}()
 	write := make(chan error, 1)
 	outcome.DispatchStarted = true
-	go func() { write <- json.NewEncoder(t.stdin).Encode(frame) }()
+	frame := encodeInvokeV2Frame(generation, invocation, req)
+	go func() {
+		_, err := t.stdin.Write(frame)
+		write <- err
+	}()
 	select {
 	case err := <-write:
 		if err != nil {

@@ -49,6 +49,10 @@ import (
 //
 // Request {} ; reply {"records":[{"id":"<subscription id>","revision":"..."}],"version":"..."}.
 // revision and version are the plugin's own and optional; core reads ids.
+//
+// depends_on v2 (S2, plugin 0.18) answers the same store-wide list for {}, so
+// this reader keeps working on both versions, and answers the plans service's
+// closure requests as well (fleetDependsGraph below).
 
 const (
 	fleetDependsMethod  = "depends_on"
@@ -65,6 +69,9 @@ type fleetDependsState struct {
 	// method; tests set it, and a set call counts as declared by every
 	// plugin.
 	call func(ctx context.Context, pluginID string) ([]byte, error)
+	// query asks a plugin's depends_on with a v2 request (the plans
+	// service's closure reads). Nil calls the plugin's method; tests set it.
+	query func(ctx context.Context, pluginID string, payload []byte) ([]byte, error)
 
 	mu sync.Mutex
 	// plugins is what each plugin's answers established.
@@ -344,4 +351,229 @@ func (s *Server) refineFleetDependentShares(ctx context.Context, pluginID string
 		}
 		publication.mu.Unlock()
 	}
+}
+
+// depends_on v2 as the plans service reads it (S2 plan sections 1.2 and 2.6).
+//
+// Request {subscription_id?, include_staged?}. Reply {records: [{id,
+// revision, kind, source, staged_revision, staged_source, staged_migrated,
+// fleet_bound, owner_credentials}], fleet_bound: [ids], owner_credentials:
+// [ids], edges: [{from, to, via}], version}. With subscription_id, records
+// holds that record and every record that reads it, transitively; with
+// include_staged the closures and edges run over the union of live and staged
+// index state, so an edge only a staged revision creates is visible. A
+// record's fleet_bound and owner_credentials are its live flags; the lists
+// are the closures over the state asked for. An edge says from reads to, by
+// member, member_tag or node_source.
+//
+// A v1 reply (records with ids only) decodes too, with v2 false, so a caller
+// can tell an older plugin from a v2 answer that names no edge.
+
+// Edge kinds of a depends_on v2 reply.
+const (
+	fleetDependsViaMember     = "member"
+	fleetDependsViaMemberTag  = "member_tag"
+	fleetDependsViaNodeSource = "node_source"
+	// maxFleetDependsEdges bounds the edges of one answer.
+	maxFleetDependsEdges = 1 << 18
+)
+
+// fleetDependsRequest is a depends_on v2 request.
+type fleetDependsRequest struct {
+	SubscriptionID string `json:"subscription_id,omitempty"`
+	IncludeStaged  bool   `json:"include_staged,omitempty"`
+}
+
+// fleetDependsFacts is one record row of a v2 reply.
+type fleetDependsFacts struct {
+	ID               string `json:"id"`
+	Revision         string `json:"revision"`
+	Kind             string `json:"kind,omitempty"`
+	Source           string `json:"source,omitempty"`
+	StagedRevision   string `json:"staged_revision,omitempty"`
+	StagedSource     string `json:"staged_source,omitempty"`
+	StagedMigrated   bool   `json:"staged_migrated,omitempty"`
+	FleetBound       bool   `json:"fleet_bound,omitempty"`
+	OwnerCredentials bool   `json:"owner_credentials,omitempty"`
+}
+
+// fleetDependsEdge says the record From reads the record To.
+type fleetDependsEdge struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Via  string `json:"via"`
+}
+
+// fleetDependsGraph is a decoded depends_on answer. Nothing in it is
+// written after decoding, except by merge, which builds a new value.
+type fleetDependsGraph struct {
+	// v2 is false for a v1 answer, which carries ids alone.
+	v2               bool
+	records          map[string]fleetDependsFacts
+	fleetBound       map[string]bool
+	ownerCredentials map[string]bool
+	edges            []fleetDependsEdge
+	version          string
+}
+
+// validFleetDependsID is the id rule of every reply.
+func validFleetDependsID(id string) bool {
+	return id != "" && len(id) <= maxFleetDependsIDBytes && !strings.ContainsFunc(id, unicode.IsControl)
+}
+
+// decodeFleetDependsGraph reads a depends_on answer of either version. A
+// missing records list, an invalid id, an edge of an unknown kind or naming
+// an invalid id, a list naming an id twice, or an answer over the bounds is
+// refused.
+func decodeFleetDependsGraph(raw []byte) (fleetDependsGraph, error) {
+	var reply struct {
+		Records          *[]fleetDependsFacts `json:"records"`
+		FleetBound       *[]string            `json:"fleet_bound"`
+		OwnerCredentials *[]string            `json:"owner_credentials"`
+		Edges            *[]fleetDependsEdge  `json:"edges"`
+		Version          string               `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return fleetDependsGraph{}, fmt.Errorf("depends_on reply: %w", err)
+	}
+	if reply.Records == nil {
+		return fleetDependsGraph{}, errors.New("depends_on reply has no records list")
+	}
+	if len(*reply.Records) > maxFleetDependsRecords {
+		return fleetDependsGraph{}, fmt.Errorf("depends_on reply names more than %d records", maxFleetDependsRecords)
+	}
+	g := fleetDependsGraph{
+		v2:      reply.FleetBound != nil && reply.OwnerCredentials != nil && reply.Edges != nil,
+		records: make(map[string]fleetDependsFacts, len(*reply.Records)), fleetBound: map[string]bool{}, ownerCredentials: map[string]bool{},
+		version: reply.Version,
+	}
+	for _, record := range *reply.Records {
+		if !validFleetDependsID(record.ID) {
+			return fleetDependsGraph{}, errors.New("depends_on reply names an invalid record id")
+		}
+		if _, dup := g.records[record.ID]; dup {
+			return fleetDependsGraph{}, errors.New("depends_on reply names a record twice")
+		}
+		g.records[record.ID] = record
+	}
+	if !g.v2 {
+		return g, nil
+	}
+	for list, into := range map[*[]string]map[string]bool{reply.FleetBound: g.fleetBound, reply.OwnerCredentials: g.ownerCredentials} {
+		if len(*list) > maxFleetDependsRecords {
+			return fleetDependsGraph{}, fmt.Errorf("depends_on reply lists more than %d records", maxFleetDependsRecords)
+		}
+		for _, id := range *list {
+			if !validFleetDependsID(id) {
+				return fleetDependsGraph{}, errors.New("depends_on reply lists an invalid record id")
+			}
+			into[id] = true
+		}
+	}
+	if len(*reply.Edges) > maxFleetDependsEdges {
+		return fleetDependsGraph{}, fmt.Errorf("depends_on reply names more than %d edges", maxFleetDependsEdges)
+	}
+	for _, edge := range *reply.Edges {
+		switch edge.Via {
+		case fleetDependsViaMember, fleetDependsViaMemberTag, fleetDependsViaNodeSource:
+		default:
+			return fleetDependsGraph{}, fmt.Errorf("depends_on reply names an edge by %q", edge.Via)
+		}
+		if !validFleetDependsID(edge.From) || !validFleetDependsID(edge.To) || edge.From == edge.To {
+			return fleetDependsGraph{}, errors.New("depends_on reply names an invalid edge")
+		}
+		g.edges = append(g.edges, edge)
+	}
+	return g, nil
+}
+
+// readers is the closure of ids: each id and every record that reads one of
+// them, transitively, over the answer's edges. A record reads its members and
+// its node source, so the closure runs upward to readers and never across to
+// siblings.
+func (g fleetDependsGraph) readers(ids ...string) map[string]bool {
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, edge := range g.edges {
+			if out[edge.To] && !out[edge.From] {
+				out[edge.From] = true
+				changed = true
+			}
+		}
+	}
+	return out
+}
+
+// gathers is every edge out of a record: what a collection gathers, what a
+// file reads.
+func (g fleetDependsGraph) gathers(id string) []fleetDependsEdge {
+	var out []fleetDependsEdge
+	for _, edge := range g.edges {
+		if edge.From == id {
+			out = append(out, edge)
+		}
+	}
+	return out
+}
+
+// merge is the union of two answers: every record (the later answer's facts
+// for an id both name), both lists and every edge once.
+func (g fleetDependsGraph) merge(other fleetDependsGraph) fleetDependsGraph {
+	out := fleetDependsGraph{v2: g.v2 && other.v2, records: map[string]fleetDependsFacts{}, fleetBound: map[string]bool{}, ownerCredentials: map[string]bool{}}
+	seen := map[fleetDependsEdge]bool{}
+	for _, part := range []fleetDependsGraph{g, other} {
+		for id, facts := range part.records {
+			out.records[id] = facts
+		}
+		for id := range part.fleetBound {
+			out.fleetBound[id] = true
+		}
+		for id := range part.ownerCredentials {
+			out.ownerCredentials[id] = true
+		}
+		for _, edge := range part.edges {
+			if !seen[edge] {
+				seen[edge] = true
+				out.edges = append(out.edges, edge)
+			}
+		}
+	}
+	return out
+}
+
+// errFleetDependsV1 is a depends_on answer without the v2 closure: the
+// installed plugin predates S2.
+var errFleetDependsV1 = errors.New("the installed sub-store plugin answers depends_on without the closure the plans service needs (v1); install plugin 0.18 or later")
+
+// fleetDependsQuery asks the plugin's depends_on with a v2 request, bounded
+// by fleetDependsTimeout, takes no plugin gate (the method only reads the
+// index) and decodes the answer, refusing a v1 one.
+func (s *Server) fleetDependsQuery(ctx context.Context, pluginID string, req fleetDependsRequest) (fleetDependsGraph, error) {
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return fleetDependsGraph{}, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, fleetDependsTimeout)
+	defer cancel()
+	var raw []byte
+	if query := s.substoreCatalogue.deps.query; query != nil {
+		raw, err = query(ctx, pluginID, payload)
+	} else {
+		raw, err = s.callRuntimePluginService(ctx, pluginID, pluginID+"/subscription", fleetDependsMethod, payload, nil, nil)
+	}
+	if err != nil {
+		return fleetDependsGraph{}, err
+	}
+	graph, err := decodeFleetDependsGraph(raw)
+	if err != nil {
+		return fleetDependsGraph{}, err
+	}
+	if !graph.v2 {
+		return fleetDependsGraph{}, errFleetDependsV1
+	}
+	return graph, nil
 }

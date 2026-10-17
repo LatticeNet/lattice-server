@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/groups"
@@ -196,78 +197,14 @@ func (c *lineCatalogue) selectIndexes(sel *model.LineCatalogueSelector) []int {
 	return out
 }
 
-// lineCatalogueMatches evaluates every selector field but the line list.
-// These rules are the pushdown contract; a plugin that runs a predicate
-// itself must apply the same ones, byte for byte:
-//
-//   - countries, regions, protocols, transports and service_states compare
-//     with Unicode case folding (strings.EqualFold); an empty row value
-//     never matches.
-//   - node_tags, group_ids and chain_roles compare exactly.
-//   - country and region read the row's effective geo: the chain's exit geo
-//     when it has one, else the node's. A field the exit geo lacks does not
-//     fall back to the node's geo.
-//   - renewal_within_days matches a known renewal at or before now plus the
-//     window, so a renewal already past matches.
-//   - probe_passed_within_hours matches a pass at or after now minus the
-//     window.
+// lineCatalogueMatches evaluates every selector field but the line list. It
+// is the SDK's LineCatalogueSelectorMatches, the pushdown contract as one
+// function, so core, the plugin's evaluator and the differential test run the
+// same code. The one rule it adds to the server's former body: a relay whose
+// chain is Unresolved has an unknown geo, so countries and regions never
+// match it (S2 plan section 2.5).
 func lineCatalogueMatches(row *model.LineCatalogueRow, sel *model.LineCatalogueSelector, now time.Time) bool {
-	geo := row.Geo
-	if row.Chain.ExitGeo != nil {
-		geo = row.Chain.ExitGeo
-	}
-	switch {
-	case len(sel.Countries) > 0 && (geo == nil || !lineCatalogueHasFold(sel.Countries, geo.Country)):
-		return false
-	case len(sel.Regions) > 0 && (geo == nil || !lineCatalogueHasFold(sel.Regions, geo.Region)):
-		return false
-	case len(sel.Protocols) > 0 && !lineCatalogueHasFold(sel.Protocols, row.Protocol):
-		return false
-	case len(sel.Transports) > 0 && !lineCatalogueHasFold(sel.Transports, row.Transport):
-		return false
-	case len(sel.ServiceStates) > 0 && !lineCatalogueHasFold(sel.ServiceStates, row.ServiceState):
-		return false
-	case len(sel.ChainRoles) > 0 && !slices.Contains(sel.ChainRoles, row.Chain.Role):
-		return false
-	case len(sel.NodeTags) > 0 && !lineCatalogueAny(sel.NodeTags, row.NodeTags):
-		return false
-	case len(sel.GroupIDs) > 0 && !lineCatalogueAny(sel.GroupIDs, row.GroupIDs):
-		return false
-	}
-	if sel.RenewalWithinDays != nil {
-		if row.Machine == nil || row.Machine.NextRenewal.IsZero() ||
-			row.Machine.NextRenewal.After(now.Add(time.Duration(*sel.RenewalWithinDays)*24*time.Hour)) {
-			return false
-		}
-	}
-	if sel.ProbePassedWithinHours != nil {
-		if row.Probe == nil || row.Probe.Verdict != model.LineProbeVerdictPass ||
-			row.Probe.At.Before(now.Add(-time.Duration(*sel.ProbePassedWithinHours)*time.Hour)) {
-			return false
-		}
-	}
-	return true
-}
-
-func lineCatalogueHasFold(values []string, value string) bool {
-	if value == "" {
-		return false
-	}
-	for _, v := range values {
-		if strings.EqualFold(v, value) {
-			return true
-		}
-	}
-	return false
-}
-
-func lineCatalogueAny(wanted, have []string) bool {
-	for _, w := range wanted {
-		if slices.Contains(have, w) {
-			return true
-		}
-	}
-	return false
+	return model.LineCatalogueSelectorMatches(row, sel, now)
 }
 
 // buildLineCatalogue builds the catalogue now. identityID, when set, names
@@ -293,7 +230,7 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 	resolvedGroups := groups.ResolveAll(s.store.Groups(), nodeList)
 	machines := lineCatalogueMachines(s.store.MachineProfiles())
 	names := s.substoreCatalogue.names.snapshot()
-	ddns := lineCatalogueDDNS(s.store.DDNSProfiles(), nodes, names)
+	ddns := lineCatalogueDDNS(s.store.DDNSProfiles(), nodes, lineCatalogueNodeEdges(lineGroups), names)
 	templates := map[string]store.LineClientTemplate{}
 	for _, t := range s.store.LineClientTemplates() {
 		templates[t.LineHashID] = t
@@ -340,11 +277,33 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 		identitySecrets = newLineCatalogueSecrets(lineCatalogueIdentitySecrets(*identity))
 	}
 
-	c := &lineCatalogue{identityID: identityID, at: now, index: make(map[string]int, len(lines)),
-		rows: make([]model.LineCatalogueRow, 0, len(lines)), encoded: make([][]byte, 0, len(lines)),
-		lines: make([]Line, 0, len(lines)), templates: make([]*store.LineClientTemplate, 0, len(lines))}
-	var withheld []string
-	for _, ln := range lines {
+	// newLineCatalogueSecrets is a pure function of the secrets it is given,
+	// and lines of one node often share their owner's credential, so one
+	// build computes each set once.
+	var ownerSets sync.Map
+	ownerSecrets := func(secrets []string) lineCatalogueSecrets {
+		key := lineCatalogueSecretsKey(secrets)
+		if set, ok := ownerSets.Load(key); ok {
+			return set.(lineCatalogueSecrets)
+		}
+		set := newLineCatalogueSecrets(secrets)
+		ownerSets.Store(key, set)
+		return set
+	}
+	// Each line's row depends on nothing but the line and the inputs read
+	// above, so rows are built in parallel and gathered in catalogue order;
+	// the catalogue and its withheld list are what building them one by one
+	// gives.
+	type builtRow struct {
+		row          model.LineCatalogueRow
+		raw          []byte
+		keptTemplate bool
+		bind         *store.LineClientTemplate
+		err          error
+	}
+	built := make([]builtRow, len(lines))
+	substoreBindEach(len(lines), func(i int) {
+		ln := lines[i]
 		node := nodes[ln.NodeID]
 		row := model.LineCatalogueRow{
 			LineUUID: ln.LineUUID, LineHashID: ln.LineHashID, NodeID: ln.NodeID,
@@ -357,6 +316,10 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 			Managed: ln.Managed, Overlay: ln.Overlay, OverlayStatus: strings.TrimSpace(ln.OverlayStatus),
 			Status: strings.TrimSpace(ln.Status), ServiceState: strings.TrimSpace(ln.ServiceState),
 			Chain: chains.chain(ln.LineUUID),
+			// Label is the entry label bind shows for the line, from the
+			// same call (substore_bind.go), so the plugin names a fleet node
+			// by it and never re-derives it.
+			Label: identityLinkEntryLabel(firstNonEmpty(nodeNames[ln.NodeID], ln.NodeID), identityLinkLineName(ln)),
 		}
 		if row.PublicPort < 0 || row.PublicPort > 65535 {
 			row.PublicPort = 0
@@ -376,7 +339,7 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 			// no longer reports one leaves the sync-time refusal standing.
 			if err == nil && !chains.root(ln.LineUUID) {
 				if shareURL := shareURLs[[2]string{ln.NodeID, ln.Tag}]; shareURL != "" {
-					owner := newLineCatalogueSecrets(lineClientShareURLSecrets(shareURL, bind.Protocol))
+					owner := ownerSecrets(lineClientShareURLSecrets(shareURL, bind.Protocol))
 					if raw, _ := json.Marshal(template); owner.in(raw) {
 						err = errors.New("the owner's credential survives in the template")
 					}
@@ -388,6 +351,9 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 				row.Template = template
 			}
 		}
+		if row.Security == "" && bind != nil {
+			row.Security = lineCatalogueTemplateSecurity(*bind)
+		}
 		hosts := []string{row.PublicHost, row.ProviderEdge}
 		if bind != nil {
 			hosts = append(hosts, bind.Host)
@@ -397,16 +363,25 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 			row.Usage = &model.LineCatalogueUsage{IdentityID: identity.ID, UsedBytes: usage[ln.LineHashID], From: usageFrom, To: usageTo}
 		}
 		raw, keptTemplate, err := finishLineCatalogueRow(&row, identitySecrets)
-		if err != nil {
-			withheld = append(withheld, ln.LineUUID+": "+err.Error())
+		built[i] = builtRow{row: row, raw: raw, keptTemplate: keptTemplate, bind: bind, err: err}
+	})
+	c := &lineCatalogue{identityID: identityID, at: now, index: make(map[string]int, len(lines)),
+		rows: make([]model.LineCatalogueRow, 0, len(lines)), encoded: make([][]byte, 0, len(lines)),
+		lines: make([]Line, 0, len(lines)), templates: make([]*store.LineClientTemplate, 0, len(lines))}
+	var withheld []string
+	for i, ln := range lines {
+		b := built[i]
+		if b.err != nil {
+			withheld = append(withheld, ln.LineUUID+": "+b.err.Error())
 			continue
 		}
-		if !keptTemplate {
+		bind := b.bind
+		if !b.keptTemplate {
 			bind = nil
 		}
 		c.index[ln.LineUUID] = len(c.rows)
-		c.rows = append(c.rows, row)
-		c.encoded = append(c.encoded, raw)
+		c.rows = append(c.rows, b.row)
+		c.encoded = append(c.encoded, b.raw)
 		c.lines = append(c.lines, ln)
 		c.templates = append(c.templates, bind)
 	}
@@ -422,10 +397,20 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 // without a template too is withheld.
 func finishLineCatalogueRow(row *model.LineCatalogueRow, identity lineCatalogueSecrets) (raw []byte, keptTemplate bool, err error) {
 	for {
-		err = row.Validate()
+		// Validate's size bound encodes the row; ValidateTrustingEncoding
+		// reads it from the encoding the row is served as, which is raw
+		// right here, so each row is encoded once. A row that does not
+		// encode is judged by Validate, which words the error as before.
+		raw, err = json.Marshal(row)
+		if err != nil {
+			if verr := row.Validate(); verr != nil {
+				err = verr
+			}
+		} else {
+			err = row.ValidateTrustingEncoding(raw)
+		}
 		if err == nil {
-			raw, err = json.Marshal(row)
-			if err == nil && identity.in(raw) {
+			if identity.in(raw) {
 				err = errors.New("the named identity's credential survives in the row")
 			}
 			if err == nil {
@@ -508,6 +493,21 @@ func lineCatalogueIdentitySecrets(u VpnUser) []string {
 // does not let a client connect.
 type lineCatalogueSecrets struct{ needles [][]byte }
 
+// lineCatalogueSecretsKey is the memo key of a secret list: each secret
+// prefixed by its length, so two different lists never share a key. A join
+// on a separator byte did not hold that: ["ab\x00cd"] and ["ab", "cd"]
+// joined the same, and the second line would have been checked against the
+// first line's needles.
+func lineCatalogueSecretsKey(secrets []string) string {
+	var b strings.Builder
+	for _, secret := range secrets {
+		b.WriteString(strconv.Itoa(len(secret)))
+		b.WriteByte(':')
+		b.WriteString(secret)
+	}
+	return b.String()
+}
+
 func newLineCatalogueSecrets(secrets []string) lineCatalogueSecrets {
 	var m lineCatalogueSecrets
 	seen := map[string]bool{}
@@ -541,11 +541,23 @@ func lineCatalogueSecretForms(secret string) []string {
 		forms = append(forms, base64.RawStdEncoding.EncodeToString(raw), base64.RawURLEncoding.EncodeToString(raw))
 	}
 	for _, form := range slices.Clone(forms) {
+		// A form with nothing JSON escapes is its own escaped form, which
+		// would only repeat it.
+		if !strings.ContainsFunc(form, jsonEscapes) {
+			continue
+		}
 		if escaped, err := json.Marshal(form); err == nil {
 			forms = append(forms, string(escaped[1:len(escaped)-1]))
 		}
 	}
 	return forms
+}
+
+// jsonEscapes reports whether json.Marshal writes r other than as itself:
+// the quote, the backslash, a control character, the three HTML characters,
+// U+2028, U+2029 and the replacement character an invalid byte becomes.
+func jsonEscapes(r rune) bool {
+	return r < 0x20 || r == '"' || r == '\\' || r == '<' || r == '>' || r == '&' || r == '\u2028' || r == '\u2029' || r == utf8.RuneError
 }
 
 func (m lineCatalogueSecrets) in(raw []byte) bool {
@@ -641,24 +653,56 @@ func lineCatalogueRenewsFirst(a, b model.MachineProfile) bool {
 	return a.ID < b.ID
 }
 
-// lineCatalogueDDNS lists each node's DDNS names, sorted, each verified when
-// the last sync resolved it to the node's current public address.
-func lineCatalogueDDNS(profiles []model.DDNSProfile, nodes map[string]model.Node, names map[string][]string) map[string][]model.LineCatalogueDDNSName {
-	byNode := map[string]map[string]bool{}
+// lineCatalogueDDNS lists each node's DDNS names, sorted, each verified by a
+// DNS answer the last sync read, never by stored configuration:
+//
+//   - a name an address profile publishes is verified when it resolved to the
+//     node's current public address;
+//   - a name a cname profile publishes is verified when its resolved addresses
+//     intersect the resolved addresses of a provider edge of the node's lines,
+//     and its Target is that edge. The edge the profile names as its target is
+//     tried first, then the node's other edges in order. Comparing the
+//     profile's last published target with the edge instead would show a
+//     hijacked CNAME as verified (S2 plan section 2.6), and a cname name is
+//     never verified by the node's own public address, which for a node behind
+//     NAT is the provider's shared egress.
+//
+// A name both kinds of profile publish is verified by either rule; only the
+// cname rule sets Target.
+func lineCatalogueDDNS(profiles []model.DDNSProfile, nodes map[string]model.Node, edges map[string][]string, names map[string][]string) map[string][]model.LineCatalogueDDNSName {
+	type published struct {
+		address bool
+		targets []string // the cname targets of the profiles that publish it
+		cname   bool
+	}
+	byNode := map[string]map[string]*published{}
 	for _, profile := range profiles {
 		nodeID := strings.TrimSpace(profile.NodeID)
 		if nodeID == "" {
 			continue
 		}
+		cname := strings.EqualFold(strings.TrimSpace(profile.RecordType), "cname")
 		for _, domain := range profile.Domains {
 			name := lineCatalogueNameKey(domain)
 			if !lineCatalogueDDNSNameValid(name) {
 				continue
 			}
 			if byNode[nodeID] == nil {
-				byNode[nodeID] = map[string]bool{}
+				byNode[nodeID] = map[string]*published{}
 			}
-			byNode[nodeID][name] = true
+			entry := byNode[nodeID][name]
+			if entry == nil {
+				entry = &published{}
+				byNode[nodeID][name] = entry
+			}
+			if cname {
+				entry.cname = true
+				if target := lineCatalogueNameKey(profile.CNAMETarget); target != "" {
+					entry.targets = append(entry.targets, target)
+				}
+			} else {
+				entry.address = true
+			}
 		}
 	}
 	out := make(map[string][]model.LineCatalogueDDNSName, len(byNode))
@@ -671,12 +715,15 @@ func lineCatalogueDDNS(profiles []model.DDNSProfile, nodes map[string]model.Node
 			}
 		}
 		list := make([]model.LineCatalogueDDNSName, 0, len(set))
-		for name := range set {
+		for name, how := range set {
 			entry := model.LineCatalogueDDNSName{Name: name}
-			for _, addr := range names[name] {
-				if public[addr] {
-					entry.Verified = true
-					break
+			resolved := names[name]
+			if how.address {
+				entry.Verified = slices.ContainsFunc(resolved, func(addr string) bool { return public[addr] })
+			}
+			if how.cname {
+				if edge := lineCatalogueCNAMEEdge(resolved, how.targets, edges[nodeID], names); edge != "" {
+					entry.Verified, entry.Target = true, edge
 				}
 			}
 			list = append(list, entry)
@@ -687,11 +734,91 @@ func lineCatalogueDDNS(profiles []model.DDNSProfile, nodes map[string]model.Node
 	return out
 }
 
+// lineCatalogueCNAMEEdge returns the provider edge a cname name resolved to:
+// the first edge, the profile's own targets first, whose resolved addresses
+// share one with the name's. "" when none does or the name did not resolve.
+func lineCatalogueCNAMEEdge(resolved, targets, edges []string, names map[string][]string) string {
+	if len(resolved) == 0 || len(edges) == 0 {
+		return ""
+	}
+	ordered := make([]string, 0, len(edges))
+	for _, edge := range edges {
+		if slices.ContainsFunc(targets, func(target string) bool { return strings.EqualFold(target, edge) }) {
+			ordered = append(ordered, edge)
+		}
+	}
+	for _, edge := range edges {
+		if !slices.Contains(ordered, edge) {
+			ordered = append(ordered, edge)
+		}
+	}
+	for _, edge := range ordered {
+		for _, addr := range lineCatalogueAddresses([]string{edge}, names) {
+			if slices.Contains(resolved, addr) {
+				return edge
+			}
+		}
+	}
+	return ""
+}
+
+// lineCatalogueNodeEdges is each node's distinct provider edges, in the
+// order of its lines.
+func lineCatalogueNodeEdges(lineGroups []LineGroup) map[string][]string {
+	out := map[string][]string{}
+	for _, g := range lineGroups {
+		for _, ln := range g.Lines {
+			edge := strings.TrimSpace(ln.ProviderEdge)
+			if edge != "" && !slices.Contains(out[ln.NodeID], edge) {
+				out[ln.NodeID] = append(out[ln.NodeID], edge)
+			}
+		}
+	}
+	return out
+}
+
+// lineCatalogueTemplateSecurity is a line's security layer as its client
+// template states it, for a line whose inventory leaves the column empty
+// (every discovered line today): the URI template's security parameter, or a
+// vmess template's tls field. "" when the template states none or states it
+// in a form a row cannot carry.
+func lineCatalogueTemplateSecurity(t store.LineClientTemplate) string {
+	key := "security"
+	if strings.EqualFold(t.Protocol, "vmess") {
+		key = "tls"
+	}
+	value := strings.ToLower(strings.TrimSpace(t.Params[key]))
+	if value == "none" || !lineCatalogueTokenValid(value) {
+		return ""
+	}
+	return value
+}
+
+// lineCatalogueTokenValid checks one enum-like column value by the SDK's own
+// row rule.
+func lineCatalogueTokenValid(value string) bool {
+	if value == "" {
+		return false
+	}
+	row := model.LineCatalogueRow{LineUUID: lineCatalogueValidationUUID, LineHashID: "h", NodeID: "n", Protocol: "p",
+		Chain: model.LineCatalogueChain{Role: model.LineChainRoleSingle}, Security: value}
+	return lineCatalogueProbeRowValid(row)
+}
+
+// lineCatalogueProbeRowValid is the SDK's row rule on a probe row that
+// carries one value to check. A probe row is far under the row's size
+// bound, so its fields are all the rule can refuse, and ValidateFields
+// checks them without encoding the row (a catalogue build checks one value
+// per line).
+func lineCatalogueProbeRowValid(row model.LineCatalogueRow) bool {
+	return row.ValidateFields() == nil
+}
+
 // lineCatalogueDDNSNameValid checks one name by the SDK's own row rule.
 func lineCatalogueDDNSNameValid(name string) bool {
 	row := model.LineCatalogueRow{LineUUID: lineCatalogueValidationUUID, LineHashID: "h", NodeID: "n", Protocol: "p",
 		Chain: model.LineCatalogueChain{Role: model.LineChainRoleSingle}, DDNSNames: []model.LineCatalogueDDNSName{{Name: name}}}
-	return row.Validate() == nil
+	return lineCatalogueProbeRowValid(row)
 }
 
 // lineCatalogueAddresses are the public addresses behind a line's hosts: an
@@ -754,19 +881,27 @@ func (c lineCatalogueChainSet) composedTemplate(lineUUID string) *store.LineClie
 
 // lineCatalogueChains places every line in its chain. Edges are the read
 // model's jump edges, in which a declared or committed downstream already
-// replaced the inferred ones. A line with an edge out and none in is an
-// entry, with both a relay, with only one in an exit. A line whose path to
-// the end is one line per hop gets that last line's node geo as its exit
-// geo. A committed chain root (the source of a committed definition that no
-// committed definition targets) also gets its path state, judged the way
-// compose judges it, and its composed entry template.
+// replaced the inferred ones. A line whose outbound names a server that
+// resolves to no fleet line has an edge out to the unknown: it is Unresolved.
+// A line with an edge out and none in is an entry, with both a relay, with
+// only one in an exit. A line whose path to the end is one line per hop gets
+// that last line's node geo as its exit geo, unless the path ends at an
+// unresolved line, whose exit is unknown: then the line is Unresolved too, so
+// no geo predicate reads a geo the traffic does not leave from. Every line
+// with a path gets the worst service state along it. A committed chain root
+// (the source of a committed definition that no committed definition targets)
+// also gets its path state, judged the way compose judges it, and its composed
+// entry template.
 func (s *Server) lineCatalogueChains(lines []Line, uuidByHash map[string]string, nodes map[string]model.Node) lineCatalogueChainSet {
 	set := lineCatalogueChainSet{blocks: map[string]model.LineCatalogueChain{}, composed: map[string]*store.LineClientTemplate{}}
 	nodeOf := make(map[string]string, len(lines))
+	serviceOf := make(map[string]string, len(lines))
 	targets := map[string][]string{}
 	incoming := map[string]bool{}
+	unresolved := map[string]bool{}
 	for _, ln := range lines {
 		nodeOf[ln.LineUUID] = ln.NodeID
+		serviceOf[ln.LineUUID] = ln.ServiceState
 		for _, hash := range ln.JumpEdges {
 			target := uuidByHash[hash]
 			if target == "" || target == ln.LineUUID || slices.Contains(targets[ln.LineUUID], target) {
@@ -776,27 +911,34 @@ func (s *Server) lineCatalogueChains(lines []Line, uuidByHash map[string]string,
 			incoming[target] = true
 		}
 	}
-	exitOf := func(start string) string {
+	for _, ln := range lines {
+		if len(targets[ln.LineUUID]) == 0 && lineCatalogueRelaysOut(ln) {
+			unresolved[ln.LineUUID] = true
+		}
+	}
+	// pathOf walks the single-successor path from start: the lines on it,
+	// start first, and whether it ends at its last line (a line with no edge
+	// out, or an unresolved one) rather than at a fork or a loop.
+	pathOf := func(start string) ([]string, bool) {
+		path := []string{start}
 		seen := map[string]bool{start: true}
 		current := start
 		for hop := 0; hop < lineCatalogueMaxChainHops; hop++ {
 			next := targets[current]
 			switch {
 			case len(next) == 0:
-				if current == start {
-					return ""
-				}
-				return current
+				return path, true
 			case len(next) > 1 || seen[next[0]]:
-				return ""
+				return path, false
 			}
 			current = next[0]
 			seen[current] = true
+			path = append(path, current)
 		}
-		return ""
+		return path, false
 	}
 	for _, ln := range lines {
-		out, in := len(targets[ln.LineUUID]) > 0, incoming[ln.LineUUID]
+		out, in := len(targets[ln.LineUUID]) > 0 || unresolved[ln.LineUUID], incoming[ln.LineUUID]
 		if !out && !in {
 			continue
 		}
@@ -810,8 +952,16 @@ func (s *Server) lineCatalogueChains(lines []Line, uuidByHash map[string]string,
 		if len(targets[ln.LineUUID]) == 1 {
 			block.DownstreamLineUUID = targets[ln.LineUUID][0]
 		}
-		if exit := exitOf(ln.LineUUID); exit != "" {
-			block.ExitGeo = lineCatalogueGeo(nodes[nodeOf[exit]].Geo)
+		if out {
+			path, ends := pathOf(ln.LineUUID)
+			last := path[len(path)-1]
+			switch {
+			case ends && unresolved[last]:
+				block.Unresolved = true
+			case ends && last != ln.LineUUID:
+				block.ExitGeo = lineCatalogueGeo(nodes[nodeOf[last]].Geo)
+			}
+			block.PathServiceState = lineCatalogueWorstServiceState(path, serviceOf)
 		}
 		set.blocks[ln.LineUUID] = block
 	}
@@ -878,6 +1028,40 @@ func lineCataloguePathState(err error) string {
 	return model.LinePathDrifted
 }
 
+// lineCatalogueRelaysOut reports a line whose outbound routes to a server
+// rather than out directly: the condition under which the read model infers a
+// jump edge (lines.go), so a line that meets it and has no edge relays to a
+// server that is no fleet line.
+func lineCatalogueRelaysOut(ln Line) bool {
+	ref := strings.ToLower(strings.TrimSpace(ln.OutboundRef))
+	return strings.TrimSpace(ln.OutboundServer) != "" && ln.OutboundPort > 0 && ref != "" && ref != "direct"
+}
+
+// lineCatalogueServiceRank orders service states from best to worst; a state
+// a line did not report is unknown.
+var lineCatalogueServiceRank = map[string]int{
+	model.LineServiceStateRunning:    0,
+	model.LineServiceStateUnknown:    1,
+	model.LineServiceStateRestarting: 2,
+	model.LineServiceStateDown:       3,
+}
+
+// lineCatalogueWorstServiceState is the worst service state of the lines on a
+// path: down, then restarting, then unknown, then running.
+func lineCatalogueWorstServiceState(path []string, serviceOf map[string]string) string {
+	worst := model.LineServiceStateRunning
+	for _, lineUUID := range path {
+		state := strings.ToLower(strings.TrimSpace(serviceOf[lineUUID]))
+		if _, known := lineCatalogueServiceRank[state]; !known {
+			state = model.LineServiceStateUnknown
+		}
+		if lineCatalogueServiceRank[state] > lineCatalogueServiceRank[worst] {
+			worst = state
+		}
+	}
+	return worst
+}
+
 // lineCatalogueComposedTemplate is the entry compose builds for a root,
 // without the identity's credential: the root's endpoint and its Reality
 // public material. The endpoint builder runs with a placeholder credential so
@@ -918,7 +1102,13 @@ type lineCataloguePage struct {
 	Rows             []json.RawMessage `json:"rows"`
 	Cursor           string            `json:"cursor,omitempty"`
 	SelectorFields   []string          `json:"selector_fields,omitempty"`
+	Unavailable      []string          `json:"unavailable,omitempty"`
 }
+
+// lineCatalogueUnavailable names the row blocks this core never fills: the
+// probe block, while no probe history producer exists (design 27's P2), so a
+// consumer offers no probe predicate and saves none.
+var lineCatalogueUnavailable = []string{model.LineCatalogueUnavailableProbe}
 
 // lineCatalogueVersion is the canonical version of a selection: the identity
 // named and every selected row's encoding, in order.
@@ -972,7 +1162,7 @@ func lineCataloguePageOf(rows [][]byte, version string, offset, limit int, first
 	if limit == 0 {
 		limit = model.MaxLineCataloguePageRows
 	}
-	page := lineCataloguePage{CatalogueVersion: version, Rows: []json.RawMessage{}}
+	page := lineCataloguePage{CatalogueVersion: version, Rows: []json.RawMessage{}, Unavailable: lineCatalogueUnavailable}
 	if first {
 		page.SelectorFields = lineCatalogueSelectorFields
 	}

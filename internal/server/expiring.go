@@ -1,7 +1,6 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -306,25 +305,12 @@ func nextReminderOffset(profile model.MachineProfile, now time.Time) (int, bool)
 }
 
 // subStoreRecordNames maps Sub-Store record ids to the names the operator
-// gave them, read from the plugin's document the same way the plugin does.
+// gave them, read from the plugin's index (subscriptions-index-v2), which
+// carries every record's names.
 func (s *Server) subStoreRecordNames() map[string]string {
 	out := map[string]string{}
-	entry, ok := s.store.KVEntry(usageSubStoreKVBucket, usageSubStoreRecordsKey)
-	if !ok || len(entry.Value) == 0 || len(entry.Value) > usageMaxSubStoreRecordsLen {
-		return out
-	}
-	var doc struct {
-		Records []struct {
-			ID          string `json:"id"`
-			Name        string `json:"name"`
-			DisplayName string `json:"display_name"`
-		} `json:"records"`
-	}
-	if err := json.Unmarshal([]byte(entry.Value), &doc); err != nil {
-		return out
-	}
-	for _, rec := range doc.Records {
-		if name := firstNonEmpty(rec.DisplayName, rec.Name); rec.ID != "" && name != "" {
+	for _, rec := range s.subStoreIndexV2().entries {
+		if name := firstNonEmpty(rec.DisplayName, rec.Name); name != "" {
 			out[rec.ID] = strings.TrimSpace(name)
 		}
 	}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -209,11 +210,14 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	// Sub-Store's apply_revision publishes a revision to existing share
-	// holders, so it runs only as an approved plan's apply step, never as an
-	// operator's call, whatever the manifest declares (substore_svc_plans.go).
+	// holders, so it runs only as an approved plan's apply step, and its
+	// fetch returns every selected row's addresses and template, so it runs
+	// only as core's own refresh: never as an operator's call, whatever the
+	// manifest declares (substore_svc_plans.go).
 	if subStoreCoreOnlyMethod(req.Service, req.Method) {
-		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, nil, "deny", subStoreCoreOnlyReason)
-		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, subStoreCoreOnlyReason))
+		reason := subStoreCoreOnlyRefusal(req.Method)
+		s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, nil, "deny", reason)
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, reason))
 		return
 	}
 	// The plugin must be ACTIVE and must DECLARE this service+method (with its
@@ -258,8 +262,7 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 	loaded, loadedOK := s.loadedPlugin(req.ID)
 	var out []byte
 	err = nil
-	mutatingSubscriptionStore := req.Service == req.ID+"/subscription" &&
-		(req.Method == "save" || req.Method == "delete" || req.Method == "import" || req.Method == "migrate")
+	mutatingSubscriptionStore := req.Service == req.ID+"/subscription" && subscriptionWriteMethod(req.Method)
 	finishSubscriptionMutation := func() {}
 	if mutatingSubscriptionStore {
 		mutationState, releaseMutation, acquireErr := s.acquireSubscriptionPluginGate(ctx, req.ID)
@@ -280,22 +283,24 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 			releaseMutation()
 		}
 		defer finishSubscriptionMutation()
-		persistMutation := s.store.MarkPluginSubscriptionSnapshotsStale
-		if s.subscriptionMutationPersist != nil {
-			persistMutation = s.subscriptionMutationPersist
-		}
-		committed, persistErr := persistMutation(req.ID, s.now())
-		if committed {
-			mutationState.mu.Lock()
-			mutationState.generation++
-			mutationState.mu.Unlock()
-			s.invalidateSharesForPlugin(req.ID)
-		}
-		if persistErr != nil {
-			finishSubscriptionMutation()
-			s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", "subscription mutation authority persistence failed")
-			writeError(w, http.StatusBadGateway, errors.New("subscription mutation authority persistence failed"))
-			return
+		if subscriptionWriteInvalidates(req.Method) {
+			persistMutation := s.store.MarkPluginSubscriptionSnapshotsStale
+			if s.subscriptionMutationPersist != nil {
+				persistMutation = s.subscriptionMutationPersist
+			}
+			committed, persistErr := persistMutation(req.ID, s.now())
+			if committed {
+				mutationState.mu.Lock()
+				mutationState.generation++
+				mutationState.mu.Unlock()
+				s.invalidateSharesForPlugin(req.ID)
+			}
+			if persistErr != nil {
+				finishSubscriptionMutation()
+				s.recordPluginCallAudit(p, req.ID, req.Service, req.Method, scopes, "deny", "subscription mutation authority persistence failed")
+				writeError(w, http.StatusBadGateway, errors.New("subscription mutation authority persistence failed"))
+				return
+			}
 		}
 		if err := ctx.Err(); err != nil {
 			finishSubscriptionMutation()
@@ -338,6 +343,13 @@ func (s *Server) handlePluginCall(w http.ResponseWriter, r *http.Request, p prin
 		}
 	} else {
 		dispatch()
+		// Sub-Store's refusal of an editor preview whose chain asked for
+		// the network over fleet nodes is answered as core answers it on
+		// the plan paths (substore_script_network.go), not relayed as the
+		// plugin's text.
+		if err != nil && substoreScriptNetworkRelayMethod(req.ID, req.Service, req.Method) && substoreScriptNetworkRefused(err) {
+			err = s.substoreScriptNetworkRelayRefusal(payload)
+		}
 	}
 	finishSubscriptionMutation()
 	if err != nil {
@@ -467,23 +479,21 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 	if s.pluginRuntime == nil {
 		return nil, errors.New("plugin runtime unavailable")
 	}
-	// A core-only method (Sub-Store's apply_revision) runs only inside an
-	// approved plan's apply, which puts its one-time grant on the context.
-	// The gateway refuses it for operators; this refuses every other core
-	// path too, such as a scheduled run or a plan-effect operation.
+	// A core-only method runs only on its own core path: Sub-Store's
+	// apply_revision inside an approved plan's apply, which puts its one-time
+	// grant on the context, and its fetch inside core's refresh, which marks
+	// the context it calls with. The gateway refuses both for operators; this
+	// refuses every other core path too, such as a scheduled run or a
+	// plan-effect operation.
 	if subStoreCoreOnlyMethod(service, method) {
-		if grant, _ := ctx.Value(subStoreApplyGrantKey{}).(*subStoreApplyGrant); grant == nil {
-			return nil, errSubStoreCoreOnlyMethod
+		if err := subStoreCoreOnlyCallAllowed(ctx, method); err != nil {
+			return nil, err
 		}
 	}
 	if budget == nil {
 		budget = s.pluginMethodBudget(pluginID, service, method)
 	}
-	body, err := json.Marshal(struct {
-		Service string          `json:"service"`
-		Method  string          `json:"method"`
-		Payload json.RawMessage `json:"payload,omitempty"`
-	}{Service: service, Method: method, Payload: payload})
+	body, err := plugin.EncodeServiceCall(service, method, payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal plugin call payload: %w", err)
 	}
@@ -879,4 +889,34 @@ func (s *Server) handlePluginInvoke(w http.ResponseWriter, r *http.Request, p pr
 		out["warnings"] = resp.Warnings
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// The subscription service's write methods, which the gateway runs under the
+// plugin's subscription gate (acquireSubscriptionPluginGate) as a plan apply
+// does, with the generation bumped around the call so a refresh in flight is
+// discarded. Every error one of them returns is replaced with one fixed
+// string, because plugin diagnostics are untrusted.
+//
+// The gate-only methods touch no live record document, no setting and no live
+// index entry (the order field, a staged document and its staged facts, a
+// never-live entry), so they leave every snapshot and every cached body as it
+// is. The others can change what a render reads, so before the call every
+// snapshot of the plugin is marked stale and every cached body of its shares
+// dropped; save_settings is among them because render reads the settings on
+// every call. A drag in the Records table no longer re-renders every share or
+// refetches every source (S2 plan section 2.6).
+var (
+	subscriptionGateOnlyWriteMethods     = []string{"reorder", "migrate_record", "discard_staged"}
+	subscriptionInvalidatingWriteMethods = []string{"save", "delete", "import", "migrate", "restore", "purge", "migrate_store", "save_settings"}
+)
+
+// subscriptionWriteMethod reports a write method of a subscription service.
+func subscriptionWriteMethod(method string) bool {
+	return slices.Contains(subscriptionGateOnlyWriteMethods, method) || slices.Contains(subscriptionInvalidatingWriteMethods, method)
+}
+
+// subscriptionWriteInvalidates reports a write method that stale-marks the
+// plugin's snapshots and drops its shares' cached bodies.
+func subscriptionWriteInvalidates(method string) bool {
+	return slices.Contains(subscriptionInvalidatingWriteMethods, method)
 }

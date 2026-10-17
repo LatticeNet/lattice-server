@@ -170,3 +170,99 @@ jobs:
           test -n "$tests"
           echo "shard $((SHARD + 1)) of $SHARDS runs $(echo "$tests" | tr '|' '\n' | wc -l) top-level tests"
           go test -race -cover -timeout 25m -run "^($tests)\$" ./internal/server/
+  substore-e2e:
+    # Design 28 S2's end-to-end tests over the real Sub-Store plugin
+    # (internal/server/substore_s2_e2e_test.go): the plugin is checked out at
+    # the commit internal/server/testdata/substore-plugin.ref records, built
+    # by the tests and run under the real system runner. They fail, not
+    # skip, when the checkout is missing here (five acceptance items live
+    # only in them); the server shards above skip them.
+    name: substore e2e
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout lattice-server
+        uses: actions/checkout@v6
+        with:
+          path: lattice-server
+      - name: read the plugin pin
+        id: pin
+        run: echo "ref=$(tr -d '[:space:]' < lattice-server/internal/server/testdata/substore-plugin.ref)" >> "$GITHUB_OUTPUT"
+      - name: checkout lattice-plugin-sub-store at the pin
+        uses: actions/checkout@v6
+        with:
+          repository: LatticeNet/lattice-plugin-sub-store
+          ref: ${{ steps.pin.outputs.ref }}
+          path: lattice-plugin-sub-store
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.9'
+          check-latest: true
+          cache-dependency-path: |
+            lattice-server/go.mod
+            lattice-server/go.sum
+            lattice-plugin-sub-store/system-go/go.sum
+      - name: test the S2 end-to-end flow over the real plugin
+        working-directory: lattice-server
+        env:
+          LATTICE_SUBSTORE_PLUGIN_REQUIRED: "1"
+          LATTICE_SUBSTORE_PLUGIN_DIR: ${{ github.workspace }}/lattice-plugin-sub-store
+        run: >-
+          go test -race -count=1 -timeout 30m -v
+          -run '^(TestTwoIdentitiesTwoCredentialsOneCachedPlan|TestPluginPlanFixturesPassBindCheckNode|TestS2FleetRenderLatency1000|TestScriptOperatorForeignServerIsPlanRejected|TestZeroRowFleetShareAnswersDecoy|TestStagedRevisionServesOnlyAfterApproval|TestClearOnlyPlanProposedThroughGateway|TestLegacyShareFirstRequestServes|TestCoreReadsRecordDocumentAtPluginKey|TestFleetWriteExpiresOnlyDependents|TestFleetWriteExpiry|TestMigrationThenFailedRefetchServesNoLegacyEntry|TestPlansProposeRestAfterPartialMigration|TestPlansCollectionDiffShowsSwitchedMemberAsProviderContent|TestPlanDeleteApplyRendersTagDependentCollection|TestFleetSnapshotIsKeyedOnTheHashOfRaw|TestFleetWriteExpiresARecordEditedSinceTheAnswer|TestChainOnlyRevisionShowsInThePlan|TestScriptNetworkRefusalNamesTheStep)$'
+          ./internal/server/
+  perf:
+    # Wall-clock figures for S2 (plan section 5) on a fixed runner image,
+    # never in the jobs above: core's bind of a 1000-node plan (under 50 ms,
+    # judged by the plugin's tools/perfgate with -target), the propose
+    # benchmark with 20 identities (recorded), and the fleet-bound share's
+    # cache miss at 1000 lines over the real plugin (under 400 ms).
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout lattice-server
+        uses: actions/checkout@v6
+        with:
+          path: lattice-server
+      - name: read the plugin pin
+        id: pin
+        run: echo "ref=$(tr -d '[:space:]' < lattice-server/internal/server/testdata/substore-plugin.ref)" >> "$GITHUB_OUTPUT"
+      - name: checkout lattice-plugin-sub-store at the pin
+        uses: actions/checkout@v6
+        with:
+          repository: LatticeNet/lattice-plugin-sub-store
+          ref: ${{ steps.pin.outputs.ref }}
+          path: lattice-plugin-sub-store
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.9'
+          check-latest: true
+          cache-dependency-path: |
+            lattice-server/go.mod
+            lattice-server/go.sum
+            lattice-plugin-sub-store/system-go/go.sum
+            lattice-plugin-sub-store/tools/perfgate/go.mod
+      - name: run the bind and propose benchmarks ten times
+        working-directory: lattice-server
+        shell: bash
+        run: >-
+          go test -run '^$' -bench '^(BenchmarkSubstoreBindPlan1000|BenchmarkSubstoreBindPlanWithCatalogueBuild1000|BenchmarkPlansPropose20Identities)$'
+          -count 10 -benchmem -timeout 30m ./internal/server/ | tee "$RUNNER_TEMP/bench.txt"
+      - name: judge the bind gate
+        working-directory: lattice-plugin-sub-store/tools/perfgate
+        run: go run . -target BenchmarkSubstoreBindPlan1000=50ms -current "$RUNNER_TEMP/bench.txt"
+      - name: fleet-bound cache miss at 1000 lines
+        working-directory: lattice-server
+        shell: bash
+        env:
+          LATTICE_SUBSTORE_PLUGIN_REQUIRED: "1"
+          LATTICE_SUBSTORE_PLUGIN_DIR: ${{ github.workspace }}/lattice-plugin-sub-store
+          LATTICE_SUBSTORE_PERF_GATE: "1"
+        run: go test -count=1 -v -run '^TestS2FleetRenderLatency1000$' ./internal/server/ | tee "$RUNNER_TEMP/latency.txt"
+      - name: keep the figures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-perf-ubuntu-24.04
+          path: |
+            ${{ runner.temp }}/bench.txt
+            ${{ runner.temp }}/latency.txt
+          retention-days: 30

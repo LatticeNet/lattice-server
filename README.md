@@ -312,7 +312,14 @@ Use the compose file and deployment guide in the umbrella repository:
   approve-only, `daily_cap` bounds auto-approvals per UTC day (0 = uncapped),
   and automated decisions are audited as `approval.auto_approve` /
   `approval.auto_skip`. Malformed JSON is logged and ignored. The server
-  starts fully manual.
+  starts fully manual. A rule that leaves `plugin` empty matches every
+  plugin except `substore-plan`: a Sub-Store plan changes what existing
+  identity holders receive, so a rule written for one writer or one action
+  prefix never approves one, and only a rule that names
+  `"plugin":"substore-plan"` does (the plugin id `latticenet.sub-store` is
+  not the plan's plugin). Such a rule approves every Sub-Store plan any
+  matching writer proposes, with no human reading the diff; prefer leaving
+  these plans manual.
 - **Passkeys (WebAuthn).** Operators can register passkeys (platform
   authenticators such as Apple Passwords / iCloud Keychain, or roaming security
   keys) and sign in with them. Verification uses

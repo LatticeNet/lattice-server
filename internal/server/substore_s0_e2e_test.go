@@ -193,7 +193,27 @@ func (f *e2eSubStore) serve(ctx context.Context, broker *plugin.Broker, live, se
 		}
 		return json.Marshal(model.ConvertReply{Content: b.String(), ContentType: "text/plain; charset=utf-8", Target: req.Target, NodeCount: len(req.Nodes)})
 	case "depends_on":
-		return json.Marshal(map[string]any{"records": []map[string]string{{"id": e2eFleet, "revision": live}}})
+		var req fleetDependsRequest
+		_ = json.Unmarshal(payload, &req)
+		if req.SubscriptionID == "" {
+			return json.Marshal(map[string]any{"records": []map[string]string{{"id": e2eFleet, "revision": live}}})
+		}
+		// The v2 closure a plan reads: the record alone, live at the fake's
+		// live revision with rev-2 staged; nothing reads it.
+		facts := fleetDependsFacts{ID: req.SubscriptionID, Revision: live, Kind: "sub", Source: subStoreSourceFleet, FleetBound: true,
+			StagedRevision: "rev-2", StagedSource: subStoreSourceFleet}
+		if req.SubscriptionID == e2eDoc {
+			facts.Source, facts.FleetBound, facts.StagedSource = "remote", false, "remote"
+		}
+		if live == "rev-2" {
+			facts.StagedRevision, facts.StagedSource = "", ""
+		}
+		fleetBound := []string{}
+		if facts.FleetBound {
+			fleetBound = []string{req.SubscriptionID}
+		}
+		return json.Marshal(map[string]any{"records": []fleetDependsFacts{facts}, "fleet_bound": fleetBound,
+			"owner_credentials": []string{}, "edges": []fleetDependsEdge{}, "version": "e2e"})
 	case subStoreApplyRevisionMethod:
 		var req subStoreApplyRevisionRequest
 		if err := json.Unmarshal(payload, &req); err != nil {
@@ -369,6 +389,13 @@ func newE2EEnv(t *testing.T, reportLive bool) *e2eEnv {
 		t.Fatal(err)
 	}
 	s.applyPluginHostAccess(loaded)
+	// The plugin's index: fleet-1 is a fleet record, doc-1 a provider one, so
+	// an identity share is admitted on fleet-1 alone.
+	putSubStoreRecords(t, cat.st, `{"records":[{"id":"`+e2eFleet+`","name":"fleet","source":"fleet"},{"id":"`+e2eDoc+`","name":"doc","source":"remote","url":"https://provider.example/sub"}]}`)
+	// The staged rev-2 the fake reports, as the plugin's store keeps it
+	// beside the live document.
+	putSubStoreChainDocuments(t, cat.st, e2eFleet)
+	putSubStoreChainDocuments(t, cat.st, e2eDoc)
 	return env
 }
 
@@ -560,7 +587,7 @@ func TestS0JoinedFlow(t *testing.T) {
 	// 7. A fleet write: bob is suspended. core asks depends_on off the write
 	// path, bob's share refuses at once, alice's revalidates and still
 	// serves her own 45 lines.
-	fetchesBefore := env.fake.count("fetch")
+	fetchesBefore, dependsBefore := env.fake.count("fetch"), env.fake.count("depends_on")
 	u, _ := s.getVpnUser(e2eBobID)
 	u.Enabled = false
 	if err := s.putVpnUser(u); err != nil {
@@ -568,7 +595,7 @@ func TestS0JoinedFlow(t *testing.T) {
 	}
 	s.triggerVPNCoreMutation()
 	s.substoreCatalogue.deps.wg.Wait()
-	if n := env.fake.count("depends_on"); n != 1 {
+	if n := env.fake.count("depends_on") - dependsBefore; n != 1 {
 		t.Fatalf("depends_on asked %d times after the fleet write", n)
 	}
 	// The host lane answers a known share in a policy state with one
@@ -600,7 +627,7 @@ func TestS0JoinedProposeWithoutLiveRevision(t *testing.T) {
 	code, body := env.gateway(t, e2eOperator, subStorePlansService, "propose",
 		map[string]any{"subscription_id": e2eFleet, "from_revision": "rev-1", "to_revision": "rev-2"})
 	t.Logf("propose without a live revision from the plugin: %d %s", code, body)
-	if code != http.StatusConflict {
+	if code != http.StatusConflict || !strings.Contains(string(body), "from_revision is not the record's live revision") {
 		t.Fatalf("propose: %d %s", code, body)
 	}
 }
@@ -609,9 +636,27 @@ func TestS0JoinedProposeWithoutLiveRevision(t *testing.T) {
 // a plan (services lane), but the bind preview refuses a document record.
 func TestS0JoinedProposeOnADocumentRecord(t *testing.T) {
 	env := newE2EEnv(t, true)
-	share := env.createShare(t, e2eDoc, "alice-doc", e2eAliceID)
-	if rec := env.fetch(share); rec.Code != http.StatusOK {
+	// Since S2 shares.create refuses an identity on a record that is not
+	// fleet-bound (identity_requires_fleet_record); such a share exists only
+	// from before, so it is stored directly.
+	if code, body := env.gateway(t, e2eOperator, subStoreSharesService, "create",
+		map[string]any{"subscription_id": e2eDoc, "slug": "alice-refused", "identity_id": e2eAliceID}); code != http.StatusBadRequest ||
+		!strings.Contains(string(body), apiErrorIdentityRequiresFleetRecord) {
+		t.Fatalf("an identity share on a document record was admitted: %d %s", code, body)
+	}
+	share := model.SubscriptionShare{ID: "share_alice_doc", Slug: "alice-doc", Token: strings.Repeat("d", 43), Enabled: true,
+		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: subStorePluginID, SubscriptionID: e2eDoc, IdentityID: e2eAliceID}}
+	if err := env.st.UpsertSubscriptionShare(share); err != nil {
+		t.Fatal(err)
+	}
+	// Since S2 an identity-bound share handed a document instead of a plan
+	// answers the decoy: a legacy record's document carries the line
+	// owners' credentials.
+	if rec := env.fetch(share); rec.Code != http.StatusNotFound {
 		t.Fatalf("document share: %d", rec.Code)
+	}
+	if got := env.refusals(share.ID); len(got) != 1 || got[0] != substoreBindDenyLegacyDocument {
+		t.Fatalf("document share refusals %v", got)
 	}
 	code, body := env.gateway(t, e2eOperator, subStorePlansService, "propose",
 		map[string]any{"subscription_id": e2eDoc, "from_revision": "rev-1", "to_revision": "rev-2"})

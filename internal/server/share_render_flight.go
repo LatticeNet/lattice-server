@@ -1,7 +1,6 @@
 package server
 
 import (
-	"compress/gzip"
 	"context"
 	"errors"
 	"time"
@@ -132,7 +131,7 @@ func (s *Server) renderShareOnce(ctx context.Context, share model.SubscriptionSh
 		}
 		// A plugin body is cached and served many times, so it is compressed
 		// once here; a core body is served once and compressed per request.
-		served := newShareBody(body, share.Source.Kind == model.ShareSourcePlugin, gzip.BestCompression)
+		served := newShareBody(body, share.Source.Kind == model.ShareSourcePlugin, shareCacheGzipLevel)
 		entry := subscriptionCacheEntry{body: body, contentType: rendered.ContentType, userinfo: rendered.Userinfo,
 			revalidationVersion: rendered.RevalidationVersion, publicSourceVersion: rendered.SourceVersion,
 			stale: rendered.Stale, fetchedAt: rendered.FetchedAt,

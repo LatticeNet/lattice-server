@@ -30,7 +30,8 @@ const (
 
 // subStoreFakePreviewer is the test double of the bind code: a fixed result
 // per revision and identity, the record's live revision, and a record of
-// every query.
+// every query. One query is one render of one revision, whatever the
+// identities it binds.
 type subStoreFakePreviewer struct {
 	mu      sync.Mutex
 	results map[string]subStoreBindResult
@@ -39,16 +40,20 @@ type subStoreFakePreviewer struct {
 	err     error
 }
 
-func (f *subStoreFakePreviewer) PreviewBind(_ context.Context, q subStoreBindQuery) (subStoreBindResult, error) {
+func (f *subStoreFakePreviewer) PreviewBind(_ context.Context, q subStoreBindQuery) (map[string]subStoreBindResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, q)
 	if f.err != nil {
-		return subStoreBindResult{}, f.err
+		return nil, f.err
 	}
-	result := f.results[q.Revision+"|"+q.IdentityID]
-	result.LiveRevision = f.live
-	return result, nil
+	out := make(map[string]subStoreBindResult, len(q.IdentityIDs))
+	for _, identityID := range q.IdentityIDs {
+		result := f.results[q.Revision+"|"+identityID]
+		result.LiveRevision = f.live
+		out[identityID] = result
+	}
+	return out, nil
 }
 
 func (f *subStoreFakePreviewer) set(key string, result subStoreBindResult) {
@@ -78,6 +83,7 @@ func (f *subStoreFakePreviewer) callCount() int {
 type subStorePlanHarness struct {
 	*subStoreSvcHarness
 	previewer *subStoreFakePreviewer
+	graph     *subStoreFakeGraph
 	mu        sync.Mutex
 	applied   []subStoreApplyRevisionRequest
 	applyErr  error
@@ -120,6 +126,15 @@ func newSubStorePlanHarness(t *testing.T) *subStorePlanHarness {
 		"rev-2|vpnuser_bob": {Included: []subStoreBindLine{{LineUUID: subStorePlanLine1, Name: "tokyo vless", Digest: "d1"}}},
 	}}
 	h.srv.subStoreSvc.previewer = h.previewer
+	// depends_on: rec is a fleet record live at rev-1 with rev-2 staged and
+	// no reader; other, no-shares, legacy (with a fleet-feed share) and
+	// provider stand alone.
+	h.graph = installSubStoreFakeGraph(t, h.srv)
+	h.graph.put(fleetDependsFacts{ID: "rec", Revision: "rev-1", Kind: "sub", Source: subStoreSourceFleet, StagedRevision: "rev-2", StagedSource: subStoreSourceFleet, FleetBound: true})
+	h.graph.put(fleetDependsFacts{ID: "other", Revision: "rev-o", Kind: "sub", Source: subStoreSourceFleet, FleetBound: true})
+	h.graph.put(fleetDependsFacts{ID: "no-shares", Revision: "a", Kind: "sub", Source: subStoreSourceFleet, StagedRevision: "b", StagedSource: subStoreSourceFleet, FleetBound: true})
+	h.graph.put(fleetDependsFacts{ID: "legacy", Revision: "rev-1", Kind: "sub", Source: subStoreSourceVPNCore, StagedRevision: "rev-2", StagedSource: subStoreSourceFleet, StagedMigrated: true, OwnerCredentials: true})
+	h.graph.put(fleetDependsFacts{ID: "provider", Revision: "rev-1", Kind: "sub", Source: "remote", StagedRevision: "rev-2", StagedSource: "remote"})
 	h.srv.subStoreSvc.applyRevision = func(ctx context.Context, req subStoreApplyRevisionRequest) (subStoreApplyRevisionReply, error) {
 		h.mu.Lock()
 		h.applied = append(h.applied, req)
@@ -203,8 +218,11 @@ func (h *subStorePlanHarness) claimApply(ctx context.Context, req subStoreApplyR
 // gate.
 func TestSubStorePlansProposeHashCoversDiffAndApplyWaitsForApproval(t *testing.T) {
 	h := newSubStorePlanHarness(t)
-	alice, _ := h.st.SubscriptionShare(h.findShare(t, "alice-phone"))
-	if res := h.fetch("/sub/alice-phone/" + alice.Token); res.Code != http.StatusOK {
+	// The harness's record renders a document, which an identity-bound share
+	// answers with the decoy (fleet_share_legacy_document), so the cache is
+	// watched through the share that names no identity.
+	unbound, _ := h.st.SubscriptionShare(h.findShare(t, "provider-only"))
+	if res := h.fetch("/sub/provider-only/" + unbound.Token); res.Code != http.StatusOK {
 		t.Fatalf("serve before apply: %d", res.Code)
 	}
 	rendersBefore := h.renders.Load()
@@ -265,9 +283,10 @@ func TestSubStorePlansProposeHashCoversDiffAndApplyWaitsForApproval(t *testing.T
 	if plan.Totals != (subStorePlanTotals{Shares: 3, UnboundShares: 1, Identities: 2, Added: 1, Removed: 2, Changed: 1, Excluded: 2}) {
 		t.Fatalf("totals = %+v", plan.Totals)
 	}
-	// One preview per revision per identity, not per share.
-	if h.previewer.callCount() != 4 {
-		t.Fatalf("previewer called %d times, want 4", h.previewer.callCount())
+	// One render per revision, binding both identities, not one per share
+	// or per identity.
+	if h.previewer.callCount() != 2 {
+		t.Fatalf("previewer called %d times, want 2", h.previewer.callCount())
 	}
 	if h.appliedCount() != 0 {
 		t.Fatal("propose applied the revision")
@@ -293,8 +312,8 @@ func TestSubStorePlansProposeHashCoversDiffAndApplyWaitsForApproval(t *testing.T
 		t.Fatalf("approve: %d %s", res.Code, res.Body.String())
 	}
 	// The decision previewed both revisions again before applying.
-	if h.previewer.callCount() != 8 {
-		t.Fatalf("previewer called %d times by the decision, want 4 more", h.previewer.callCount()-4)
+	if h.previewer.callCount() != 4 {
+		t.Fatalf("previewer called %d times by the decision, want 2 more", h.previewer.callCount()-2)
 	}
 	if h.appliedCount() != 1 {
 		t.Fatalf("apply_revision called %d times", h.appliedCount())
@@ -308,7 +327,7 @@ func TestSubStorePlansProposeHashCoversDiffAndApplyWaitsForApproval(t *testing.T
 		t.Fatalf("approval after apply = %+v", current)
 	}
 	// The body rendered from rev-1 is not served after the apply.
-	if res := h.fetch("/sub/alice-phone/" + alice.Token); res.Code != http.StatusOK || h.renders.Load() == rendersBefore {
+	if res := h.fetch("/sub/provider-only/" + unbound.Token); res.Code != http.StatusOK || h.renders.Load() == rendersBefore {
 		t.Fatalf("the share was served from the pre-apply cache (%d renders before, %d after)", rendersBefore, h.renders.Load())
 	}
 	// Approving again applies nothing more.
@@ -626,23 +645,48 @@ func TestSubStorePlanUnclaimedApplyIsAudited(t *testing.T) {
 	}
 }
 
-// The share-write lock is released before apply_revision runs: a slow apply
-// does not hold up every share change.
-func TestSubStorePlanApplyRunsOutsideShareWriteLock(t *testing.T) {
+// TestPlanApplyAssignsIdentitiesAfterApplyRevisionUnderLock: apply_revision
+// runs under the share-write lock the decision took, so no share appears on
+// the record between the stale check and the apply, and a share's identity
+// is written only after apply_revision succeeded, still under the lock.
+func TestPlanApplyAssignsIdentitiesAfterApplyRevisionUnderLock(t *testing.T) {
 	h := newSubStorePlanHarness(t)
-	lockFree := false
+	unbound := h.findShare(t, "provider-only")
+	lockHeld, assignedDuringApply := false, false
 	h.setOnApply(func(context.Context, subStoreApplyRevisionRequest) {
 		if h.srv.subStoreSvc.mu.TryLock() {
-			lockFree = true
 			h.srv.subStoreSvc.mu.Unlock()
+		} else {
+			lockHeld = true
 		}
+		share, _ := h.st.SubscriptionShare(unbound)
+		assignedDuringApply = share.Source.IdentityID != ""
 	})
-	reply := h.propose(t)
+	var reply subStorePlansProposeReply
+	if err := json.Unmarshal(h.mustCall(t, subStorePlansService, "propose",
+		`{"subscription_id":"rec","from_revision":"rev-1","to_revision":"rev-2","share_identities":{"`+unbound+`":"vpnuser_bob"}}`), &reply); err != nil {
+		t.Fatal(err)
+	}
 	if res := h.approve(subStorePlanApprover, reply.ApprovalID, reply.PlanSHA256, true); res.Code != http.StatusOK {
 		t.Fatalf("approve: %d %s", res.Code, res.Body.String())
 	}
-	if !lockFree {
-		t.Fatal("apply_revision ran under the share-write lock")
+	if !lockHeld {
+		t.Fatal("apply_revision ran outside the share-write lock")
+	}
+	if assignedDuringApply {
+		t.Fatal("the share carried its identity before apply_revision returned")
+	}
+	if share, _ := h.st.SubscriptionShare(unbound); share.Source.IdentityID != "vpnuser_bob" {
+		t.Fatalf("the share was not assigned after the apply: %+v", share.Source)
+	}
+	audited := false
+	for _, ev := range h.st.AuditEvents() {
+		if ev.Action == auditActionShareIdentity && ev.Metadata["approval_id"] == reply.ApprovalID && ev.Metadata["identity_to"] == "vpnuser_bob" {
+			audited = true
+		}
+	}
+	if !audited {
+		t.Fatal("the assignment was not audited with its approval")
 	}
 }
 
@@ -701,9 +745,12 @@ func TestSubStorePlansProposeRefusals(t *testing.T) {
 		t.Fatalf("propose through rpc.call: %v", err)
 	}
 	for _, bad := range []string{
+		// The same revision with no share change promotes and assigns nothing.
 		`{"subscription_id":"rec","from_revision":"rev-1","to_revision":"rev-1"}`,
 		`{"subscription_id":"rec","from_revision":"rev-1"}`,
 		`{"subscription_id":"rec","from_revision":"rev-1","to_revision":"rev-2","extra":1}`,
+		`{"subscription_id":"rec","from_revision":"rev-1","to_revision":"rev-2","action":"rename"}`,
+		`{"subscription_id":"rec","from_revision":"rev-1","to_revision":"rev-2","action":"delete"}`,
 	} {
 		if _, err := h.call(subStoreSvcAdmin, subStorePlansService, "propose", bad); subStoreSvcErrStatus(err) != http.StatusBadRequest {
 			t.Fatalf("propose %s: %v", bad, err)

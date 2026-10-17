@@ -11,6 +11,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // Design 31, S4: the agent fetches the binary of its open update in the
@@ -150,7 +151,8 @@ func (s *Server) agentPrefetchPlanFor(node model.Node, fresh bool) agentPrefetch
 		payload  agentUpdatePayload
 	}
 	var open []candidate
-	for _, approval := range s.openAgentUpdateApprovals(node.ID, fresh) {
+	approvals, tasks := s.openAgentUpdateApprovals(node.ID, fresh)
+	for _, approval := range approvals {
 		payload, err := agentUpdatePayloadFromApproval(approval)
 		if err != nil || payload.NodeID != node.ID {
 			continue
@@ -165,20 +167,29 @@ func (s *Server) agentPrefetchPlanFor(node model.Node, fresh bool) agentPrefetch
 	if len(open) == 0 || s.taskExecutionDisabled {
 		return plan
 	}
+	// Only an approved plan can have a task. Any leased one means an update
+	// script is running, whichever plan it is, so nothing is fetched; else
+	// the newest approved plan with a queued task runs next.
 	next := open[0]
+	queuedFound := false
 	for _, c := range open {
 		if c.approval.Status != model.ApprovalApproved {
 			continue
 		}
-		// Only an approved plan can have a task, so the task table is
-		// walked for those alone.
-		queued, leased := s.store.ApprovalTaskState(c.approval.ID)
-		if leased {
+		state := tasks[c.approval.ID]
+		if state.Leased {
 			return plan
 		}
-		if queued {
-			next = c
-			break
+		if state.Queued && !queuedFound {
+			next, queuedFound = c, true
+		}
+	}
+	// The index may be a few seconds old, so the plan chosen from it is read
+	// again: one that closed meanwhile is not named.
+	if !fresh {
+		current, ok := s.store.Approval(next.approval.ID)
+		if !ok || current.Status != next.approval.Status || current.Reason != next.approval.Reason || current.Action != next.approval.Action {
+			return plan
 		}
 	}
 	target, ref, ok := s.agentPrefetchTargetFor(node, next.approval, next.payload)
@@ -191,19 +202,37 @@ func (s *Server) agentPrefetchPlanFor(node model.Node, fresh bool) agentPrefetch
 }
 
 // openAgentUpdateApprovals is the node's pending and approved agent update
-// approvals, newest first.
-func (s *Server) openAgentUpdateApprovals(nodeID string, fresh bool) []model.Approval {
+// approvals, newest first, and the task state of the approved ones.
+func (s *Server) openAgentUpdateApprovals(nodeID string, fresh bool) ([]model.Approval, map[string]store.ApprovalTaskStateView) {
 	if fresh {
-		return s.store.NodeOpenPluginApprovals(nodeID, agentUpdatePlugin)
+		approvals := s.store.NodeOpenPluginApprovals(nodeID, agentUpdatePlugin)
+		return approvals, s.store.ApprovalTaskStates(approvedIDs(approvals))
 	}
 	b := &s.agentPrefetch
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	now := s.now()
 	if b.index == nil || now.Sub(b.indexAt) >= agentPrefetchIndexTTL || now.Before(b.indexAt) {
+		// One walk of the approvals and one of the tasks serve every node
+		// that pulls inside the TTL.
 		b.index, b.indexAt = s.store.OpenPluginApprovals(agentUpdatePlugin), now
+		var ids []string
+		for _, list := range b.index {
+			ids = append(ids, approvedIDs(list)...)
+		}
+		b.indexTasks = s.store.ApprovalTaskStates(ids)
 	}
-	return b.index[nodeID]
+	return b.index[nodeID], b.indexTasks
+}
+
+func approvedIDs(approvals []model.Approval) []string {
+	var ids []string
+	for _, a := range approvals {
+		if a.Status == model.ApprovalApproved {
+			ids = append(ids, a.ID)
+		}
+	}
+	return ids
 }
 
 func (s *Server) agentPrefetchTargetFor(node model.Node, approval model.Approval, payload agentUpdatePayload) (agentPrefetchTarget, agentArtifactRef, bool) {
@@ -385,10 +414,11 @@ type agentPrefetchBook struct {
 	mu       sync.Mutex
 	records  map[string]agentPrefetchRecord
 	inFlight map[string]int
-	// index is the open agent update approvals by node, read for the config
-	// pull at indexAt.
-	index   map[string][]model.Approval
-	indexAt time.Time
+	// index is the open agent update approvals by node, and indexTasks the
+	// task state of the approved ones, read for the config pull at indexAt.
+	index      map[string][]model.Approval
+	indexTasks map[string]store.ApprovalTaskStateView
+	indexAt    time.Time
 	// serveAudits folds the prefetch route's serve audits; set by New.
 	serveAudits *auditFailureThrottle
 }

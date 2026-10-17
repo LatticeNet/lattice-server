@@ -498,8 +498,8 @@ func TestAgentPrefetchConfigIndexIsShortLived(t *testing.T) {
 		t.Fatal("the open plan must be named")
 	}
 	f.setStatus(t, model.ApprovalRejected, "no")
-	if got := f.config(t).AgentUpdate; got.Prefetch == nil {
-		t.Fatal("inside its TTL the index answers as it was built")
+	if got := f.config(t).AgentUpdate; got.Prefetch != nil || len(got.Keep) != 2 {
+		t.Fatalf("inside its TTL the index keeps the plan's digests, but the plan it would name is read again and is closed: %+v", got)
 	}
 	res := f.get(t, prefetchPath(f.ref, "node-a"), f.token, nil)
 	res.Body.Close()
@@ -546,6 +546,25 @@ func TestAgentPrefetchFetchesThePlanThatRunsNext(t *testing.T) {
 	f.srv.now = func() time.Time { return time.Now().Add(agentPrefetchIndexTTL) }
 	if got := f.config(t).AgentUpdate; got.Prefetch != nil {
 		t.Fatalf("nothing is fetched while an update runs: %+v", got.Prefetch)
+	}
+
+	// A newer approved plan with its task queued behind the running one is
+	// not fetched either: the running script would remove its file, and the
+	// agent it restarts would not be held.
+	newer.Status = model.ApprovalApproved
+	if err := f.st.UpsertApproval(newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.st.CreateTask(model.Task{
+		ID: id.New("task"), ApprovalID: newer.ID, Targets: []string{"node-a"},
+		Interpreter: "sh", Script: "true", TimeoutSec: 600, OutputLimit: 65536,
+		Status: model.TaskQueued, CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.srv.now = func() time.Time { return time.Now().Add(2 * agentPrefetchIndexTTL) }
+	if got := f.config(t).AgentUpdate; got.Prefetch != nil {
+		t.Fatalf("a leased update anywhere among the open plans stops prefetch: %+v", got.Prefetch)
 	}
 }
 

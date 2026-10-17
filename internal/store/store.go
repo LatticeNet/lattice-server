@@ -4139,23 +4139,47 @@ func (s *Store) NodeOpenPluginApprovals(nodeID, plugin string) []model.Approval 
 // ApprovalTaskState reports whether a task created for approvalID is queued
 // and whether one is leased to a node now, without copying the task table.
 func (s *Store) ApprovalTaskState(approvalID string) (queued, leased bool) {
-	if approvalID == "" {
-		return false, false
+	state := s.ApprovalTaskStates([]string{approvalID})[approvalID]
+	return state.Queued, state.Leased
+}
+
+// ApprovalTaskStateView is whether an approval has a queued task and whether
+// it has a leased one.
+type ApprovalTaskStateView struct {
+	Queued, Leased bool
+}
+
+// ApprovalTaskStates is ApprovalTaskState for several approvals in one walk
+// of the task table. Approvals with no queued or leased task are absent.
+func (s *Store) ApprovalTaskStates(approvalIDs []string) map[string]ApprovalTaskStateView {
+	out := map[string]ApprovalTaskStateView{}
+	want := map[string]bool{}
+	for _, id := range approvalIDs {
+		if id != "" {
+			want[id] = true
+		}
+	}
+	if len(want) == 0 {
+		return out
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, t := range s.state.Tasks {
-		if t.ApprovalID != approvalID {
+		if !want[t.ApprovalID] {
 			continue
 		}
+		state := out[t.ApprovalID]
 		switch t.Status {
 		case model.TaskQueued:
-			queued = true
+			state.Queued = true
 		case model.TaskLeased:
-			leased = true
+			state.Leased = true
+		default:
+			continue
 		}
+		out[t.ApprovalID] = state
 	}
-	return queued, leased
+	return out
 }
 
 // PutSession persists a session, pruning expired entries and enforcing the

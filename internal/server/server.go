@@ -770,8 +770,10 @@ func New(opts Options) (*Server, error) {
 		// bucket (burst 20, 1/sec sustained) caps total failure-audit writes
 		// so IP rotation cannot exceed a fixed rate. Both are generous for
 		// legitimate failures and bound an unauthenticated flood.
-		authFailAuditThrottle:     newAuditFailureThrottle(time.Minute, 20, 1.0),
-		agentPrefetch:             agentPrefetchBook{serveAudits: newAuditFailureThrottle(time.Minute, 60, 1.0)},
+		authFailAuditThrottle: newAuditFailureThrottle(time.Minute, 20, 1.0),
+		// The keys are authenticated nodes with an open plan, so the global
+		// budget only has to stay above a release's first serves fleet-wide.
+		agentPrefetch:             agentPrefetchBook{serveAudits: newAuditFailureThrottle(time.Minute, 1024, 10.0)},
 		shareRefusalAudit:         newShareRefusalAuditThrottle(),
 		shareResolvedRefusalAudit: newShareRefusalAuditThrottle(),
 		// General authenticated API surface.

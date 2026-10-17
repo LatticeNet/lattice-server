@@ -106,6 +106,12 @@ func (s *Server) submitApproval(ctx context.Context, a model.Approval) (model.Ap
 	if err := s.store.UpsertApproval(a); err != nil {
 		return model.Approval{}, err
 	}
+	// The store stamps UpdatedAt, and CreatedAt when it is zero, on its own
+	// copy. Carry on with that row, or every plan response says the approval
+	// was last updated in year 1.
+	if stored, ok := s.store.Approval(a.ID); ok {
+		a = stored
+	}
 	return s.evaluateApprovalAutoRules(ctx, a), nil
 }
 

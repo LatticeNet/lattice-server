@@ -3640,6 +3640,14 @@ func (s *Store) UpsertStorageBinding(b model.StorageBinding) error {
 	return s.Save()
 }
 
+// StorageBinding returns one binding by id.
+func (s *Store) StorageBinding(id string) (model.StorageBinding, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b, ok := s.state.StorageBindings[id]
+	return b, ok
+}
+
 func (s *Store) StorageBindings(kind string) []model.StorageBinding {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5920,6 +5928,14 @@ func (s *Store) UpsertNotifyChannel(c model.NotifyChannel) error {
 	return s.Save()
 }
 
+// NotifyChannel returns one channel by id.
+func (s *Store) NotifyChannel(id string) (model.NotifyChannel, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c, ok := s.state.NotifyChannels[id]
+	return c, ok
+}
+
 // NotifyChannels returns all channels sorted by creation time.
 func (s *Store) NotifyChannels() []model.NotifyChannel {
 	s.mu.Lock()
@@ -5955,6 +5971,14 @@ func (s *Store) UpsertNotifyRule(rule model.NotifyRule) error {
 	}
 	s.state.NotifyRules[rule.ID] = rule
 	return s.Save()
+}
+
+// NotifyRule returns one notification rule by id.
+func (s *Store) NotifyRule(id string) (model.NotifyRule, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rule, ok := s.state.NotifyRules[id]
+	return rule, ok
 }
 
 // NotifyRules returns all notification rules sorted by creation time.

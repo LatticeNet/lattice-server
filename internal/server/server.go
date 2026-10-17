@@ -5173,6 +5173,9 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "kv.put", Scope: "kv:write", Metadata: map[string]string{"bucket": req.Bucket, "key": req.Key}})
+		if stored, ok := s.store.KVEntry(entry.Bucket, entry.Key); ok {
+			entry = stored // carries the updated_at the store stamped
+		}
 		writeJSON(w, http.StatusOK, entry)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -5245,6 +5248,9 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "static.put", Scope: "static:write", Metadata: map[string]string{"bucket": req.Bucket, "path": clean}})
+		if stored, ok := s.store.StaticObject(obj.Bucket, obj.Path); ok {
+			obj = stored // carries the updated_at the store stamped
+		}
 		writeJSON(w, http.StatusOK, obj)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -5910,6 +5916,9 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 			metadata["fallback_channel_id"] = opts.FallbackChannelID
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: metadata})
+		if stored, ok := s.store.NotifyChannel(channel.ID); ok {
+			channel = stored // carries the created_at and updated_at the store stamped
+		}
 		health, _ := s.store.NotifyChannelHealth(channel.ID)
 		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, opts, s.now()))
 	default:
@@ -6012,6 +6021,9 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 			metadata["quiet_hours"] = qh.Start + "-" + qh.End + " " + qh.TimeZone
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: metadata})
+		if stored, ok := s.store.NotifyRule(rule.ID); ok {
+			rule = stored // carries the created_at and updated_at the store stamped
+		}
 		writeJSON(w, http.StatusOK, toNotifyRuleView(rule, opts))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -6504,6 +6516,9 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider, "record_type": ddnsRecordTypeLabel(req), "comment_mode": ddnsCommentModeLabel(req)}})
+		if stored, ok := s.store.DDNSProfile(req.ID); ok {
+			req = stored // carries the created_at and updated_at the store stamped
+		}
 		view := toDDNSView(req)
 		view.Warnings = s.ddnsSaveWarnings(r.Context(), req)
 		writeJSON(w, http.StatusOK, view)
@@ -7878,6 +7893,9 @@ func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "tunnel.create", Scope: "tunnel:admin", Metadata: map[string]string{"tunnel_id": req.ID}})
+		if stored, ok := s.store.Tunnel(req.ID); ok {
+			req = stored // carries the created_at and updated_at the store stamped
+		}
 		writeJSON(w, http.StatusOK, req)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

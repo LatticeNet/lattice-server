@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 // readZeroTimeBody reads a response and fails the test if any member carries
@@ -125,4 +126,57 @@ func TestNeverSeenNodeAndUnfinishedTaskCarryNoYearOne(t *testing.T) {
 	for _, path := range []string{"/api/machines", "/api/nodes/geo"} {
 		readZeroTimeBody(t, doJSON(t, handler, http.MethodGet, path, "", cookies, ""), "GET "+path)
 	}
+}
+
+// assertStampedTimes fails unless each named member is a real time. The store
+// stamps created_at and updated_at on its own copy of a row, and a handler
+// that answered from the copy it handed in sent year 1 for both.
+func assertStampedTimes(t *testing.T, what string, obj map[string]any, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		raw, ok := obj[key].(string)
+		if !ok {
+			t.Errorf("%s: %s missing: %v", what, key, obj)
+			continue
+		}
+		at, err := time.Parse(time.RFC3339Nano, raw)
+		if err != nil || at.Year() < 2000 {
+			t.Errorf("%s: %s = %q, want the time the store wrote", what, key, raw)
+		}
+	}
+}
+
+// Every create or update answers with the row the store holds, so the times
+// the store stamped are in the response. Each of these handlers used to write
+// the copy it passed to the store, whose created_at and updated_at were zero.
+func TestCreateAndUpdateAnswerWithTheStoredTimes(t *testing.T) {
+	handler, _ := newTestServer(t)
+	cookies, csrf := loginSession(t, handler)
+	for _, tc := range []struct {
+		path, body string
+		keys       []string
+	}{
+		{"/api/kv", `{"bucket":"zero","key":"k","value":"v"}`, []string{"updated_at"}},
+		{"/api/static", `{"bucket":"zero","path":"/index.html","content":"hi","content_type":"text/html"}`, []string{"updated_at"}},
+		{"/api/storage/buckets?kind=kv", `{"name":"zero","display_name":"Zero"}`, []string{"created_at", "updated_at"}},
+		{"/api/notify/channels", `{"id":"nc-zero","name":"Zero","kind":"telegram","config":{"token":"t","chat_id":"1"}}`, []string{"created_at", "updated_at"}},
+		{"/api/tunnels", `{"name":"zero","node_id":"n1","tunnel_id":"tun-zero","ingress":[{"hostname":"zero.example.com","service":"http://localhost:8088"}]}`, []string{"created_at", "updated_at"}},
+	} {
+		obj, _ := readZeroTimeBody(t, doJSON(t, handler, http.MethodPost, tc.path, tc.body, cookies, csrf), "POST "+tc.path).(map[string]any)
+		assertStampedTimes(t, "POST "+tc.path, obj, tc.keys...)
+		if tc.path != "/api/tunnels" {
+			continue
+		}
+		// A plan answers with the approval submitApproval stored.
+		id, _ := obj["id"].(string)
+		approval, _ := readZeroTimeBody(t, doJSON(t, handler, http.MethodPost, "/api/tunnels/plan", `{"id":"`+id+`"}`, cookies, csrf), "POST /api/tunnels/plan").(map[string]any)
+		assertStampedTimes(t, "tunnel plan approval", approval, "created_at", "updated_at")
+	}
+
+	_, ddnsHandler, _ := newDDNSServer(t)
+	ddnsCookies, ddnsCSRF := loginSession(t, ddnsHandler)
+	profile, _ := readZeroTimeBody(t, doJSON(t, ddnsHandler, http.MethodPost, "/api/ddns",
+		`{"name":"cf","node_id":"n1","provider":"cloudflare","domains":["a.example.com"],"cf_api_token":"secret","enable_ipv4":true}`, ddnsCookies, ddnsCSRF), "POST /api/ddns").(map[string]any)
+	assertStampedTimes(t, "POST /api/ddns", profile, "created_at", "updated_at")
+	assertAbsentKeys(t, "a DDNS profile that has never run", profile, "last_run_at")
 }

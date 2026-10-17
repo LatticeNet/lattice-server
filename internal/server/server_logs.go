@@ -243,6 +243,9 @@ func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request, p prin
 				"enabled":   strconv.FormatBool(ls.Enabled),
 			},
 		})
+		if stored, ok := s.store.LogSource(ls.ID); ok {
+			ls = stored // carries the created_at and updated_at the store stamped
+		}
 		writeJSON(w, http.StatusOK, ls)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

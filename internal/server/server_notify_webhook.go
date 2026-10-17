@@ -204,6 +204,9 @@ func (s *Server) handleNotifyWebhooks(w http.ResponseWriter, r *http.Request, p 
 				return
 			}
 			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.update", Scope: "notify:admin", Metadata: map[string]string{"webhook_id": hook.ID, "event_type": hook.EventType}})
+			if stored, ok := s.store.NotifyWebhook(hook.ID); ok {
+				hook = stored // carries the updated_at the store stamped
+			}
 			writeJSON(w, http.StatusOK, toNotifyWebhookView(hook))
 			return
 		}
@@ -223,6 +226,9 @@ func (s *Server) handleNotifyWebhooks(w http.ResponseWriter, r *http.Request, p 
 			return
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.webhook.create", Scope: "notify:admin", Metadata: map[string]string{"webhook_id": hook.ID, "event_type": hook.EventType}})
+		if stored, ok := s.store.NotifyWebhook(hook.ID); ok {
+			hook = stored // carries the created_at and updated_at the store stamped
+		}
 		writeJSON(w, http.StatusOK, notifyWebhookSecretResponse{
 			notifyWebhookView: toNotifyWebhookView(hook),
 			Secret:            auth.FormatToken(hook.ID, secret),

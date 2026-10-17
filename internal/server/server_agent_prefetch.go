@@ -54,6 +54,11 @@ const (
 	// running one; each names at most two digests.
 	agentPrefetchKeepMax = 8
 
+	// agentPrefetchIndexTTL is how old the config pull's index of open agent
+	// update approvals may be. One walk of the approval table then serves
+	// every node that pulls inside it.
+	agentPrefetchIndexTTL = 5 * time.Second
+
 	// agentPrefetchReportTTL is how long a node's prefetch report is shown.
 	// A beat comes every interval, so a report this old is from a node that
 	// stopped reporting.
@@ -115,29 +120,37 @@ type agentPrefetchPlan struct {
 	ok       bool
 }
 
-// agentPrefetchPlanFor reads the node's agent update approvals. The newest
-// pending or approved one is the prefetch target when everything holds:
+// agentPrefetchPlanFor reads the node's open agent update approvals, pending
+// or approved, and picks the one whose task runs next. An approved plan with
+// its apply task queued runs before any newer plan, and its script removes
+// every other kept download, so it is the one to fetch; while one is leased
+// its script is running and nothing is fetched. Otherwise it is the newest
+// open plan, since a new plan supersedes the older ones. That plan is the
+// prefetch target when everything holds:
 //
 //   - task execution is enabled on this server, so the update can run;
 //   - the plan fetches from this control plane, under the source walk, whose
 //     script finishes a complete kept file instead of asking for a range past
 //     its end (curl 7 reports that 416 as a failure, so an S1 script would
 //     fail forever on a file prefetch completed);
-//   - its apply task is not running, and its update has not already run and
-//     wait for the node's confirmation;
+//   - its update has not already run and wait for the node's confirmation;
 //   - the node does not already report the target version;
 //   - the control plane holds exactly the pinned object.
 //
-// An older open approval behind a newer one is never fetched; it stays in
-// keep only.
-func (s *Server) agentPrefetchPlanFor(node model.Node) agentPrefetchPlan {
+// fresh reads the store; otherwise the approvals come from an index at most
+// agentPrefetchIndexTTL old, which is what the config pull uses. A stale
+// index costs nothing: the route reads fresh and refuses a file whose plan
+// closed meanwhile, the agent holds every download while a task runs, and
+// keep names every open plan's digests, which a few seconds cannot make
+// wrong about a plan that already had a kept file.
+func (s *Server) agentPrefetchPlanFor(node model.Node, fresh bool) agentPrefetchPlan {
 	plan := agentPrefetchPlan{config: agentUpdateAgentConfig{Keep: []string{}}}
-	var newest *model.Approval
-	var newestPayload agentUpdatePayload
-	for _, approval := range s.store.NodePluginApprovals(node.ID, agentUpdatePlugin) {
-		if approval.Status != model.ApprovalPending && approval.Status != model.ApprovalApproved {
-			continue
-		}
+	type candidate struct {
+		approval model.Approval
+		payload  agentUpdatePayload
+	}
+	var open []candidate
+	for _, approval := range s.openAgentUpdateApprovals(node.ID, fresh) {
 		payload, err := agentUpdatePayloadFromApproval(approval)
 		if err != nil || payload.NodeID != node.ID {
 			continue
@@ -147,21 +160,50 @@ func (s *Server) agentPrefetchPlanFor(node model.Node) agentPrefetchPlan {
 				plan.config.Keep = append(plan.config.Keep, digest)
 			}
 		}
-		if newest == nil {
-			a := approval
-			newest, newestPayload = &a, payload
-		}
+		open = append(open, candidate{approval: approval, payload: payload})
 	}
-	if newest == nil || s.taskExecutionDisabled {
+	if len(open) == 0 || s.taskExecutionDisabled {
 		return plan
 	}
-	target, ref, ok := s.agentPrefetchTargetFor(node, *newest, newestPayload)
+	next := open[0]
+	for _, c := range open {
+		if c.approval.Status != model.ApprovalApproved {
+			continue
+		}
+		// Only an approved plan can have a task, so the task table is
+		// walked for those alone.
+		queued, leased := s.store.ApprovalTaskState(c.approval.ID)
+		if leased {
+			return plan
+		}
+		if queued {
+			next = c
+			break
+		}
+	}
+	target, ref, ok := s.agentPrefetchTargetFor(node, next.approval, next.payload)
 	if !ok {
 		return plan
 	}
 	plan.config.Prefetch = &target
-	plan.approval, plan.ref, plan.ok = *newest, ref, true
+	plan.approval, plan.ref, plan.ok = next.approval, ref, true
 	return plan
+}
+
+// openAgentUpdateApprovals is the node's pending and approved agent update
+// approvals, newest first.
+func (s *Server) openAgentUpdateApprovals(nodeID string, fresh bool) []model.Approval {
+	if fresh {
+		return s.store.NodeOpenPluginApprovals(nodeID, agentUpdatePlugin)
+	}
+	b := &s.agentPrefetch
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := s.now()
+	if b.index == nil || now.Sub(b.indexAt) >= agentPrefetchIndexTTL || now.Before(b.indexAt) {
+		b.index, b.indexAt = s.store.OpenPluginApprovals(agentUpdatePlugin), now
+	}
+	return b.index[nodeID]
 }
 
 func (s *Server) agentPrefetchTargetFor(node model.Node, approval model.Approval, payload agentUpdatePayload) (agentPrefetchTarget, agentArtifactRef, bool) {
@@ -178,8 +220,14 @@ func (s *Server) agentPrefetchTargetFor(node model.Node, approval model.Approval
 	if err != nil {
 		return agentPrefetchTarget{}, agentArtifactRef{}, false
 	}
-	ref, obj, ok := s.storedAgentArtifactObject(payload.TargetVersion, osName, arch)
-	if !ok || ref.SHA256 != payload.SHA256 || ref.GzipSHA256 != payload.CompressedSHA256 {
+	// The plan names the object exactly, so it is looked up by its path
+	// rather than by listing the bucket.
+	ref := agentArtifactRef{Version: payload.TargetVersion, OS: osName, Arch: arch, SHA256: payload.SHA256, GzipSHA256: payload.CompressedSHA256}
+	if ref.validate() != nil {
+		return agentPrefetchTarget{}, agentArtifactRef{}, false
+	}
+	obj, ok := s.store.StaticObject(agentArtifactBucket, ref.objectPath())
+	if !ok {
 		return agentPrefetchTarget{}, agentArtifactRef{}, false
 	}
 	// The script fetches binary_url from this control plane; a plan that
@@ -196,11 +244,6 @@ func (s *Server) agentPrefetchTargetFor(node model.Node, approval model.Approval
 		binarySize = payload.BinarySize
 	}
 	if servedSize <= 0 || servedSize > maxAgentArtifactBytes || binarySize <= 0 || binarySize > maxAgentArtifactBytes {
-		return agentPrefetchTarget{}, agentArtifactRef{}, false
-	}
-	// Checked last: it walks the task table, and only an approved plan can
-	// have a task at all.
-	if approval.Status == model.ApprovalApproved && s.store.ApprovalTaskLeased(approval.ID) {
 		return agentPrefetchTarget{}, agentArtifactRef{}, false
 	}
 	return agentPrefetchTarget{
@@ -238,7 +281,7 @@ func (s *Server) handleAgentPrefetchBinary(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
-	plan := s.agentPrefetchPlanFor(node)
+	plan := s.agentPrefetchPlanFor(node, true)
 	if !plan.ok || plan.ref != ref {
 		reason := "no open agent update approval names this binary for this node"
 		if plan.ok {
@@ -258,6 +301,11 @@ func (s *Server) handleAgentPrefetchBinary(w http.ResponseWriter, r *http.Reques
 		action: "agent.binary.prefetch", node: node, ref: ref,
 		idKey: "approval_id", id: plan.approval.ID,
 		deadline: agentPrefetchServeSec * time.Second,
+		// A node resumes after every cut, and a node holding its token can
+		// ask for ranges as fast as the route limiter lets it, so the serve
+		// audit is folded per node and approval: the first one in a minute
+		// is written, with the count of those folded since the last.
+		audit: s.agentPrefetch.serveAudits, auditKey: "prefetch|" + node.ID + "|" + plan.approval.ID,
 	})
 }
 
@@ -337,6 +385,12 @@ type agentPrefetchBook struct {
 	mu       sync.Mutex
 	records  map[string]agentPrefetchRecord
 	inFlight map[string]int
+	// index is the open agent update approvals by node, read for the config
+	// pull at indexAt.
+	index   map[string][]model.Approval
+	indexAt time.Time
+	// serveAudits folds the prefetch route's serve audits; set by New.
+	serveAudits *auditFailureThrottle
 }
 
 func (b *agentPrefetchBook) enter(nodeID string) bool {
@@ -436,6 +490,22 @@ func (s *Server) agentPrefetchViewFor(a model.Approval) *agentPrefetchView {
 	rec, ok := b.records[a.NodeID]
 	b.mu.Unlock()
 	if !ok || rec.facts.ApprovalID != a.ID || s.now().Sub(rec.receivedAt) > agentPrefetchReportTTL {
+		return nil
+	}
+	// The report is the node's own word. It is shown only when it names the
+	// file this approval pins, so it cannot stand for another one.
+	payload, err := agentUpdatePayloadFromApproval(a)
+	if err != nil {
+		return nil
+	}
+	served := payload.SHA256
+	if payload.CompressedSHA256 != "" {
+		served = payload.CompressedSHA256
+		if rec.facts.Size != int64(payload.CompressedSize) {
+			return nil
+		}
+	}
+	if rec.facts.SHA256 != served {
 		return nil
 	}
 	return &agentPrefetchView{

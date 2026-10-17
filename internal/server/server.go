@@ -771,6 +771,7 @@ func New(opts Options) (*Server, error) {
 		// so IP rotation cannot exceed a fixed rate. Both are generous for
 		// legitimate failures and bound an unauthenticated flood.
 		authFailAuditThrottle:     newAuditFailureThrottle(time.Minute, 20, 1.0),
+		agentPrefetch:             agentPrefetchBook{serveAudits: newAuditFailureThrottle(time.Minute, 60, 1.0)},
 		shareRefusalAudit:         newShareRefusalAuditThrottle(),
 		shareResolvedRefusalAudit: newShareRefusalAuditThrottle(),
 		// General authenticated API surface.

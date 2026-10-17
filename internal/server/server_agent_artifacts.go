@@ -857,12 +857,17 @@ type agentArtifactServe struct {
 	idKey    string
 	id       string
 	deadline time.Duration
+	// audit, when set, folds the serve audit under auditKey; the refusals
+	// are never folded.
+	audit    *auditFailureThrottle
+	auditKey string
 }
 
 // serveAgentArtifact sends one stored object to a node a route has already
-// authorized for exactly ref. It re-verifies the stored bytes against the
-// digest in their path before any byte is written, answers single byte
-// ranges with that digest as the ETag, and audits every answer.
+// authorized for exactly ref. The bytes are held to the digest in their path
+// before any byte is written (once per decoded copy, which every download of
+// that object then shares), single byte ranges are answered with that digest
+// as the ETag, and every answer is audited.
 func (s *Server) serveAgentArtifact(w http.ResponseWriter, r *http.Request, sv agentArtifactServe) {
 	node, ref := sv.node, sv.ref
 	obj, ok := s.store.StaticObject(agentArtifactBucket, ref.objectPath())
@@ -888,13 +893,7 @@ func (s *Server) serveAgentArtifact(w http.ResponseWriter, r *http.Request, sv a
 	// sends. The node holds those bytes to the same digest before it
 	// decompresses them, and the result to the binary's own digest.
 	served := ref.servedSHA256()
-	data, decodeErr := s.agentArtifactBytes.decoded(ref.objectPath(), obj.Content)
-	if decodeErr == nil {
-		sum := sha256.Sum256(data)
-		if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(served)) != 1 {
-			decodeErr = fmt.Errorf("stored digest %s does not match the pinned %s", hex.EncodeToString(sum[:]), served)
-		}
-	}
+	data, decodeErr := s.agentArtifactBytes.verified(ref.objectPath(), obj.Content, served)
 	if decodeErr != nil {
 		// A wrong or truncated copy is a control-plane defect, not a node error,
 		// and it must never reach a node that is about to install it as root.
@@ -939,12 +938,25 @@ func (s *Server) serveAgentArtifact(w http.ResponseWriter, r *http.Request, sv a
 		r.Header.Del("Range")
 		meta["range_ignored"] = "multiple ranges; served the whole object"
 	}
-	s.recordRequestAudit(r, model.AuditEvent{
-		ID:       id.New("audit"),
-		NodeID:   node.ID,
-		Action:   sv.action,
-		Metadata: meta,
-	})
+	emit := true
+	if sv.audit != nil {
+		var suppressed, dropped int
+		emit, suppressed, dropped = sv.audit.Allow(sv.auditKey, s.now())
+		if suppressed > 0 {
+			meta["suppressed_repeats"] = strconv.Itoa(suppressed)
+		}
+		if dropped > 0 {
+			meta["global_suppressed"] = strconv.Itoa(dropped)
+		}
+	}
+	if emit {
+		s.recordRequestAudit(r, model.AuditEvent{
+			ID:       id.New("audit"),
+			NodeID:   node.ID,
+			Action:   sv.action,
+			Metadata: meta,
+		})
+	}
 	w.Header().Set("Content-Type", agentArtifactContentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
@@ -976,52 +988,103 @@ func (s *Server) serveAgentArtifact(w http.ResponseWriter, r *http.Request, sv a
 	}
 }
 
-// agentArtifactByteCache holds the decoded bytes of the objects the download
-// routes served last. Every request used to decode its own copy and keep it
-// for as long as its response took, which on a slow line is many minutes, so
-// memory grew with the number of open downloads. Prefetch makes that number
-// the size of the fleet: a release plans an update for every online node and
-// every node starts fetching. One shared copy per object bounds it instead.
+// agentArtifactByteCache holds the verified, decoded bytes of the objects
+// the download routes served last. Every request used to decode its own copy
+// and keep it for as long as its response took, which on a slow line is many
+// minutes, so memory grew with the number of open downloads. Prefetch makes
+// that number the size of the fleet: a release plans an update for every
+// online node and every node starts fetching. One shared copy per object
+// bounds it instead, and it is decoded and hashed once rather than per
+// request.
 //
-// An entry is used only for the same object path and the same stored
-// content, so a replaced object is decoded afresh, and the bytes are still
-// held to their digest on every request. agentArtifactByteCacheEntries keeps
-// a release's two platforms.
+// An entry is used only for the same object path, the same stored content
+// and the same digest, so a replaced or corrupted object is decoded and
+// verified afresh. Concurrent misses for one object decode it once, outside
+// the lock. Entries are kept within agentArtifactByteCacheBudget, most
+// recently used first; the newest entry is always kept, whatever its size.
 type agentArtifactByteCache struct {
 	mu      sync.Mutex
-	entries []agentArtifactByteEntry
+	entries []*agentArtifactByteEntry
+	loading map[string]*agentArtifactByteLoad
+	// budget overrides agentArtifactByteCacheBudget in tests.
+	budget int
 }
 
 type agentArtifactByteEntry struct {
-	path    string
-	content string
-	data    []byte
+	path, content, digest string
+	data                  []byte
 }
 
-const agentArtifactByteCacheEntries = 2
+type agentArtifactByteLoad struct {
+	content, digest string
+	done            chan struct{}
+	data            []byte
+	err             error
+}
 
-// decoded returns the bytes content decodes to. The slice is shared by every
-// caller and must not be written to.
-func (c *agentArtifactByteCache) decoded(path, content string) ([]byte, error) {
+// agentArtifactByteCacheBudget fits a release's raw and compressed objects
+// for both platforms, or two releases' compressed ones during a rollout.
+const agentArtifactByteCacheBudget = 64 << 20
+
+// verified returns the bytes content decodes to, held to digest. The slice is
+// shared by every caller and must not be written to.
+func (c *agentArtifactByteCache) verified(path, content, digest string) ([]byte, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	for i, e := range c.entries {
-		if e.path == path && e.content == content {
-			if i > 0 {
-				copy(c.entries[1:i+1], c.entries[:i])
-				c.entries[0] = e
-			}
+		if e.path == path && e.content == content && e.digest == digest {
+			copy(c.entries[1:i+1], c.entries[:i])
+			c.entries[0] = e
+			c.mu.Unlock()
 			return e.data, nil
 		}
 	}
+	if ld := c.loading[path]; ld != nil && ld.content == content && ld.digest == digest {
+		c.mu.Unlock()
+		<-ld.done
+		return ld.data, ld.err
+	}
+	ld := &agentArtifactByteLoad{content: content, digest: digest, done: make(chan struct{})}
+	if c.loading == nil {
+		c.loading = map[string]*agentArtifactByteLoad{}
+	}
+	c.loading[path] = ld
+	c.mu.Unlock()
+
+	data, err := decodeVerifiedAgentArtifact(content, digest)
+
+	c.mu.Lock()
+	if c.loading[path] == ld {
+		delete(c.loading, path)
+	}
+	if err == nil {
+		budget := c.budget
+		if budget <= 0 {
+			budget = agentArtifactByteCacheBudget
+		}
+		c.entries = append([]*agentArtifactByteEntry{{path: path, content: content, digest: digest, data: data}}, c.entries...)
+		total := 0
+		for i, e := range c.entries {
+			total += len(e.data)
+			if i > 0 && total > budget {
+				c.entries = c.entries[:i]
+				break
+			}
+		}
+	}
+	c.mu.Unlock()
+	ld.data, ld.err = data, err
+	close(ld.done)
+	return data, err
+}
+
+func decodeVerifiedAgentArtifact(content, digest string) ([]byte, error) {
 	data, err := base64.StdEncoding.DecodeString(content)
 	if err != nil {
 		return nil, err
 	}
-	entry := agentArtifactByteEntry{path: path, content: content, data: data}
-	c.entries = append([]agentArtifactByteEntry{entry}, c.entries...)
-	if len(c.entries) > agentArtifactByteCacheEntries {
-		c.entries = c.entries[:agentArtifactByteCacheEntries]
+	sum := sha256.Sum256(data)
+	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(digest)) != 1 {
+		return nil, fmt.Errorf("stored digest %s does not match the pinned %s", hex.EncodeToString(sum[:]), digest)
 	}
 	return data, nil
 }

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -446,27 +447,140 @@ func TestAgentPrefetchRouteIsRateLimitedLikeTheBinaryRoute(t *testing.T) {
 	}
 }
 
-// Every download shares one decoded copy of an object, and a replaced
-// object is decoded afresh.
-func TestAgentArtifactByteCacheSharesOneCopy(t *testing.T) {
-	var c agentArtifactByteCache
-	a := base64.StdEncoding.EncodeToString([]byte("first object"))
-	b := base64.StdEncoding.EncodeToString([]byte("second object"))
-	one, _ := c.decoded("p/a", a)
-	two, _ := c.decoded("p/a", a)
-	if &one[0] != &two[0] {
-		t.Fatal("the same object must be decoded once")
+// Every download shares one verified copy of an object, decoded once even
+// under concurrent misses; a replaced object, or one that fails its digest,
+// is decoded and checked afresh, and the cache stays within its budget.
+func TestAgentArtifactByteCacheSharesOneVerifiedCopy(t *testing.T) {
+	c := agentArtifactByteCache{budget: 40}
+	first, second := []byte("first object, twenty"), []byte("second object, twent")
+	a, b := base64.StdEncoding.EncodeToString(first), base64.StdEncoding.EncodeToString(second)
+	da, db := sha256.Sum256(first), sha256.Sum256(second)
+	digestA, digestB := hex.EncodeToString(da[:]), hex.EncodeToString(db[:])
+
+	var wg sync.WaitGroup
+	got := make([][]byte, 16)
+	for i := range got {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got[i], _ = c.verified("p/a", a, digestA)
+		}(i)
 	}
-	if got, _ := c.decoded("p/a", b); string(got) != "second object" {
-		t.Fatalf("replaced content must be decoded afresh: %q", got)
+	wg.Wait()
+	for _, g := range got {
+		if len(g) == 0 || &g[0] != &got[0][0] {
+			t.Fatal("concurrent downloads of one object must share one decoded copy")
+		}
 	}
-	c.decoded("p/b", a)
-	c.decoded("p/c", a)
-	if len(c.entries) != agentArtifactByteCacheEntries {
-		t.Fatalf("the cache must stay bounded: %d", len(c.entries))
+	if _, err := c.verified("p/a", b, digestA); err == nil || !strings.Contains(err.Error(), "does not match the pinned") {
+		t.Fatalf("replaced content must be held to the digest afresh: %v", err)
 	}
-	if _, err := c.decoded("p/d", "not base64!"); err == nil {
+	if got, err := c.verified("p/a", b, digestB); err != nil || string(got) != string(second) {
+		t.Fatalf("replaced content must be decoded afresh: %q %v", got, err)
+	}
+	c.verified("p/b", a, digestA)
+	c.verified("p/c", a, digestA)
+	if len(c.entries) != 2 {
+		t.Fatalf("the cache must stay within its budget: %d entries", len(c.entries))
+	}
+	if _, err := c.verified("p/d", "not base64!", digestA); err == nil {
 		t.Fatal("undecodable content must fail")
+	}
+}
+
+// The config pull reads open approvals from an index a few seconds old, so
+// one walk of the approval table serves every node; the route reads fresh.
+func TestAgentPrefetchConfigIndexIsShortLived(t *testing.T) {
+	f := newPrefetchFixture(t, 16<<10, true)
+	now := time.Now()
+	f.srv.now = func() time.Time { return now }
+	if got := f.config(t).AgentUpdate; got.Prefetch == nil {
+		t.Fatal("the open plan must be named")
+	}
+	f.setStatus(t, model.ApprovalRejected, "no")
+	if got := f.config(t).AgentUpdate; got.Prefetch == nil {
+		t.Fatal("inside its TTL the index answers as it was built")
+	}
+	res := f.get(t, prefetchPath(f.ref, "node-a"), f.token, nil)
+	res.Body.Close()
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("the route reads fresh and must refuse a closed plan at once, got %d", res.StatusCode)
+	}
+	now = now.Add(agentPrefetchIndexTTL)
+	if got := f.config(t).AgentUpdate; got.Prefetch != nil || len(got.Keep) != 0 {
+		t.Fatalf("past its TTL the index must be rebuilt: %+v", got)
+	}
+}
+
+// When an approved plan's task is queued behind a newer pending plan, the
+// approved one runs first and its script removes every other kept
+// download, so that is the file to fetch; while it runs, nothing is.
+func TestAgentPrefetchFetchesThePlanThatRunsNext(t *testing.T) {
+	f := newPrefetchFixture(t, 16<<10, true)
+	task := f.approveWithTask(t, false)
+	payload, err := agentUpdatePayloadFromApproval(f.approval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := sha256.Sum256([]byte("a newer binary"))
+	payload.SHA256 = hex.EncodeToString(other[:])
+	newer := f.approval
+	newer.ID, newer.Status, newer.CreatedAt = id.New("approval"), model.ApprovalPending, f.approval.CreatedAt.Add(time.Minute)
+	newer.Action = agentUpdateApprovalAction(payload)
+	if err := f.st.UpsertApproval(newer); err != nil {
+		t.Fatal(err)
+	}
+	got := f.config(t).AgentUpdate
+	if got.Prefetch == nil || got.Prefetch.ApprovalID != f.approval.ID {
+		t.Fatalf("the queued approved plan must be fetched, got %+v", got.Prefetch)
+	}
+	if !slices.Contains(got.Keep, payload.SHA256) || !slices.Contains(got.Keep, f.ref.GzipSHA256) {
+		t.Fatalf("keep must name both open plans: %v", got.Keep)
+	}
+	if _, err := f.st.LeaseTasks("node-a", 1); err != nil {
+		t.Fatal(err)
+	}
+	if queued, leased := f.st.ApprovalTaskState(f.approval.ID); queued || !leased {
+		t.Fatalf("task %s must be leased now", task.ID)
+	}
+	f.srv.now = func() time.Time { return time.Now().Add(agentPrefetchIndexTTL) }
+	if got := f.config(t).AgentUpdate; got.Prefetch != nil {
+		t.Fatalf("nothing is fetched while an update runs: %+v", got.Prefetch)
+	}
+}
+
+// A node that resumes, or asks for ranges as fast as the limiter allows,
+// writes one serve audit a minute for its approval, with the folded count.
+func TestAgentPrefetchServeAuditsAreFolded(t *testing.T) {
+	f := newPrefetchFixture(t, 16<<10, true)
+	now := time.Now()
+	f.srv.now = func() time.Time { return now }
+	serves := func() []model.AuditEvent {
+		var out []model.AuditEvent
+		for _, ev := range f.st.AuditEvents() {
+			if ev.Action == "agent.binary.prefetch" && ev.Decision != "deny" {
+				out = append(out, ev)
+			}
+		}
+		return out
+	}
+	for range 3 {
+		res := f.get(t, prefetchPath(f.ref, "node-a"), f.token, map[string]string{"Range": "bytes=0-0"})
+		res.Body.Close()
+		if res.StatusCode != http.StatusPartialContent {
+			t.Fatalf("status %d", res.StatusCode)
+		}
+	}
+	if got := serves(); len(got) != 1 {
+		t.Fatalf("repeats inside a minute must fold into one audit, got %d", len(got))
+	}
+	now = now.Add(time.Minute)
+	res := f.get(t, prefetchPath(f.ref, "node-a"), f.token, nil)
+	res.Body.Close()
+	// The store lists audit events newest first.
+	got := serves()
+	if len(got) != 2 || got[0].Metadata["suppressed_repeats"] != "2" || got[0].Metadata["range"] != "" {
+		t.Fatalf("the next audit must carry the folded count: %d events, %v", len(got), got[0].Metadata)
 	}
 }
 
@@ -535,6 +649,14 @@ func TestAgentPrefetchReportIsShownBesideItsApproval(t *testing.T) {
 	beat(report("complete", "", len(f.served), "approval-other"))
 	if got := shown(); got != nil {
 		t.Fatalf("a report for another approval must not be shown here: %+v", got)
+	}
+	other, err := json.Marshal(agentPrefetchFacts{ApprovalID: f.approval.ID, SHA256: f.ref.SHA256, Bytes: 1, Size: int64(len(f.served)), State: "complete"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	beat(`,"prefetch":` + string(other))
+	if got := shown(); got != nil {
+		t.Fatalf("a report naming a file the approval does not pin must not be shown: %+v", got)
 	}
 	beat(report("complete", "", len(f.served), f.approval.ID))
 	if got := shown(); got == nil || got.State != "complete" {
@@ -622,4 +744,22 @@ func TestAgentPrefetchedFileLetsTheTaskFinishInsideTheBudget(t *testing.T) {
 			t.Fatal("the installed download must be removed")
 		}
 	})
+}
+
+// The names lattice-node-agent's prefetch shares with the apply script and
+// this route. The agent pins the same literals
+// (TestPrefetchContractNamesMatchTheServer in internal/prefetch), so a change
+// on one side fails a test until the other follows.
+func TestAgentPrefetchContractNamesMatchTheAgent(t *testing.T) {
+	for got, want := range map[string]string{
+		agentUpdatePartialPrefix:        ".lattice-agent-download-",
+		defaultAgentInstallPath:         "/opt/lattice/node-agent/lattice-agent",
+		previousDefaultAgentInstallPath: "/opt/lattice/lattice-agent",
+		legacyAgentInstallPath:          "/usr/local/bin/lattice-agent",
+		agentPrefetchPathPrefix:         "/api/agent/prefetch-binary/",
+	} {
+		if got != want {
+			t.Errorf("%q, want %q", got, want)
+		}
+	}
 }

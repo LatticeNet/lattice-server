@@ -104,7 +104,7 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 	// The beacon companion admits a source's egress address when it is not
 	// one of the node's pinned ones (design 29 D12), as seen here.
 	s.noteBeaconEgress(node.ID, s.clientIP(r))
-	prefetch := s.agentPrefetchPlanFor(node).config
+	prefetch := s.agentPrefetchPlanFor(node, false).config
 	writeJSON(w, http.StatusOK, agentConfigResponse{
 		AgentConfig: model.AgentConfig{
 			LatticeIdentityUUID: node.LatticeIdentityUUID,

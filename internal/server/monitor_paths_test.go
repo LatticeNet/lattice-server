@@ -146,8 +146,9 @@ func TestPathSeriesJoinsChecksAndShowsGaps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if series.StepSeconds != 300 || !series.From.Equal(now.Add(-6*time.Hour).Truncate(5*time.Minute)) {
-		t.Fatalf("6h series: step %d from %s", series.StepSeconds, series.From)
+	// Six hours of five-minute steps is 72 of them, the last in progress.
+	if series.StepSeconds != 300 || !series.From.Equal(now.Truncate(5*time.Minute).Add(-6*time.Hour+5*time.Minute)) || len(series.Buckets) != 72 {
+		t.Fatalf("6h series: step %d from %s, %d buckets", series.StepSeconds, series.From, len(series.Buckets))
 	}
 	if len(series.MethodChanges) != 2 || series.MethodChanges[0].Method != "tcp" || !series.MethodChanges[0].T.Equal(start) ||
 		series.MethodChanges[1].Method != "icmp" || !series.MethodChanges[1].T.Equal(start.Add(2*time.Hour)) {
@@ -444,7 +445,9 @@ func TestPathMatrixScope(t *testing.T) {
 
 // Each window's figures hold until its next bucket closes, and a path that
 // appears meanwhile is read at once, over the same window, without
-// rereading the others.
+// rereading the others. The window is the whole buckets before the one in
+// progress, so the runs here land in the bucket before base's, a late one
+// after the first read included.
 func TestPathMatrixCachesUntilTheBucketCloses(t *testing.T) {
 	srv, _, st := newPathsServer(t)
 	upsertNodes(t, st, model.Node{ID: "node-a", Name: "a", Online: true})
@@ -458,12 +461,12 @@ func TestPathMatrixCachesUntilTheBucketCloses(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	ingest(base.Add(-30 * time.Second))
+	ingest(base.Add(-5 * time.Minute))
 	first, err := srv.pathMatrixFor(p, model.PathWindowDay, base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ingest(base.Add(30 * time.Second))
+	ingest(base.Add(-4*time.Minute - 30*time.Second))
 	cached, _ := srv.pathMatrixFor(p, model.PathWindowDay, base.Add(time.Minute))
 	if a, b := pathCellFor(t, first, "node-a", "mon-a"), pathCellFor(t, cached, "node-a", "mon-a"); a.Samples != 1 || b.Samples != 1 {
 		t.Fatalf("within the bucket the figures hold: %d then %d", a.Samples, b.Samples)
@@ -471,7 +474,7 @@ func TestPathMatrixCachesUntilTheBucketCloses(t *testing.T) {
 	if err := st.UpsertMonitor(model.Monitor{ID: "mon-b", Name: "b", Type: model.MonitorTypeTCP, Target: "203.0.113.9:80", IntervalSec: 60, TimeoutSec: 5, NodeIDs: []string{"node-a"}, Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.IngestAgentMonitorResults("node-a", []model.MonitorResult{{MonitorID: "mon-b", At: base.Add(40 * time.Second), Success: true, LatencyMs: 12}}, base.Add(40*time.Second)); err != nil {
+	if _, err := st.IngestAgentMonitorResults("node-a", []model.MonitorResult{{MonitorID: "mon-b", At: base.Add(-3 * time.Minute), Success: true, LatencyMs: 12}}, base.Add(40*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	withNew, _ := srv.pathMatrixFor(p, model.PathWindowDay, base.Add(2*time.Minute))

@@ -178,3 +178,68 @@ func TestCheckTimeoutBoundIsTheSDKs(t *testing.T) {
 		}
 	}
 }
+
+// A window of N buckets counts N. A check that ran every minute, its newest
+// run stamped exactly now, reads 60 of 60 in the 1h matrix (not 61 of 60:
+// the window used to hold both ends) and 1440 of 1440 in the 24h matrix
+// (not the bucket in progress on top). Its 1h series is 60 one-minute
+// buckets, the last in progress, which expects the run it already heard
+// rather than reading 1 of 0; a step in progress that heard nothing reads a
+// gap only once a whole interval has passed in it.
+func TestPathWindowsCountTheirBuckets(t *testing.T) {
+	srv, _, st := newPathsServer(t)
+	upsertNodes(t, st, model.Node{ID: "node-a", Name: "a", Online: true})
+	if err := st.UpsertMonitor(model.Monitor{ID: "mon-a", Name: "a", Type: model.MonitorTypeTCP, Target: "203.0.113.9:443", IntervalSec: 60, TimeoutSec: 5, NodeIDs: []string{"node-a"}, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	var runs []model.MonitorResult
+	for i := 25 * 60; i >= 0; i-- {
+		runs = append(runs, model.MonitorResult{MonitorID: "mon-a", At: now.Add(-time.Duration(i) * time.Minute), Success: true, LatencyMs: 20})
+	}
+	if _, err := st.IngestAgentMonitorResults("node-a", runs, now); err != nil {
+		t.Fatal(err)
+	}
+	p := principal{Principal: adminPrincipalForTest()}
+	for _, c := range []struct {
+		window string
+		want   int
+	}{{model.PathWindowHour, 60}, {model.PathWindowDay, 1440}} {
+		m, err := srv.pathMatrixFor(p, c.window, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cell := pathCellFor(t, m, "node-a", "mon-a"); cell.Samples != c.want || cell.Expected != c.want {
+			t.Errorf("%s matrix = %d samples of %d expected, want %d of %d", c.window, cell.Samples, cell.Expected, c.want, c.want)
+		}
+	}
+	checks := []pathCheck{{monitorID: "mon-a", method: model.MonitorTypeTCP}}
+	series, err := srv.pathSeriesFor(checks, "node-a", model.PathWindowHour, time.Minute, now.Add(30*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series.Buckets) != 60 || !series.From.Equal(now.Add(-59*time.Minute)) {
+		t.Fatalf("1h series = %d buckets from %s, want 60 from %s", len(series.Buckets), series.From, now.Add(-59*time.Minute))
+	}
+	for i, b := range series.Buckets {
+		if b.N != 1 || b.Expected != 1 {
+			t.Errorf("1h series bucket %d at %s = %d of %d, want 1 of 1", i, b.T.Format(time.TimeOnly), b.N, b.Expected)
+		}
+	}
+	// Five-minute steps, read three minutes into a step that heard nothing
+	// (the check stopped at now): three runs were due, so it is a gap. Read
+	// thirty seconds into one, nothing was certainly due yet.
+	for _, c := range []struct {
+		at   time.Duration
+		want int
+	}{{3 * time.Minute, 3}, {30 * time.Second, 0}} {
+		six, err := srv.pathSeriesFor(checks, "node-a", model.PathWindowSixHours, time.Minute, now.Add(5*time.Minute+c.at))
+		if err != nil {
+			t.Fatal(err)
+		}
+		last := six.Buckets[len(six.Buckets)-1]
+		if len(six.Buckets) != 72 || last.N != 0 || last.Expected != c.want {
+			t.Errorf("6h series %s into an empty step: %d buckets, last %d of %d, want 72 and 0 of %d", c.at, len(six.Buckets), last.N, last.Expected, c.want)
+		}
+	}
+}

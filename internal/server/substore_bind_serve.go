@@ -90,6 +90,54 @@ type substoreBindState struct {
 	dayRows func(userID string, from, to time.Time) []store.UsageDayUser
 	// memo is the per-record policy the cache digest reads.
 	memo substoreBindPolicyMemo
+	// selections remembers the selection read from recent snapshots.
+	selections substoreBindSelectionMemo
+}
+
+// substoreBindSelectionMemoSize bounds substoreBindSelectionMemo.
+const substoreBindSelectionMemoSize = 64
+
+// substoreBindSelectionMemo remembers, by the hash of a snapshot's raw, the
+// catalogue version and line set substoreBindSnapshotSelection read from
+// it. That read decodes the whole envelope (most of a megabyte at 1000
+// lines) on every bind, and every identity's share of one record, and every
+// body-only miss, binds over the same snapshot. The key is the content, so
+// an entry is never stale; the memo keeps the most recent entries.
+type substoreBindSelectionMemo struct {
+	mu      sync.Mutex
+	entries map[string]substoreBindSelectionEntry
+	order   []string
+}
+
+type substoreBindSelectionEntry struct {
+	version  string
+	selected map[string]bool
+}
+
+// read answers the selection of a snapshot whose raw hashes to key,
+// reading it from raw on a miss. A caller must not change the set.
+func (m *substoreBindSelectionMemo) read(key string, snap model.SubscriptionSnapshot) (string, map[string]bool) {
+	m.mu.Lock()
+	entry, ok := m.entries[key]
+	m.mu.Unlock()
+	if ok {
+		return entry.version, entry.selected
+	}
+	version, selected := substoreBindSnapshotSelection(snap)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.entries == nil {
+		m.entries = make(map[string]substoreBindSelectionEntry, substoreBindSelectionMemoSize)
+	}
+	if _, present := m.entries[key]; !present {
+		if len(m.order) == substoreBindSelectionMemoSize {
+			delete(m.entries, m.order[0])
+			m.order = m.order[1:]
+		}
+		m.order = append(m.order, key)
+	}
+	m.entries[key] = substoreBindSelectionEntry{version: version, selected: selected}
+	return version, selected
 }
 
 // substoreBindRefusal is a render the bind step refused. The share answers
@@ -170,10 +218,18 @@ func substoreBindSnapshotSelection(snap model.SubscriptionSnapshot) (string, map
 // A plan without a selection passes; substoreBindPlan then reads the
 // snapshot's.
 func substoreBindCheckSelection(plan model.SelectionPlan, snap model.SubscriptionSnapshot) string {
+	version, selected := substoreBindSnapshotSelection(snap)
+	return substoreBindCheckSelectionIn(plan, version, selected)
+}
+
+// substoreBindCheckSelectionIn is substoreBindCheckSelection over the
+// version and line set substoreBindSnapshotSelection already read, so a
+// caller that also binds decodes the snapshot once (a 1000-line snapshot is
+// most of a megabyte).
+func substoreBindCheckSelectionIn(plan model.SelectionPlan, version string, selected map[string]bool) string {
 	if plan.Selection == nil {
 		return ""
 	}
-	version, selected := substoreBindSnapshotSelection(snap)
 	if selected == nil || plan.Selection.CatalogueVersion != version {
 		return substoreBindRefusedSelectionMismatch
 	}
@@ -509,14 +565,17 @@ func (s *Server) substoreBindRendered(ctx context.Context, share model.Subscript
 	if !policy.Active() {
 		return renderedSubscription{}, substoreBindRefusal{reason: substoreBindDenyIdentityPrefix + firstNonEmpty(policy.Reason, policy.Status)}
 	}
-	if refused := substoreBindCheckSelection(plan, snap); refused != "" {
+	// The selection is read through a memo keyed by the hash of the
+	// snapshot's raw, which costs a fraction of decoding it.
+	version, selected := s.substoreCatalogue.bind.selections.read(subscriptionContentHash(snap.Raw), snap)
+	if refused := substoreBindCheckSelectionIn(plan, version, selected); refused != "" {
 		return renderedSubscription{}, substoreBindRefusal{reason: substoreBindDenyPrefix + refused}
 	}
 	catalogue, err := s.buildLineCatalogue("")
 	if err != nil {
 		return renderedSubscription{}, err
 	}
-	result := substoreBindPlan(plan, u, catalogue, substoreBindInputs{selected: substoreBindSelection(snap), usage: usage,
+	result := substoreBindPlan(plan, u, catalogue, substoreBindInputs{selected: selected, usage: usage,
 		names: s.substoreCatalogue.names.snapshot()})
 	for _, x := range result.Excluded {
 		if x.Reason == substoreBindRejectedPrefix+"skip-cert-verify" {
@@ -628,8 +687,14 @@ func (s *Server) substoreBindConvert(ctx context.Context, pluginID string, req m
 		if err != nil {
 			return model.ConvertReply{}, err
 		}
-		if err := json.Unmarshal(out, &reply); err != nil {
-			return model.ConvertReply{}, fmt.Errorf("decode convert reply: %w", err)
+		// The reply carries the converted document, most of a megabyte at
+		// 1000 lines.
+		if !decodeKnownMembers(out, map[string]any{"content": &reply.Content, "content_type": &reply.ContentType,
+			"target": &reply.Target, "node_count": &reply.NodeCount, "headers": &reply.Headers, "log": &reply.Log}) {
+			reply = model.ConvertReply{}
+			if err := json.Unmarshal(out, &reply); err != nil {
+				return model.ConvertReply{}, fmt.Errorf("decode convert reply: %w", err)
+			}
 		}
 	}
 	if err := reply.Validate(); err != nil {

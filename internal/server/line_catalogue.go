@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/groups"
@@ -276,11 +277,33 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 		identitySecrets = newLineCatalogueSecrets(lineCatalogueIdentitySecrets(*identity))
 	}
 
-	c := &lineCatalogue{identityID: identityID, at: now, index: make(map[string]int, len(lines)),
-		rows: make([]model.LineCatalogueRow, 0, len(lines)), encoded: make([][]byte, 0, len(lines)),
-		lines: make([]Line, 0, len(lines)), templates: make([]*store.LineClientTemplate, 0, len(lines))}
-	var withheld []string
-	for _, ln := range lines {
+	// newLineCatalogueSecrets is a pure function of the secrets it is given,
+	// and lines of one node often share their owner's credential, so one
+	// build computes each set once.
+	var ownerSets sync.Map
+	ownerSecrets := func(secrets []string) lineCatalogueSecrets {
+		key := lineCatalogueSecretsKey(secrets)
+		if set, ok := ownerSets.Load(key); ok {
+			return set.(lineCatalogueSecrets)
+		}
+		set := newLineCatalogueSecrets(secrets)
+		ownerSets.Store(key, set)
+		return set
+	}
+	// Each line's row depends on nothing but the line and the inputs read
+	// above, so rows are built in parallel and gathered in catalogue order;
+	// the catalogue and its withheld list are what building them one by one
+	// gives.
+	type builtRow struct {
+		row          model.LineCatalogueRow
+		raw          []byte
+		keptTemplate bool
+		bind         *store.LineClientTemplate
+		err          error
+	}
+	built := make([]builtRow, len(lines))
+	substoreBindEach(len(lines), func(i int) {
+		ln := lines[i]
 		node := nodes[ln.NodeID]
 		row := model.LineCatalogueRow{
 			LineUUID: ln.LineUUID, LineHashID: ln.LineHashID, NodeID: ln.NodeID,
@@ -316,7 +339,7 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 			// no longer reports one leaves the sync-time refusal standing.
 			if err == nil && !chains.root(ln.LineUUID) {
 				if shareURL := shareURLs[[2]string{ln.NodeID, ln.Tag}]; shareURL != "" {
-					owner := newLineCatalogueSecrets(lineClientShareURLSecrets(shareURL, bind.Protocol))
+					owner := ownerSecrets(lineClientShareURLSecrets(shareURL, bind.Protocol))
 					if raw, _ := json.Marshal(template); owner.in(raw) {
 						err = errors.New("the owner's credential survives in the template")
 					}
@@ -340,16 +363,25 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 			row.Usage = &model.LineCatalogueUsage{IdentityID: identity.ID, UsedBytes: usage[ln.LineHashID], From: usageFrom, To: usageTo}
 		}
 		raw, keptTemplate, err := finishLineCatalogueRow(&row, identitySecrets)
-		if err != nil {
-			withheld = append(withheld, ln.LineUUID+": "+err.Error())
+		built[i] = builtRow{row: row, raw: raw, keptTemplate: keptTemplate, bind: bind, err: err}
+	})
+	c := &lineCatalogue{identityID: identityID, at: now, index: make(map[string]int, len(lines)),
+		rows: make([]model.LineCatalogueRow, 0, len(lines)), encoded: make([][]byte, 0, len(lines)),
+		lines: make([]Line, 0, len(lines)), templates: make([]*store.LineClientTemplate, 0, len(lines))}
+	var withheld []string
+	for i, ln := range lines {
+		b := built[i]
+		if b.err != nil {
+			withheld = append(withheld, ln.LineUUID+": "+b.err.Error())
 			continue
 		}
-		if !keptTemplate {
+		bind := b.bind
+		if !b.keptTemplate {
 			bind = nil
 		}
 		c.index[ln.LineUUID] = len(c.rows)
-		c.rows = append(c.rows, row)
-		c.encoded = append(c.encoded, raw)
+		c.rows = append(c.rows, b.row)
+		c.encoded = append(c.encoded, b.raw)
 		c.lines = append(c.lines, ln)
 		c.templates = append(c.templates, bind)
 	}
@@ -365,10 +397,20 @@ func (s *Server) buildLineCatalogue(identityID string) (*lineCatalogue, error) {
 // without a template too is withheld.
 func finishLineCatalogueRow(row *model.LineCatalogueRow, identity lineCatalogueSecrets) (raw []byte, keptTemplate bool, err error) {
 	for {
-		err = row.Validate()
+		// Validate's size bound encodes the row; ValidateTrustingEncoding
+		// reads it from the encoding the row is served as, which is raw
+		// right here, so each row is encoded once. A row that does not
+		// encode is judged by Validate, which words the error as before.
+		raw, err = json.Marshal(row)
+		if err != nil {
+			if verr := row.Validate(); verr != nil {
+				err = verr
+			}
+		} else {
+			err = row.ValidateTrustingEncoding(raw)
+		}
 		if err == nil {
-			raw, err = json.Marshal(row)
-			if err == nil && identity.in(raw) {
+			if identity.in(raw) {
 				err = errors.New("the named identity's credential survives in the row")
 			}
 			if err == nil {
@@ -451,6 +493,21 @@ func lineCatalogueIdentitySecrets(u VpnUser) []string {
 // does not let a client connect.
 type lineCatalogueSecrets struct{ needles [][]byte }
 
+// lineCatalogueSecretsKey is the memo key of a secret list: each secret
+// prefixed by its length, so two different lists never share a key. A join
+// on a separator byte did not hold that: ["ab\x00cd"] and ["ab", "cd"]
+// joined the same, and the second line would have been checked against the
+// first line's needles.
+func lineCatalogueSecretsKey(secrets []string) string {
+	var b strings.Builder
+	for _, secret := range secrets {
+		b.WriteString(strconv.Itoa(len(secret)))
+		b.WriteByte(':')
+		b.WriteString(secret)
+	}
+	return b.String()
+}
+
 func newLineCatalogueSecrets(secrets []string) lineCatalogueSecrets {
 	var m lineCatalogueSecrets
 	seen := map[string]bool{}
@@ -484,11 +541,23 @@ func lineCatalogueSecretForms(secret string) []string {
 		forms = append(forms, base64.RawStdEncoding.EncodeToString(raw), base64.RawURLEncoding.EncodeToString(raw))
 	}
 	for _, form := range slices.Clone(forms) {
+		// A form with nothing JSON escapes is its own escaped form, which
+		// would only repeat it.
+		if !strings.ContainsFunc(form, jsonEscapes) {
+			continue
+		}
 		if escaped, err := json.Marshal(form); err == nil {
 			forms = append(forms, string(escaped[1:len(escaped)-1]))
 		}
 	}
 	return forms
+}
+
+// jsonEscapes reports whether json.Marshal writes r other than as itself:
+// the quote, the backslash, a control character, the three HTML characters,
+// U+2028, U+2029 and the replacement character an invalid byte becomes.
+func jsonEscapes(r rune) bool {
+	return r < 0x20 || r == '"' || r == '\\' || r == '<' || r == '>' || r == '&' || r == '\u2028' || r == '\u2029' || r == utf8.RuneError
 }
 
 func (m lineCatalogueSecrets) in(raw []byte) bool {
@@ -733,14 +802,23 @@ func lineCatalogueTokenValid(value string) bool {
 	}
 	row := model.LineCatalogueRow{LineUUID: lineCatalogueValidationUUID, LineHashID: "h", NodeID: "n", Protocol: "p",
 		Chain: model.LineCatalogueChain{Role: model.LineChainRoleSingle}, Security: value}
-	return row.Validate() == nil
+	return lineCatalogueProbeRowValid(row)
+}
+
+// lineCatalogueProbeRowValid is the SDK's row rule on a probe row that
+// carries one value to check. A probe row is far under the row's size
+// bound, so its fields are all the rule can refuse, and ValidateFields
+// checks them without encoding the row (a catalogue build checks one value
+// per line).
+func lineCatalogueProbeRowValid(row model.LineCatalogueRow) bool {
+	return row.ValidateFields() == nil
 }
 
 // lineCatalogueDDNSNameValid checks one name by the SDK's own row rule.
 func lineCatalogueDDNSNameValid(name string) bool {
 	row := model.LineCatalogueRow{LineUUID: lineCatalogueValidationUUID, LineHashID: "h", NodeID: "n", Protocol: "p",
 		Chain: model.LineCatalogueChain{Role: model.LineChainRoleSingle}, DDNSNames: []model.LineCatalogueDDNSName{{Name: name}}}
-	return row.Validate() == nil
+	return lineCatalogueProbeRowValid(row)
 }
 
 // lineCatalogueAddresses are the public addresses behind a line's hosts: an

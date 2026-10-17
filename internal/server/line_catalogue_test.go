@@ -919,12 +919,14 @@ func TestLineCatalogueOperatorCallNeedsVPNCoreRead(t *testing.T) {
 // 50 ms target.
 func TestLineCatalogueThousandLinesInOnePage(t *testing.T) {
 	const (
-		// Measured 2026-10-09 on darwin/arm64, go1.26.6: 253,050 allocations
-		// a cold read, 294,600 under -race -cover.
-		coldAllocsBound = 380_000
-		// Measured the same day: 230,750 allocations a warm read, 272,300
-		// under -race -cover.
-		warmAllocsBound = 346_000
+		// Measured 2026-10-16 on darwin/arm64, go1.26.9, once each row was
+		// encoded once and its owner check stopped rebuilding the same
+		// secret forms: 137,105 allocations a cold read, 148,095 under -race
+		// -cover (253,050 and 294,600 on 2026-10-09).
+		coldAllocsBound = 206_000
+		// Measured the same day: 114,796 allocations a warm read, 125,931
+		// under -race -cover (230,750 and 272,300 on 2026-10-09).
+		warmAllocsBound = 173_000
 		// Measured the same day: 778,587 bytes, about 779 a row.
 		pageBytesBound = 1_168_000
 	)

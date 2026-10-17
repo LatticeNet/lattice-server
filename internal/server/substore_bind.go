@@ -10,12 +10,16 @@ import (
 	"maps"
 	"net"
 	"regexp"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-sdk/strictjson"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -167,8 +171,10 @@ var (
 			"path": substoreBindOptPath, "headers": substoreBindOptHeaders, "method": substoreBindOptScalar}},
 		"h2-opts": {network: "h2", keys: map[string]substoreBindOptKind{
 			"path": substoreBindOptPath, "host": substoreBindOptHosts}},
+		// _grpc-type is the URI parsers' annotation of the template's mode
+		// parameter (gun by default), which the URI producer writes back.
 		"grpc-opts": {network: "grpc", keys: map[string]substoreBindOptKind{
-			"grpc-service-name": substoreBindOptScalar}},
+			"grpc-service-name": substoreBindOptScalar, "_grpc-type": substoreBindOptScalar}},
 		"xhttp-opts": {network: "xhttp", keys: map[string]substoreBindOptKind{
 			"path": substoreBindOptPath, "host": substoreBindOptHosts, "mode": substoreBindOptScalar,
 			"headers": substoreBindOptHeaders}},
@@ -389,8 +395,24 @@ type substoreNodeObject struct {
 }
 
 // parseSubstoreNodeObject reads one JSON object, refusing a duplicate key
-// and anything after the object.
+// and anything after the object. strictjson.Fields reads a well-formed
+// object with no duplicate key at any depth in one pass; whatever it
+// declines (a duplicate nested key, which this check allows, included)
+// takes the token walk below, which decides and words every error. For an
+// object Fields reads the two answer the same keys, in order, and the same
+// value bytes.
 func parseSubstoreNodeObject(raw json.RawMessage) (substoreNodeObject, error) {
+	if fields, ok := strictjson.Fields(raw); ok {
+		obj := substoreNodeObject{values: make(map[string]json.RawMessage, len(fields))}
+		if len(fields) > 0 {
+			obj.keys = make([]string, 0, len(fields))
+		}
+		for _, f := range fields {
+			obj.keys = append(obj.keys, f.Key)
+			obj.values[f.Key] = append(json.RawMessage(nil), f.Value...)
+		}
+		return obj, nil
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
 		return substoreNodeObject{}, errors.New("node is not a JSON object")
@@ -985,12 +1007,29 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in 
 	// carried are the fleet nodes whose placeholders a document keeps, bound
 	// or inert; inert are those excluded for an operational reason.
 	var carried, inert []model.SelectionPlanNode
-	for i, node := range plan.Nodes {
-		obj, err := parseSubstoreNodeObject(node.Node)
-		name := ""
-		if err == nil {
-			name = substoreBindNodeName(obj)
+	// The per-node work that reads nothing but the node and its line (the
+	// parse, the node checks, the credential, the encodings) runs in
+	// parallel; every decision that counts or orders nodes (clones, the
+	// line memo, exclusions, substitutions) stays in index order, and the
+	// entries and exclusions are sorted by index below, so the result is
+	// what binding the nodes one by one gives.
+	objs := make([]substoreNodeObject, len(plan.Nodes))
+	objErrs := make([]error, len(plan.Nodes))
+	names := make([]string, len(plan.Nodes))
+	substoreBindEach(len(plan.Nodes), func(i int) {
+		objs[i], objErrs[i] = parseSubstoreNodeObject(plan.Nodes[i].Node)
+		if objErrs[i] == nil {
+			names[i] = substoreBindNodeName(objs[i])
 		}
+	})
+	type pending struct {
+		index int
+		line  *substoreBindLine
+		clone int
+	}
+	var checks []pending
+	for i, node := range plan.Nodes {
+		obj, err, name := objs[i], objErrs[i], names[i]
 		if node.Provider {
 			if err != nil {
 				exclude(i, "", "", identityLinkExclusion{reason: substoreBindRejectedPrefix + "node"})
@@ -1030,25 +1069,51 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in 
 			exclude(i, node.LineUUID, name, identityLinkExclusion{reason: substoreBindRejectedPrefix + "node"})
 			continue
 		}
-		if field := substoreBindCheckNode(node.Node, obj, node, line); field != "" {
-			exclude(i, node.LineUUID, name, identityLinkExclusion{reason: substoreBindRejectedPrefix + field})
+		checks = append(checks, pending{index: i, line: line, clone: clones[node.LineUUID]})
+	}
+	failed := make([]string, len(checks))
+	substoreBindEach(len(checks), func(k int) {
+		i := checks[k].index
+		failed[k] = substoreBindCheckNode(plan.Nodes[i].Node, objs[i], plan.Nodes[i], checks[k].line)
+	})
+	for k, p := range checks {
+		i, node := p.index, plan.Nodes[p.index]
+		if failed[k] != "" {
+			exclude(i, node.LineUUID, names[i], identityLinkExclusion{reason: substoreBindRejectedPrefix + failed[k]})
 			continue
 		}
-		server, _ := obj.string("server")
-		validated = append(validated, candidate{index: i, node: node, obj: obj, line: line, entry: substoreBindEntry{
-			Index: i, LineUUID: node.LineUUID, Name: name, Label: line.label, NodeID: line.row.NodeID,
-			Protocol: line.row.Protocol, Server: server, Port: line.template.Port, Clone: clones[node.LineUUID]}})
+		server, _ := objs[i].string("server")
+		validated = append(validated, candidate{index: i, node: node, obj: objs[i], line: p.line, entry: substoreBindEntry{
+			Index: i, LineUUID: node.LineUUID, Name: names[i], Label: p.line.label, NodeID: p.line.row.NodeID,
+			Protocol: p.line.row.Protocol, Server: server, Port: p.line.template.Port, Clone: p.clone}})
 	}
+	type boundNode struct {
+		obj     substoreNodeObject
+		err     error
+		encoded json.RawMessage
+		digest  string
+	}
+	boundNodes := make([]boundNode, len(validated))
+	substoreBindEach(len(validated), func(k int) {
+		v := validated[k]
+		if v.line.exclude.reason != "" {
+			return
+		}
+		b := &boundNodes[k]
+		if b.obj, b.err = substoreBindNodeCredential(v.obj, v.node, v.line); b.err == nil {
+			b.encoded = b.obj.encode()
+			b.digest = substoreBindEntryDigest(b.obj)
+		}
+	})
 	substitutions := map[string]string{}
 	placed := map[string]substoreBindPlaced{}
-	for _, v := range validated {
+	for k, v := range validated {
 		if v.line.exclude.reason != "" {
 			exclude(v.index, v.node.LineUUID, v.entry.Name, v.line.exclude)
 			inert = append(inert, v.node)
 			continue
 		}
-		boundObj, err := substoreBindNodeCredential(v.obj, v.node, v.line)
-		if err != nil {
+		if boundNodes[k].err != nil {
 			exclude(v.index, v.node.LineUUID, v.entry.Name, identityLinkExclusion{reason: identityLineTemplateUnusable})
 			inert = append(inert, v.node)
 			continue
@@ -1058,8 +1123,8 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in 
 			placed[placeholder] = substoreBindPlaced{node: v.node, line: v.line}
 		}
 		carried = append(carried, v.node)
-		bound[v.index] = boundObj.encode()
-		v.entry.Digest = substoreBindEntryDigest(boundObj)
+		bound[v.index] = boundNodes[k].encoded
+		v.entry.Digest = boundNodes[k].digest
 		result.Entries = append(result.Entries, v.entry)
 	}
 	sort.SliceStable(result.Entries, func(i, j int) bool { return result.Entries[i].Index < result.Entries[j].Index })
@@ -1098,6 +1163,80 @@ func substoreBindPlan(plan model.SelectionPlan, u VpnUser, c *lineCatalogue, in 
 	}
 	return result
 }
+
+// substoreBindHelpers bounds, process-wide, the goroutines substoreBindEach
+// starts beside its callers: a bind or a catalogue build takes a token per
+// helper and never waits for one, so K concurrent calls run their own
+// goroutines plus at most eight helpers between them instead of eight each.
+var substoreBindHelpers = make(chan struct{}, 8)
+
+// substoreBindEach calls fn(i) for every i in [0, n), spread over the
+// calling goroutine and up to seven helpers (fewer under a lower GOMAXPROCS,
+// or while other calls hold the process-wide helper tokens) once n is large
+// enough to repay them, and returns when every call has returned. fn must
+// touch only what index i owns.
+//
+// A panic in fn reaches the caller as it would from the serial loop: the
+// worker that panicked recovers, the others stop taking indexes, and once
+// all have returned substoreBindEach panics again on the calling goroutine
+// with the first value. The per-node input is plugin-controlled JSON, and a
+// panic left on a helper goroutine would end the core process instead of
+// failing one request through net/http's per-connection recover.
+func substoreBindEach(n int, fn func(i int)) {
+	workers := min(runtime.GOMAXPROCS(0), 8)
+	if n < 128 || workers < 2 {
+		for i := 0; i < n; i++ {
+			fn(i)
+		}
+		return
+	}
+	const block = 32
+	var next atomic.Int64
+	var first atomic.Pointer[substoreBindPanic]
+	work := func() {
+		defer func() {
+			if v := recover(); v != nil {
+				first.CompareAndSwap(nil, &substoreBindPanic{value: v})
+				next.Store(int64(n))
+			}
+		}()
+		for {
+			start := int(next.Add(block)) - block
+			if start >= n {
+				return
+			}
+			for i := start; i < min(start+block, n); i++ {
+				fn(i)
+			}
+		}
+	}
+	var wg sync.WaitGroup
+helpers:
+	for w := 1; w < workers; w++ {
+		select {
+		case substoreBindHelpers <- struct{}{}:
+		default:
+			break helpers
+		}
+		wg.Add(1)
+		go func() {
+			defer func() {
+				<-substoreBindHelpers
+				wg.Done()
+			}()
+			work()
+		}()
+	}
+	work()
+	wg.Wait()
+	if p := first.Load(); p != nil {
+		panic(p.value)
+	}
+}
+
+// substoreBindPanic carries a recovered panic value from a worker to the
+// caller of substoreBindEach.
+type substoreBindPanic struct{ value any }
 
 // substoreBindDocumentRefusal is why a document plan cannot be served, or
 // "": the first exclusion that is not operational, a placeholder count that

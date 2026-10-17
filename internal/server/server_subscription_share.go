@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-sdk/strictjson"
 	"github.com/LatticeNet/lattice-server/internal/proxycore"
 )
 
@@ -659,6 +660,78 @@ func (s *Server) invalidateSharesForSource(pluginID, subscriptionID string) {
 	}
 }
 
+// pluginRenderReply is the part of a plugin's render reply core reads.
+type pluginRenderReply struct {
+	Content     string `json:"content"`
+	ContentType string `json:"content_type"`
+	// Target is the client the plugin rendered for, once it says. The core
+	// labels the response from it only after checking it against the
+	// bounded target set.
+	Target string `json:"target"`
+	// Plan is a fleet-bound record's selection plan, in place of Content
+	// (substore_bind_serve.go).
+	Plan json.RawMessage `json:"plan"`
+	// Headers are the response headers the record asks for, which
+	// substoreBindRendered puts through the allow-list.
+	Headers map[string]string `json:"headers"`
+}
+
+// decodePluginRenderReply is json.Unmarshal of a render reply into
+// pluginRenderReply, through decodeKnownMembers (a fleet plan is most of a
+// megabyte).
+func decodePluginRenderReply(out []byte) (pluginRenderReply, error) {
+	var reply pluginRenderReply
+	if decodeKnownMembers(out, map[string]any{"content": &reply.Content, "content_type": &reply.ContentType,
+		"target": &reply.Target, "plan": &reply.Plan, "headers": &reply.Headers}) {
+		return reply, nil
+	}
+	reply = pluginRenderReply{}
+	err := json.Unmarshal(out, &reply)
+	return reply, err
+}
+
+// decodeKnownMembers is json.Unmarshal of a plugin reply into the struct
+// whose fields targets names by their exact JSON names, for the plain case:
+// a reply strictjson reads in one pass, where a member named exactly as a
+// target is decoded into it (a string in one pass by strictjson.String, a
+// raw member copied once), and a member encoding/json would match to no
+// target is skipped as json.Unmarshal skips it. A reply carries up to
+// several MiB in one member (a snapshot, a plan, a converted document),
+// which json.Unmarshal validates, skips or unquotes, and copies in separate
+// passes. ok is false for anything else (a member matched only by case
+// folding, one that does not decode), and the caller decodes the reply with
+// json.Unmarshal from zero, which decides and words every error.
+func decodeKnownMembers(raw []byte, targets map[string]any) bool {
+	fields, ok := strictjson.Fields(raw)
+	if !ok {
+		return false
+	}
+	for _, f := range fields {
+		target, known := targets[f.Key]
+		if !known {
+			for name := range targets {
+				if strings.EqualFold(f.Key, name) {
+					return false
+				}
+			}
+			continue
+		}
+		switch t := target.(type) {
+		case *json.RawMessage:
+			*t = append(json.RawMessage(nil), f.Value...)
+		case *string:
+			if !strictjson.StringInto(f.Value, t) {
+				return false
+			}
+		default:
+			if json.Unmarshal(f.Value, target) != nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // renderShare asks the share's source for content. It never shows the source the
 // token and never lets it influence the response beyond the bytes and a content
 // type. coreUser is a core share's user as the handler resolved it
@@ -712,21 +785,8 @@ func (s *Server) renderShare(ctx context.Context, share model.SubscriptionShare,
 		if err != nil {
 			return renderedSubscription{}, err
 		}
-		var reply struct {
-			Content     string `json:"content"`
-			ContentType string `json:"content_type"`
-			// Target is the client the plugin rendered for, once it says. The
-			// core labels the response from it only after checking it against
-			// the bounded target set.
-			Target string `json:"target"`
-			// Plan is a fleet-bound record's selection plan, in place of
-			// Content (substore_bind_serve.go).
-			Plan json.RawMessage `json:"plan"`
-			// Headers are the response headers the record asks for, which
-			// substoreBindRendered puts through the allow-list.
-			Headers map[string]string `json:"headers"`
-		}
-		if err := json.Unmarshal(out, &reply); err != nil {
+		reply, err := decodePluginRenderReply(out)
+		if err != nil {
 			return renderedSubscription{}, fmt.Errorf("decode plugin render reply: %w", err)
 		}
 		plan, err := substoreDecodeRenderPlan(reply.Content, reply.Plan)

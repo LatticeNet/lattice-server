@@ -77,6 +77,12 @@ type subscriptionRefreshAuthority struct {
 	vpnGen uint64
 }
 
+// subscriptionRevalidationVersion is a snapshot's source version, or the
+// hash of its raw when it has none. A fleet-bound record's snapshot has
+// none: the Sub-Store plugin keeps its envelope digest inside raw, because a
+// schema 2 snapshot admits a source version only paired with the manifest
+// it hashes, so it is keyed on the hash of raw, which moves exactly when the
+// envelope does (TestFleetSnapshotIsKeyedOnTheHashOfRaw).
 func subscriptionRevalidationVersion(snapshot model.SubscriptionSnapshot) string {
 	if snapshot.SourceVersion != "" {
 		return snapshot.SourceVersion
@@ -468,8 +474,13 @@ func (s *Server) fetchSubscriptionSource(ctx context.Context, pluginID, subscrip
 		SourceVersion  string          `json:"source_version"`
 		SourceManifest json.RawMessage `json:"source_manifest"`
 	}
-	if err := json.Unmarshal(out, &reply); err != nil {
-		return model.SubscriptionSnapshot{}, fmt.Errorf("decode plugin fetch reply: %w", err)
+	// The reply carries the snapshot as a string of up to several MiB.
+	if !decodeKnownMembers(out, map[string]any{"raw": &reply.Raw, "userinfo": &reply.Userinfo,
+		"source_version": &reply.SourceVersion, "source_manifest": &reply.SourceManifest}) {
+		reply.Raw, reply.Userinfo, reply.SourceVersion, reply.SourceManifest = "", "", "", nil
+		if err := json.Unmarshal(out, &reply); err != nil {
+			return model.SubscriptionSnapshot{}, fmt.Errorf("decode plugin fetch reply: %w", err)
+		}
 	}
 	if reply.Raw == "" {
 		// An empty fetch is a failure, not a subscription with no nodes. Accepting

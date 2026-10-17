@@ -486,11 +486,7 @@ func (s *Server) callRuntimePluginService(ctx context.Context, pluginID, service
 	if budget == nil {
 		budget = s.pluginMethodBudget(pluginID, service, method)
 	}
-	body, err := json.Marshal(struct {
-		Service string          `json:"service"`
-		Method  string          `json:"method"`
-		Payload json.RawMessage `json:"payload,omitempty"`
-	}{Service: service, Method: method, Payload: payload})
+	body, err := plugin.EncodeServiceCall(service, method, payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal plugin call payload: %w", err)
 	}

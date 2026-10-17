@@ -121,6 +121,11 @@ type Options struct {
 	// PluginRuntimePool controls persistent stdio-json-v2 worker capacity and
 	// retirement. Nil uses the system runner's safe host defaults.
 	PluginRuntimePool *plugin.SystemPoolConfig
+	// PluginUIDs, when set, runs each system plugin child as its own uid
+	// from this range (design 30, LATTICE_PLUGIN_UID_BASE). It needs
+	// PluginRuntimeDir: New refuses one without the other. Nil keeps
+	// children on the server's uid.
+	PluginUIDs *plugin.PluginUIDRange
 	// PublicURL is the externally-reachable base URL of this server (scheme +
 	// host, no trailing slash), used to build the OIDC redirect URL. Required
 	// for SSO login; empty disables the OIDC start/callback flow. It is also the
@@ -688,6 +693,12 @@ func New(opts Options) (*Server, error) {
 			return nil, fmt.Errorf("configure plugin runtime: %w", err)
 		}
 	}
+	// Per-plugin uids apply only to the system runner. Without a runtime dir
+	// no plugin child runs at all, and an operator who set the base believes
+	// isolation is on, so the combination is refused rather than ignored.
+	if opts.PluginUIDs != nil && strings.TrimSpace(opts.PluginRuntimeDir) == "" {
+		return nil, errors.New("configure plugin runtime: LATTICE_PLUGIN_UID_BASE is set but LATTICE_PLUGIN_RUNTIME_DIR is not; per-plugin uids apply only to the system runner, so set the runtime dir or unset the base")
+	}
 	if opts.Logger == nil {
 		opts.Logger = log.Default()
 	}
@@ -862,9 +873,13 @@ func New(opts Options) (*Server, error) {
 			// What each plugin process used, read when it exits, for the
 			// System page's plugins table (metrics.db).
 			ProcessObserver: telemetry.ObservePluginProcess,
+			PluginUIDs:      opts.PluginUIDs,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("configure plugin runtime: %w", err)
+		}
+		if opts.PluginUIDs != nil {
+			s.logger.Printf("plugin runtime: plugin children run as per-plugin uids %s with no supplementary groups", opts.PluginUIDs)
 		}
 		s.pluginRuntime = plugin.NewRuntimeManagerWithOptions(plugin.RuntimeManagerOptions{
 			Services: s.pluginHostServices(),

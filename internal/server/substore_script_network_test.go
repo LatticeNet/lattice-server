@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -169,6 +171,76 @@ func TestSubstoreScriptNetworkRefusalBody(t *testing.T) {
 	var raw map[string]map[string]json.RawMessage
 	if err := json.Unmarshal(refusal.op.Body, &raw); err != nil || raw["error"]["record"] != nil {
 		t.Fatalf("a draft's body names a record: %s", refusal.op.Body)
+	}
+}
+
+// scriptNetworkRefusalSamplesFile holds refusals as core words them.
+// tools/tsgen publishes it in the Sub-Store UI's core-types.ts, where the
+// UI's parser reads every message back (scriptNetwork.test.ts there): the
+// bridge relays a host error's message and code only, so the UI reads the
+// record and the step out of this sentence, and a change of wording here
+// has to fail on both sides at once.
+const scriptNetworkRefusalSamplesFile = "testdata/script_network_refusals.json"
+
+type scriptNetworkRefusalSample struct {
+	Name     string                     `json:"name"`
+	Rendered string                     `json:"rendered"`
+	Record   string                     `json:"record"`
+	Step     *substoreScriptNetworkStep `json:"step"`
+	Message  string                     `json:"message"`
+}
+
+// TestScriptNetworkRefusalSamples holds every sample to the refusal core
+// builds for it: the message byte for byte, the record the body names (the
+// holder of the step, else the rendered record) and the step. The samples
+// cover each shape a message takes: the rendered record's own step, a
+// member's step, a draft, no step found, and ids with quotes, spaces and
+// CJK, which %q escapes.
+func TestScriptNetworkRefusalSamples(t *testing.T) {
+	raw, err := os.ReadFile(scriptNetworkRefusalSamplesFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var samples []scriptNetworkRefusalSample
+	if err := decoder.Decode(&samples); err != nil {
+		t.Fatal(err)
+	}
+	shapes := map[string]bool{}
+	for _, sample := range samples {
+		holder := ""
+		if sample.Step != nil {
+			holder = sample.Record
+		}
+		refusal := newSubstoreScriptNetworkRefusal(sample.Rendered, holder, sample.Step)
+		if refusal.Error() != sample.Message {
+			t.Errorf("%s: core words it\n  %s\nbut the sample says\n  %s", sample.Name, refusal.Error(), sample.Message)
+			continue
+		}
+		got := decodeScriptNetworkRefusal(t, refusal)
+		if got.Record != sample.Record || got.Message != sample.Message || (got.Step == nil) != (sample.Step == nil) ||
+			(got.Step != nil && *got.Step != *sample.Step) {
+			t.Errorf("%s: the body says record %q step %+v, the sample record %q step %+v", sample.Name, got.Record, got.Step, sample.Record, sample.Step)
+		}
+		switch {
+		case sample.Step == nil:
+			shapes["no step"] = true
+		case sample.Rendered == "":
+			shapes["draft"] = true
+		case sample.Record != sample.Rendered:
+			shapes["member"] = true
+		default:
+			shapes["own"] = true
+		}
+		if strings.ContainsAny(sample.Record+sample.Rendered, "\" ") {
+			shapes["escaped"] = true
+		}
+	}
+	for _, shape := range []string{"own", "member", "draft", "no step", "escaped"} {
+		if !shapes[shape] {
+			t.Errorf("no sample covers %s", shape)
+		}
 	}
 }
 

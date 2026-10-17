@@ -56,6 +56,18 @@ func TestCoreTypesFollowTheJSONTags(t *testing.T) {
 			t.Fatalf("output lacks %q", want)
 		}
 	}
+	// The refusal's messages come with it, as core words them, so the UI's
+	// parser reads core's own sentences.
+	for _, want := range []string{
+		"export interface ScriptNetworkRefusalSample {\n  name: string;\n  rendered: string;\n  record: string;\n  step?: ScriptNetworkStep;\n  message: string;\n}",
+		"export const scriptNetworkRefusalSamples: ScriptNetworkRefusalSample[] = [\n",
+		`"record": "paid-extra",`,
+		`of record \"paid-extra\" is the first step in that render`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output lacks %q", want)
+		}
+	}
 	// A field tagged "-" never reaches the wire, so never the declaration.
 	if !strings.Contains(out, "export interface BindLine {\n  line_uuid?: string;\n  name?: string;\n  reason?: string;\n}") {
 		t.Fatal("BindLine is not its three wire fields")
@@ -68,6 +80,29 @@ func TestTSNameDropsThePackagePrefix(t *testing.T) {
 	} {
 		if got := tsName(goName); got != want {
 			t.Fatalf("tsName(%q) = %q, want %q", goName, got, want)
+		}
+	}
+}
+
+// A samples file that is missing, or carries a field the declaration does
+// not, fails the generator rather than publishing a constant the UI's type
+// does not describe.
+func TestScriptNetworkSamplesDecodeStrictly(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := scriptNetworkSamples(filepath.Join(dir, "missing.json")); err == nil {
+		t.Fatal("a missing samples file was accepted")
+	}
+	for name, body := range map[string]string{
+		"extra field": `[{"name":"a","rendered":"r","record":"r","message":"m","detail":"x"}]`,
+		"empty":       `[]`,
+		"no message":  `[{"name":"a","rendered":"r","record":"r"}]`,
+	} {
+		path := filepath.Join(dir, "samples.json")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := scriptNetworkSamples(path); err == nil {
+			t.Fatalf("%s: accepted", name)
 		}
 	}
 }

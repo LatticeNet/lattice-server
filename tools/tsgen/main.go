@@ -2,10 +2,11 @@
 // Sub-Store UI reads (design 28 S2): the bind preview, its entries and
 // exclusions, the plan status row, the plan proposal and the plan itself,
 // the shares list entry, and the error object of the
-// fleet_script_network_unavailable refusal. It reads the Go source of internal/server and
-// of the SDK's model package and follows each field's JSON tag, so the UI's
-// types are the server's wire, not a hand copy of it: a hand copy is how an
-// earlier draft lost label, node_id and clone.
+// fleet_script_network_unavailable refusal, with that refusal's messages as
+// core words them (testdata/script_network_refusals.json). It reads the Go
+// source of internal/server and of the SDK's model package and follows each
+// field's JSON tag, so the UI's types are the server's wire, not a hand copy
+// of it: a hand copy is how an earlier draft lost label, node_id and clone.
 //
 //	go run ./tools/tsgen -ref <server commit> -o core-types.ts
 //
@@ -15,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -173,7 +175,77 @@ func generate(serverDir, modelDir, ref string) ([]byte, error) {
 		b.WriteString("\n")
 		b.WriteString(g.decls[key])
 	}
+	samples, err := scriptNetworkSamples(filepath.Join(serverDir, filepath.FromSlash(scriptNetworkSamplesFile)))
+	if err != nil {
+		return nil, err
+	}
+	b.WriteString("\n")
+	b.WriteString(samples)
 	return b.Bytes(), nil
+}
+
+// scriptNetworkSamplesFile holds fleet_script_network_unavailable refusals
+// as core words them, relative to the server package. The plugin bridge
+// relays a host error's message and code only, never the typed body, so the
+// UI reads the record and the step back out of the message. Publishing the
+// samples beside the types puts core's own wording in front of the UI's
+// parser: the server's TestScriptNetworkRefusalSamples holds each message
+// to the refusal core builds, and the UI's test parses each one, so a change
+// of wording fails both sides.
+const scriptNetworkSamplesFile = "testdata/script_network_refusals.json"
+
+// scriptNetworkSample is one entry of the samples file. Its fields are the
+// declaration written for it below; the file decodes strictly into it.
+type scriptNetworkSample struct {
+	Name     string `json:"name"`
+	Rendered string `json:"rendered"`
+	Record   string `json:"record"`
+	Step     *struct {
+		Position int    `json:"position"`
+		Type     string `json:"type"`
+	} `json:"step,omitempty"`
+	Message string `json:"message"`
+}
+
+// scriptNetworkSamples is the samples file as a TypeScript declaration and
+// constant.
+func scriptNetworkSamples(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read the refusal samples: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	var samples []scriptNetworkSample
+	if err := decoder.Decode(&samples); err != nil {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
+	if len(samples) == 0 {
+		return "", fmt.Errorf("%s holds no sample", path)
+	}
+	for i, sample := range samples {
+		if sample.Name == "" || sample.Message == "" {
+			return "", fmt.Errorf("%s: sample %d has no name or no message", path, i)
+		}
+	}
+	var out bytes.Buffer
+	encoder := json.NewEncoder(&out)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(samples); err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	b.WriteString("// A fleet_script_network_unavailable refusal as core words it, from\n")
+	b.WriteString("// internal/server/" + scriptNetworkSamplesFile + ". The plugin bridge relays a\n")
+	b.WriteString("// host error's message and code only, so the UI reads the record and the step\n")
+	b.WriteString("// back out of the message; the server's TestScriptNetworkRefusalSamples holds\n")
+	b.WriteString("// each message to the refusal core builds.\n")
+	b.WriteString("export interface ScriptNetworkRefusalSample {\n  name: string;\n  rendered: string;\n  record: string;\n  step?: ScriptNetworkStep;\n  message: string;\n}\n\n")
+	b.WriteString("export const scriptNetworkRefusalSamples: ScriptNetworkRefusalSample[] = ")
+	b.WriteString(strings.TrimRight(out.String(), "\n"))
+	b.WriteString(";\n")
+	return b.String(), nil
 }
 
 // tsName is the TypeScript name of a type outside the roots: the Go name

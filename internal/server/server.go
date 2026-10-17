@@ -5174,7 +5174,8 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request, p principal) {
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "kv.put", Scope: "kv:write", Metadata: map[string]string{"bucket": req.Bucket, "key": req.Key}})
 		if stored, ok := s.store.KVEntry(entry.Bucket, entry.Key); ok {
-			entry = stored // carries the updated_at the store stamped
+			// The store's stamped times only; the body stays this caller's write.
+			entry.UpdatedAt = stored.UpdatedAt
 		}
 		writeJSON(w, http.StatusOK, entry)
 	default:
@@ -5249,7 +5250,8 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request, p principa
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "static.put", Scope: "static:write", Metadata: map[string]string{"bucket": req.Bucket, "path": clean}})
 		if stored, ok := s.store.StaticObject(obj.Bucket, obj.Path); ok {
-			obj = stored // carries the updated_at the store stamped
+			// The store's stamped times only; the body stays this caller's write.
+			obj.UpdatedAt = stored.UpdatedAt
 		}
 		writeJSON(w, http.StatusOK, obj)
 	default:
@@ -5917,7 +5919,8 @@ func (s *Server) handleNotifyChannels(w http.ResponseWriter, r *http.Request, p 
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: action, Scope: "notify:admin", Metadata: metadata})
 		if stored, ok := s.store.NotifyChannel(channel.ID); ok {
-			channel = stored // carries the created_at and updated_at the store stamped
+			// The store's stamped times only; the body stays this caller's write.
+			channel.CreatedAt, channel.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
 		}
 		health, _ := s.store.NotifyChannelHealth(channel.ID)
 		writeJSON(w, http.StatusOK, toNotifyChannelView(channel, health, opts, s.now()))
@@ -6022,7 +6025,8 @@ func (s *Server) handleNotifyRules(w http.ResponseWriter, r *http.Request, p pri
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "notify.rule.upsert", Scope: "notify:admin", Metadata: metadata})
 		if stored, ok := s.store.NotifyRule(rule.ID); ok {
-			rule = stored // carries the created_at and updated_at the store stamped
+			// The store's stamped times only; the body stays this caller's write.
+			rule.CreatedAt, rule.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
 		}
 		writeJSON(w, http.StatusOK, toNotifyRuleView(rule, opts))
 	default:
@@ -6517,7 +6521,8 @@ func (s *Server) handleDDNS(w http.ResponseWriter, r *http.Request, p principal)
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "ddns:admin", Metadata: map[string]string{"ddns_id": req.ID, "provider": req.Provider, "record_type": ddnsRecordTypeLabel(req), "comment_mode": ddnsCommentModeLabel(req)}})
 		if stored, ok := s.store.DDNSProfile(req.ID); ok {
-			req = stored // carries the created_at and updated_at the store stamped
+			// The store's stamped times only; the body stays this caller's write.
+			req.CreatedAt, req.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
 		}
 		view := toDDNSView(req)
 		view.Warnings = s.ddnsSaveWarnings(r.Context(), req)
@@ -7894,7 +7899,8 @@ func (s *Server) handleTunnels(w http.ResponseWriter, r *http.Request, p princip
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "tunnel.create", Scope: "tunnel:admin", Metadata: map[string]string{"tunnel_id": req.ID}})
 		if stored, ok := s.store.Tunnel(req.ID); ok {
-			req = stored // carries the created_at and updated_at the store stamped
+			// The store's stamped times only; the body stays this caller's write.
+			req.CreatedAt, req.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
 		}
 		writeJSON(w, http.StatusOK, req)
 	default:

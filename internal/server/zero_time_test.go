@@ -2,8 +2,15 @@ package server
 
 import (
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -161,6 +168,10 @@ func TestCreateAndUpdateAnswerWithTheStoredTimes(t *testing.T) {
 		{"/api/storage/buckets?kind=kv", `{"name":"zero","display_name":"Zero"}`, []string{"created_at", "updated_at"}},
 		{"/api/notify/channels", `{"id":"nc-zero","name":"Zero","kind":"telegram","config":{"token":"t","chat_id":"1"}}`, []string{"created_at", "updated_at"}},
 		{"/api/tunnels", `{"name":"zero","node_id":"n1","tunnel_id":"tun-zero","ingress":[{"hostname":"zero.example.com","service":"http://localhost:8088"}]}`, []string{"created_at", "updated_at"}},
+		{"/api/notify/rules", `{"id":"r-zero","name":"Zero","event_types":["node.offline"],"channel_ids":["nc-zero"]}`, []string{"created_at", "updated_at"}},
+		{"/api/notify/webhooks", `{"name":"Zero","event_type":"zero.event","title_template":"t"}`, []string{"created_at", "updated_at"}},
+		{"/api/storage/bindings?kind=kv", `{"bucket":"zero","hostname":"zero.example.com"}`, []string{"created_at", "updated_at"}},
+		{"/api/storage/tokens?kind=kv", `{"name":"zero","access":"admin","buckets":["zero"]}`, []string{"created_at", "updated_at"}},
 	} {
 		obj, _ := readZeroTimeBody(t, doJSON(t, handler, http.MethodPost, tc.path, tc.body, cookies, csrf), "POST "+tc.path).(map[string]any)
 		assertStampedTimes(t, "POST "+tc.path, obj, tc.keys...)
@@ -179,4 +190,87 @@ func TestCreateAndUpdateAnswerWithTheStoredTimes(t *testing.T) {
 		`{"name":"cf","node_id":"n1","provider":"cloudflare","domains":["a.example.com"],"cf_api_token":"secret","enable_ipv4":true}`, ddnsCookies, ddnsCSRF), "POST /api/ddns").(map[string]any)
 	assertStampedTimes(t, "POST /api/ddns", profile, "created_at", "updated_at")
 	assertAbsentKeys(t, "a DDNS profile that has never run", profile, "last_run_at")
+
+	_, invHandler, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	invCookies, invCSRF := loginSession(t, invHandler)
+	policy, _ := readZeroTimeBody(t, doJSON(t, invHandler, http.MethodPost, "/api/nodes/agent-updates", `{
+		"node_id":"node-a","enabled":true,"target_version":"0.2.0",
+		"binary_url":"https://downloads.example.com/lattice-agent-linux-amd64","sha256":"`+agentUpdateTestSHA+`",
+		"install_path":"/usr/local/bin/lattice-agent","service_name":"lattice-agent.service"
+	}`, invCookies, invCSRF), "POST /api/nodes/agent-updates").(map[string]any)
+	assertStampedTimes(t, "agent update policy", policy, "created_at", "updated_at")
+	assertAbsentKeys(t, "a policy nothing has planned or applied", policy, "last_planned_at", "last_applied_at")
+}
+
+// zeroTimeOmitemptyAllowed are the value time.Time members of the API views
+// that keep omitempty on purpose. omitempty never omits a time.Time, so on
+// any other member it is a bug that ships year 1.
+var zeroTimeOmitemptyAllowed = map[string]string{
+	// The wireguard plugin UI tells a never-reported node from an offline one
+	// only by this view's year 1, and the view carries no status to read
+	// instead. It moves when the view gains one and that UI reads it.
+	"wireGuardNetworkView.LastSeen": "wireguard plugin UI reads the zero time as never reported",
+}
+
+// TestNoViewTimeIsOmitempty reads the source of the packages whose types the
+// API serves and fails on any value time.Time tagged omitempty without
+// omitzero, so the next optional instant cannot reintroduce the leak.
+func TestNoViewTimeIsOmitempty(t *testing.T) {
+	fset := token.NewFileSet()
+	seen := map[string]bool{}
+	for _, dir := range []string{".", "../plugin", "../metricsdb"} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				continue
+			}
+			file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ast.Inspect(file, func(n ast.Node) bool {
+				spec, ok := n.(*ast.TypeSpec)
+				if !ok {
+					return true
+				}
+				st, ok := spec.Type.(*ast.StructType)
+				if !ok {
+					return true
+				}
+				for _, field := range st.Fields.List {
+					sel, ok := field.Type.(*ast.SelectorExpr)
+					if !ok || sel.Sel.Name != "Time" || field.Tag == nil {
+						continue
+					}
+					if x, ok := sel.X.(*ast.Ident); !ok || x.Name != "time" {
+						continue
+					}
+					tag, _ := strconv.Unquote(field.Tag.Value)
+					opts := "," + reflect.StructTag(tag).Get("json") + ","
+					if !strings.Contains(opts, ",omitempty,") || strings.Contains(opts, ",omitzero,") {
+						continue
+					}
+					for _, fieldName := range field.Names {
+						member := spec.Name.Name + "." + fieldName.Name
+						seen[member] = true
+						if zeroTimeOmitemptyAllowed[member] == "" {
+							t.Errorf("%s (%s): omitempty never omits a time.Time, so an unset value ships as year 1; tag it omitzero",
+								member, fset.Position(field.Pos()))
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+	for member := range zeroTimeOmitemptyAllowed {
+		if !seen[member] {
+			t.Errorf("zeroTimeOmitemptyAllowed names %s, which is no longer an omitempty time.Time; drop the entry", member)
+		}
+	}
 }

@@ -244,7 +244,8 @@ func (s *Server) handleLogSources(w http.ResponseWriter, r *http.Request, p prin
 			},
 		})
 		if stored, ok := s.store.LogSource(ls.ID); ok {
-			ls = stored // carries the created_at and updated_at the store stamped
+			// The store's stamped times only; the body stays this caller's write.
+			ls.CreatedAt, ls.UpdatedAt = stored.CreatedAt, stored.UpdatedAt
 		}
 		writeJSON(w, http.StatusOK, ls)
 	default:

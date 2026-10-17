@@ -40,15 +40,64 @@ func errMonitorMethodChange(field string) error {
 }
 
 // validMonitorAlert reports whether alert is a policy a save may store.
+// down_and_degraded is refused on tls (validMonitorAlertFor).
 func validMonitorAlert(alert string) bool {
-	return alert == "" || alert == model.MonitorAlertDown || alert == model.MonitorAlertOff
+	switch alert {
+	case "", model.MonitorAlertDown, model.MonitorAlertOff, model.MonitorAlertDownAndDegraded:
+		return true
+	}
+	return false
 }
 
-// monitorPages reports whether a monitor's failures page: an operator check
-// whose alert policy is not off. Generated latency checks never page one
-// pair at a time; a path's degradation is judged on its rollups instead.
-func monitorPages(mon model.Monitor) bool {
-	return mon.ManagedBy == "" && mon.Alert != model.MonitorAlertOff
+// errMonitorAlert is the answer to a policy a save may not store.
+var errMonitorAlert = fmt.Errorf("alert must be %q, %q or %q", model.MonitorAlertDown, model.MonitorAlertDownAndDegraded, model.MonitorAlertOff)
+
+// errTLSDegraded is the answer to a degraded policy or thresholds on a tls
+// check, which measures a certificate, not latency.
+var errTLSDegraded = errors.New("a tls check measures a certificate, not latency: it takes neither the down_and_degraded alert nor degraded thresholds")
+
+// validMonitorAlertFor checks a policy and degraded thresholds for a check of
+// kind, and returns the thresholds' canonical form.
+func validMonitorAlertFor(kind, alert string, degraded *model.MonitorDegradedRule) (*model.MonitorDegradedRule, error) {
+	if !validMonitorAlert(alert) {
+		return nil, errMonitorAlert
+	}
+	if kind == model.MonitorTypeTLS && (alert == model.MonitorAlertDownAndDegraded || degraded != nil) {
+		return nil, errTLSDegraded
+	}
+	if err := model.ValidateDegradedRule(degraded); err != nil {
+		return nil, err
+	}
+	return model.CanonicalDegradedRule(degraded), nil
+}
+
+// degradedRulesEqual compares two stored (canonical) rules.
+func degradedRulesEqual(a, b *model.MonitorDegradedRule) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// degradedRuleSummary is a rule as an audit record names it: the fields that
+// differ from the defaults, or "default".
+func degradedRuleSummary(r *model.MonitorDegradedRule) string {
+	if r == nil {
+		return "default"
+	}
+	var parts []string
+	for _, f := range []struct {
+		name string
+		v    float64
+	}{
+		{"loss_percent", r.LossPercent}, {"loss_factor", r.LossFactor},
+		{"latency_factor", r.LatencyFactor}, {"latency_margin_ms", r.LatencyMarginMs},
+	} {
+		if f.v != 0 {
+			parts = append(parts, f.name+"="+strconv.FormatFloat(f.v, 'f', -1, 64))
+		}
+	}
+	return strings.Join(parts, ",")
 }
 
 // validMonitorTiming checks the interval and timeout a save stores.
@@ -143,6 +192,12 @@ func (s *Server) handleMonitorUpdate(w http.ResponseWriter, r *http.Request, p p
 	if slices.Contains(changed, "headers") {
 		// Names and secrecy only: a value never reaches an audit record.
 		meta["headers"] = monitorHeaderNames(stored.Headers)
+	}
+	if slices.Contains(changed, "alert") {
+		meta["alert"] = stored.Alert
+	}
+	if slices.Contains(changed, "degraded") {
+		meta["degraded"] = degradedRuleSummary(stored.Degraded)
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
@@ -265,14 +320,23 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	}
 	if req.Alert != nil {
 		alert := strings.TrimSpace(*req.Alert)
-		if !validMonitorAlert(alert) {
-			return model.Monitor{}, nil, false, fmt.Errorf("alert must be %q or %q", model.MonitorAlertDown, model.MonitorAlertOff)
+		if _, err := validMonitorAlertFor(mon.Type, alert, nil); err != nil {
+			return model.Monitor{}, nil, false, err
 		}
 		if alert == "" {
 			alert = model.MonitorAlertDown
 		}
 		note("alert", alert != mon.Alert)
 		next.Alert = alert
+	}
+	if req.Degraded != nil {
+		// An object replaces the stored thresholds whole: {} resets them.
+		rule, err := validMonitorAlertFor(mon.Type, "", req.Degraded)
+		if err != nil {
+			return model.Monitor{}, nil, false, err
+		}
+		note("degraded", !degradedRulesEqual(rule, mon.Degraded))
+		next.Degraded = rule
 	}
 	if req.AlertAfter != nil {
 		if *req.AlertAfter < 1 || *req.AlertAfter > model.MonitorAlertAfterMax {

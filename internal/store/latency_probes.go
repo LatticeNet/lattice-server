@@ -67,6 +67,10 @@ func cloneLatencyProbeConfig(cfg model.LatencyProbeConfig) model.LatencyProbeCon
 	cfg.ExcludeTargets = slices.Clone(cfg.ExcludeTargets)
 	cfg.DisabledPairs = slices.Clone(cfg.DisabledPairs)
 	cfg.SourceMethods = maps.Clone(cfg.SourceMethods)
+	if cfg.Degraded != nil {
+		rule := *cfg.Degraded
+		cfg.Degraded = &rule
+	}
 	return cfg
 }
 
@@ -124,6 +128,9 @@ func (s *Store) SyncManagedMonitors(managedBy string, desired []model.Monitor, n
 				return ManagedMonitorChanges{}, err
 			}
 		}
+	}
+	for _, id := range deletes {
+		s.deletePathDegradedMemLocked(func(p MonitorPair) bool { return p.MonitorID == id })
 	}
 	prior := make(map[string]*model.Monitor)
 	remember := func(id string) {

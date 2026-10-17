@@ -193,10 +193,14 @@ type monitorView struct {
 	// PausedNodeIDs are sources that keep their history but do not run the
 	// monitor now. Their pairs are left out of Latest.
 	PausedNodeIDs []string `json:"paused_node_ids,omitempty"`
-	// Alert is the alert policy, "down" or "off", and AlertAfter the failed
-	// runs in a row that page and read as down.
+	// Alert is the alert policy in force, "down", "down_and_degraded" or
+	// "off" (a generated check's is the path set's), and AlertAfter the
+	// failed runs in a row that page and read as down.
 	Alert      string `json:"alert"`
 	AlertAfter int    `json:"alert_after"`
+	// Degraded is an operator check's stored degraded thresholds, absent
+	// when every one is the default (design 29 D13).
+	Degraded *model.MonitorDegradedRule `json:"degraded,omitempty"`
 	// Version is what an edit names (POST /api/monitors/update).
 	Version   int64     `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
@@ -249,13 +253,14 @@ func toMonitorLatestView(l store.MonitorLatest) monitorLatestView {
 	return v
 }
 
-// monitorAlertOf is the policy a monitor follows: generated checks never
-// page, and an empty policy is the default.
+// monitorAlertOf is the policy an operator's check follows, an empty one
+// read as the default. A generated check's is the path set's, which
+// monitorViews fills in.
 func monitorAlertOf(m model.Monitor) string {
-	if !monitorPages(m) {
+	if m.ManagedBy != "" {
 		return model.MonitorAlertOff
 	}
-	return model.MonitorAlertDown
+	return model.EffectiveMonitorAlert(m.Alert, false)
 }
 
 func toMonitorViews(in []model.Monitor) []monitorView {
@@ -268,7 +273,7 @@ func toMonitorViews(in []model.Monitor) []monitorView {
 			TargetNode: m.TargetNode, Packets: m.Packets, ExpectStatus: m.ExpectStatus,
 			Headers: redactMonitorHeaders(m.Headers), SecretsOrigin: m.SecretsOrigin,
 			Enabled: m.Enabled, ManagedBy: m.ManagedBy, PausedNodeIDs: m.PausedNodeIDs,
-			Alert: monitorAlertOf(m), AlertAfter: store.MonitorAlertAfter(m), Version: m.Version,
+			Alert: monitorAlertOf(m), AlertAfter: store.MonitorAlertAfter(m), Degraded: m.Degraded, Version: m.Version,
 			CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,
 			Latest: []monitorLatestView{},
 		})

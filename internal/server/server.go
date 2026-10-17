@@ -376,6 +376,9 @@ type Server struct {
 	// monitorPaths holds the paths matrix cache and the history pruning
 	// sweep's guard; see monitor_paths.go and monitor_settings.go.
 	monitorPaths monitorPathState
+	// pathDegraded is the degraded evaluator's state (design 29 D13,
+	// monitor_degraded.go).
+	pathDegraded pathDegradedState
 	// beacon holds the measurement beacon's in-memory state: each agent's
 	// latest report and egress address; see beacon.go.
 	beacon beaconRuntime
@@ -902,6 +905,7 @@ func New(opts Options) (*Server, error) {
 		s.startLineClientTemplateSync()
 		s.startLatencyProbeSync()
 		s.startMonitorHistoryPrune()
+		s.startPathDegradedEvaluator()
 		s.startPluginTaskScheduler()
 		s.startStateWriteSummary()
 		if s.selfmon != nil {
@@ -5411,10 +5415,13 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusBadRequest, errors.New("name and target (or target_node) are required"))
 			return
 		}
-		if !validMonitorAlert(req.Alert) {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("alert must be %q or %q", model.MonitorAlertDown, model.MonitorAlertOff))
+		req.Alert = strings.TrimSpace(req.Alert)
+		degraded, err := validMonitorAlertFor(req.Type, req.Alert, req.Degraded)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		req.Degraded = degraded
 		if req.Alert == "" {
 			req.Alert = model.MonitorAlertDown
 		}
@@ -5513,9 +5520,12 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		meta := map[string]string{"monitor_id": req.ID, "type": req.Type}
+		meta := map[string]string{"monitor_id": req.ID, "type": req.Type, "alert": req.Alert}
 		if req.TargetNode != "" {
 			meta["target_node"] = req.TargetNode
+		}
+		if req.Degraded != nil {
+			meta["degraded"] = degradedRuleSummary(req.Degraded)
 		}
 		if len(req.Headers) > 0 {
 			meta["headers"] = monitorHeaderNames(req.Headers)
@@ -5727,6 +5737,18 @@ func (s *Server) agentMonitorsFor(node model.Node, assigned []model.Monitor, now
 // agent would be handed them now, and secret header values removed.
 func (s *Server) monitorViews(monitors []model.Monitor, now time.Time) []monitorView {
 	views := toMonitorViews(monitors)
+	var pathSet *checkPolicy
+	for i, mon := range monitors {
+		if mon.ManagedBy != model.MonitorManagedLatency {
+			continue
+		}
+		if pathSet == nil {
+			cfg, _ := s.store.LatencyProbeConfig()
+			p := pathSetPolicy(cfg)
+			pathSet = &p
+		}
+		views[i].Alert, views[i].AlertAfter = pathSet.alert, pathSet.after
+	}
 	var targets *monitorTargets
 	for i, mon := range monitors {
 		if mon.TargetNode == "" || mon.ManagedBy != "" {
@@ -6197,17 +6219,17 @@ func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorRes
 		return
 	}
 	mon, _ := s.store.Monitor(current.MonitorID)
-	after := store.MonitorAlertAfter(mon)
+	policy := s.monitorPolicy(mon)
+	after := policy.after
 	if !current.Success && priorFailStreak != after-1 {
 		return
 	}
-	if !monitorPages(mon) {
-		// Latency probes do not page one pair at a time: a path from China
-		// drops probes routinely, and twenty targets would page twenty
-		// times. A degradation alert belongs to the incident path, judged
-		// on the pair's rollups (latencyRollupsFor) instead. A check whose
-		// alert policy is off never pages; the incident sweep closes what
-		// it had open when the policy changed.
+	if !policy.pagesDown() {
+		// Generated latency checks page only when the path set's policy
+		// says so (off by default): a path from China drops probes
+		// routinely, and twenty targets would page twenty times. A check
+		// whose alert policy is off never pages; the incident sweep closes
+		// what it had open when the policy changed.
 		return
 	}
 	if mon.ID == "" {

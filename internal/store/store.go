@@ -334,6 +334,10 @@ type Store struct {
 	loadedLastSeen map[string]time.Time
 	// testNow is the heartbeat clock in tests; nil means time.Now.
 	testNow func() time.Time
+	// testBeforePathDegradedWrite runs in PutPathDegradedRecord after the
+	// first existence check and before the bolt write, outside the lock, so
+	// a test can put a delete in that window. Tests only; set before use.
+	testBeforePathDegradedWrite func(MonitorPair)
 	// closed is set by the first Close. A later Close does nothing: the bolt
 	// sidecar is gone by then, so a write would put its domains in the JSON
 	// file. Guarded by mu.

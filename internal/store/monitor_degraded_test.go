@@ -235,9 +235,59 @@ func TestPathDegradedRecordWritesDoNotHoldTheStoreLock(t *testing.T) {
 	}
 }
 
-// Puts racing deletes of their monitor never leave a record behind: the
-// write checks again after it lands and takes back a record whose monitor a
-// delete removed meanwhile.
+// A delete that runs after a put's first existence check and before its
+// bolt write finds no record to remove, so the put must take its record back
+// once it lands. The seam puts the delete exactly in that window, for a
+// monitor delete and a node delete alike; without the second check the
+// record would outlive its pair.
+func TestPathDegradedRecordPutTakesBackAfterADeleteInTheWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		delete func(*Store) error
+	}{
+		{"monitor", func(s *Store) error { return s.DeleteMonitor("mon-a") }},
+		{"node", func(s *Store) error {
+			_, _, err := s.DeleteNode("node-a")
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := openHotStore(t, t.TempDir())
+			defer s.Close()
+			if err := s.UpsertNode(model.Node{ID: "node-a", Name: "node-a"}); err != nil {
+				t.Fatal(err)
+			}
+			seedMonitor(t, s, model.Monitor{ID: "mon-a", Type: model.MonitorTypeTCP, NodeIDs: []string{"node-a"}})
+			pair := MonitorPair{"mon-a", "node-a"}
+			ran := 0
+			s.testBeforePathDegradedWrite = func(got MonitorPair) {
+				ran++
+				if got != pair {
+					t.Errorf("seam pair = %+v", got)
+				}
+				if err := tc.delete(s); err != nil {
+					t.Error(err)
+				}
+				if recs, err := s.runtimeBoltHot.PathDegradedRecords(); err != nil || len(recs) != 0 {
+					t.Errorf("records before the write = %+v, %v", recs, err)
+				}
+			}
+			if err := s.PutPathDegradedRecord(pair, PathDegradedRecord{Reason: model.PathReasonDegradedLatency}); err != nil {
+				t.Fatal(err)
+			}
+			if ran != 1 {
+				t.Fatalf("seam ran %d times, want 1", ran)
+			}
+			if got, err := s.PathDegradedRecords(); err != nil || len(got) != 0 {
+				t.Fatalf("records after a delete in the window = %+v, %v", got, err)
+			}
+		})
+	}
+}
+
+// Puts racing deletes of their monitor, with no seam, never leave a record
+// behind either. This exercises the unlocked write under -race; the test
+// above is the one that pins the take-back.
 func TestPathDegradedRecordPutRacingAMonitorDelete(t *testing.T) {
 	s := openHotStore(t, t.TempDir())
 	defer s.Close()

@@ -94,7 +94,7 @@ func (s *Store) PutPathDegradedRecord(pair MonitorPair, rec PathDegradedRecord) 
 		return err
 	}
 	s.mu.Lock()
-	hot, exists := s.runtimeBoltHot, s.monitorPairExistsLocked(pair)
+	hot, exists, beforeWrite := s.runtimeBoltHot, s.monitorPairExistsLocked(pair), s.testBeforePathDegradedWrite
 	if hot == nil {
 		defer s.mu.Unlock()
 		if !exists {
@@ -109,6 +109,9 @@ func (s *Store) PutPathDegradedRecord(pair MonitorPair, rec PathDegradedRecord) 
 	s.mu.Unlock()
 	if !exists {
 		return nil
+	}
+	if beforeWrite != nil {
+		beforeWrite(pair)
 	}
 	if err := hot.PutPathDegradedRecord(pair, rec); err != nil {
 		return err

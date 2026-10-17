@@ -105,19 +105,17 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 	// one of the node's pinned ones (design 29 D12), as seen here.
 	s.noteBeaconEgress(node.ID, s.clientIP(r))
 	prefetch := s.agentPrefetchPlanFor(node, false).config
-	writeJSON(w, http.StatusOK, agentConfigResponse{
-		AgentConfig: model.AgentConfig{
-			LatticeIdentityUUID: node.LatticeIdentityUUID,
-			Debug: model.AgentDebugConfig{
-				Enabled:       node.AgentDebug.Enabled,
-				Collect:       collect,
-				MaxLineBytes:  defaultAgentDebugMaxLineBytes,
-				MaxBatchLines: defaultAgentDebugMaxBatchLines,
-			},
-			TerminalTransport: normalizeNodeTerminalTransport(node.TerminalTransport),
-			IPConfig:          s.agentIPConfig(node.IPConfig),
-			Beacon:            s.agentBeaconConfig(node, s.now()),
+	writeJSON(w, http.StatusOK, model.AgentConfig{
+		LatticeIdentityUUID: node.LatticeIdentityUUID,
+		Debug: model.AgentDebugConfig{
+			Enabled:       node.AgentDebug.Enabled,
+			Collect:       collect,
+			MaxLineBytes:  defaultAgentDebugMaxLineBytes,
+			MaxBatchLines: defaultAgentDebugMaxBatchLines,
 		},
+		TerminalTransport: normalizeNodeTerminalTransport(node.TerminalTransport),
+		IPConfig:          s.agentIPConfig(node.IPConfig),
+		Beacon:            s.agentBeaconConfig(node, s.now()),
 		// The agent update prefetch (design 31, S4), always present so the
 		// agent can tell this server from one that predates it.
 		AgentUpdate: &prefetch,

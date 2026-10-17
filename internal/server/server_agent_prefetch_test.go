@@ -150,8 +150,8 @@ type prefetchConfigBody struct {
 	Debug               json.RawMessage `json:"debug"`
 	LatticeIdentityUUID string          `json:"lattice_identity_uuid"`
 	AgentUpdate         *struct {
-		Prefetch *agentPrefetchTarget `json:"prefetch"`
-		Keep     []string             `json:"keep"`
+		Prefetch *model.AgentUpdatePrefetch `json:"prefetch"`
+		Keep     []string                   `json:"keep"`
 	} `json:"agent_update"`
 }
 
@@ -182,10 +182,10 @@ func TestAgentPrefetchConfigNamesTheOpenApprovalsFile(t *testing.T) {
 		t.Run(fmt.Sprintf("compressed=%v", compressed), func(t *testing.T) {
 			f := newPrefetchFixture(t, 64<<10, compressed)
 			got := f.config(t).AgentUpdate
-			want := agentPrefetchTarget{
+			want := model.AgentUpdatePrefetch{
 				ApprovalID: f.approval.ID, Version: "0.3.4", OS: "linux", Arch: "amd64",
 				SHA256: f.ref.SHA256, CompressedSHA256: f.ref.GzipSHA256,
-				Size: len(f.served), BinarySize: len(f.data), InstallPath: defaultAgentInstallPath,
+				Size: int64(len(f.served)), BinarySize: int64(len(f.data)), InstallPath: defaultAgentInstallPath,
 			}
 			if got.Prefetch == nil || *got.Prefetch != want {
 				t.Fatalf("prefetch %+v, want %+v", got.Prefetch, want)
@@ -637,7 +637,7 @@ func TestAgentPrefetchReportIsShownBesideItsApproval(t *testing.T) {
 		return nil
 	}
 	report := func(state, reason string, bytes int, approvalID string) string {
-		raw, err := json.Marshal(agentPrefetchFacts{
+		raw, err := json.Marshal(model.AgentPrefetchFacts{
 			ApprovalID: approvalID, SHA256: f.ref.GzipSHA256, Bytes: int64(bytes), Size: int64(len(f.served)),
 			State: state, Reason: reason,
 		})
@@ -669,7 +669,7 @@ func TestAgentPrefetchReportIsShownBesideItsApproval(t *testing.T) {
 	if got := shown(); got != nil {
 		t.Fatalf("a report for another approval must not be shown here: %+v", got)
 	}
-	other, err := json.Marshal(agentPrefetchFacts{ApprovalID: f.approval.ID, SHA256: f.ref.SHA256, Bytes: 1, Size: int64(len(f.served)), State: "complete"})
+	other, err := json.Marshal(model.AgentPrefetchFacts{ApprovalID: f.approval.ID, SHA256: f.ref.SHA256, Bytes: 1, Size: int64(len(f.served)), State: "complete"})
 	if err != nil {
 		t.Fatal(err)
 	}

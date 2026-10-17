@@ -70,52 +70,11 @@ const (
 
 var errAgentPrefetchDenied = errors.New("agent binary prefetch is not authorized for this node")
 
-// agentUpdateAgentConfig is the agent_update block of the agent config pull.
-// It is always present from a server that serves prefetch, which is how an
-// agent tells an old server (no block: do nothing) from one with nothing to
-// fetch (a block without prefetch: prune what keep does not name).
-type agentUpdateAgentConfig struct {
-	Prefetch *agentPrefetchTarget `json:"prefetch,omitempty"`
-	// Keep lists the digests of every pending or approved agent update for
-	// this node, running ones included. The agent removes kept downloads
-	// whose digest is not here and never touches one that is, so a running
-	// update's partial survives a config pulled while its task runs.
-	Keep []string `json:"keep"`
-}
-
-// agentPrefetchTarget names the one file the agent fetches. It carries
-// digests and sizes, never a URL: the agent builds the URL from its own
-// enrolled server address and these validated fields. Size is the size of
-// the file fetched, the compressed one when CompressedSHA256 is set, and
-// BinarySize that of the binary it installs, which sizes the disk check.
-// InstallPath is the plan's, from which the agent resolves the directory the
-// apply script will keep the download in, by the script's own rule.
-type agentPrefetchTarget struct {
-	ApprovalID       string `json:"approval_id"`
-	Version          string `json:"version"`
-	OS               string `json:"os"`
-	Arch             string `json:"arch"`
-	SHA256           string `json:"sha256"`
-	CompressedSHA256 string `json:"compressed_sha256,omitempty"`
-	Size             int    `json:"size"`
-	BinarySize       int    `json:"binary_size"`
-	InstallPath      string `json:"install_path"`
-}
-
-// agentConfigResponse is the config pull's answer: the SDK's agent config
-// with the prefetch block beside it. The block is defined here and in the
-// agent rather than in the SDK, so S4 ships without an SDK pin bump; the JSON
-// is the same either way.
-type agentConfigResponse struct {
-	model.AgentConfig
-	AgentUpdate *agentUpdateAgentConfig `json:"agent_update,omitempty"`
-}
-
 // agentPrefetchPlan is what the config and the route both take from the
 // node's approvals, so the file the config names and the file the route
 // serves can never differ.
 type agentPrefetchPlan struct {
-	config   agentUpdateAgentConfig
+	config   model.AgentUpdateConfig
 	approval model.Approval
 	ref      agentArtifactRef
 	ok       bool
@@ -145,7 +104,7 @@ type agentPrefetchPlan struct {
 // keep names every open plan's digests, which a few seconds cannot make
 // wrong about a plan that already had a kept file.
 func (s *Server) agentPrefetchPlanFor(node model.Node, fresh bool) agentPrefetchPlan {
-	plan := agentPrefetchPlan{config: agentUpdateAgentConfig{Keep: []string{}}}
+	plan := agentPrefetchPlan{config: model.AgentUpdateConfig{Keep: []string{}}}
 	type candidate struct {
 		approval model.Approval
 		payload  agentUpdatePayload
@@ -235,50 +194,50 @@ func approvedIDs(approvals []model.Approval) []string {
 	return ids
 }
 
-func (s *Server) agentPrefetchTargetFor(node model.Node, approval model.Approval, payload agentUpdatePayload) (agentPrefetchTarget, agentArtifactRef, bool) {
+func (s *Server) agentPrefetchTargetFor(node model.Node, approval model.Approval, payload agentUpdatePayload) (model.AgentUpdatePrefetch, agentArtifactRef, bool) {
 	if normalizeAgentBinarySource(payload.BinarySource) != agentBinarySourceControlPlane || !agentUpdateWalks(approval.Plan, payload) {
-		return agentPrefetchTarget{}, agentArtifactRef{}, false
+		return model.AgentUpdatePrefetch{}, agentArtifactRef{}, false
 	}
 	if isAgentUpdateAwaitingConfirmation(approval) {
-		return agentPrefetchTarget{}, agentArtifactRef{}, false
+		return model.AgentUpdatePrefetch{}, agentArtifactRef{}, false
 	}
 	if strings.TrimPrefix(strings.TrimSpace(node.AgentVersion), "v") == payload.TargetVersion {
-		return agentPrefetchTarget{}, agentArtifactRef{}, false
+		return model.AgentUpdatePrefetch{}, agentArtifactRef{}, false
 	}
 	osName, arch, err := agentPlatformForNode(node)
 	if err != nil {
-		return agentPrefetchTarget{}, agentArtifactRef{}, false
+		return model.AgentUpdatePrefetch{}, agentArtifactRef{}, false
 	}
 	// The plan names the object exactly, so it is looked up by its path
 	// rather than by listing the bucket.
 	ref := agentArtifactRef{Version: payload.TargetVersion, OS: osName, Arch: arch, SHA256: payload.SHA256, GzipSHA256: payload.CompressedSHA256}
 	if ref.validate() != nil {
-		return agentPrefetchTarget{}, agentArtifactRef{}, false
+		return model.AgentUpdatePrefetch{}, agentArtifactRef{}, false
 	}
 	obj, ok := s.store.StaticObject(agentArtifactBucket, ref.objectPath())
 	if !ok {
-		return agentPrefetchTarget{}, agentArtifactRef{}, false
+		return model.AgentUpdatePrefetch{}, agentArtifactRef{}, false
 	}
 	// The script fetches binary_url from this control plane; a plan that
 	// names another object, or another origin, is not the file it continues.
 	if base := s.agentBinaryBaseURL(); base == "" || payload.BinaryURL != base+ref.urlPath() {
-		return agentPrefetchTarget{}, agentArtifactRef{}, false
+		return model.AgentUpdatePrefetch{}, agentArtifactRef{}, false
 	}
 	servedSize := agentArtifactDecodedSize(obj.Content)
 	binarySize := servedSize
 	if ref.GzipSHA256 != "" {
 		if payload.CompressedSize != servedSize {
-			return agentPrefetchTarget{}, agentArtifactRef{}, false
+			return model.AgentUpdatePrefetch{}, agentArtifactRef{}, false
 		}
 		binarySize = payload.BinarySize
 	}
 	if servedSize <= 0 || servedSize > maxAgentArtifactBytes || binarySize <= 0 || binarySize > maxAgentArtifactBytes {
-		return agentPrefetchTarget{}, agentArtifactRef{}, false
+		return model.AgentUpdatePrefetch{}, agentArtifactRef{}, false
 	}
-	return agentPrefetchTarget{
+	return model.AgentUpdatePrefetch{
 		ApprovalID: approval.ID, Version: ref.Version, OS: ref.OS, Arch: ref.Arch,
 		SHA256: ref.SHA256, CompressedSHA256: ref.GzipSHA256,
-		Size: servedSize, BinarySize: binarySize, InstallPath: payload.InstallPath,
+		Size: int64(servedSize), BinarySize: int64(binarySize), InstallPath: payload.InstallPath,
 	}, ref, true
 }
 
@@ -372,26 +331,6 @@ func (s *Server) auditAgentPrefetchDenied(r *http.Request, nodeID string, ref ag
 	})
 }
 
-// Prefetch states an agent reports.
-const (
-	agentPrefetchFetching = "fetching"
-	agentPrefetchComplete = "complete"
-	agentPrefetchWaiting  = "waiting"
-	agentPrefetchRefused  = "refused"
-)
-
-// agentPrefetchFacts is the "prefetch" key of a heartbeat: what the agent
-// holds of the file the config named. The agent sends it while the config
-// names a prefetch.
-type agentPrefetchFacts struct {
-	ApprovalID string `json:"approval_id"`
-	SHA256     string `json:"sha256"`
-	Bytes      int64  `json:"bytes"`
-	Size       int64  `json:"size"`
-	State      string `json:"state"`
-	Reason     string `json:"reason,omitempty"`
-}
-
 // agentPrefetchView is the progress shown beside the approval it is for.
 type agentPrefetchView struct {
 	State      string    `json:"state"`
@@ -402,7 +341,7 @@ type agentPrefetchView struct {
 }
 
 type agentPrefetchRecord struct {
-	facts      agentPrefetchFacts
+	facts      model.AgentPrefetchFacts
 	receivedAt time.Time
 }
 
@@ -450,7 +389,7 @@ func (b *agentPrefetchBook) leave(nodeID string) {
 // without one (an older agent, or nothing to fetch) clears the record, so a
 // finished or withdrawn prefetch stops being shown. A report that fails
 // validation is dropped and leaves the previous record alone.
-func (s *Server) noteAgentPrefetch(nodeID string, facts *agentPrefetchFacts) {
+func (s *Server) noteAgentPrefetch(nodeID string, facts *model.AgentPrefetchFacts) {
 	b := &s.agentPrefetch
 	if facts == nil {
 		b.mu.Lock()
@@ -480,22 +419,22 @@ func (s *Server) forgetAgentPrefetch(nodeID string) {
 // boundAgentPrefetchFacts accepts a report only in the shape the agent
 // sends. The values come from the node and reach the console, so the
 // reason keeps printable ASCII only and is cut to a bound.
-func boundAgentPrefetchFacts(f agentPrefetchFacts) (agentPrefetchFacts, bool) {
+func boundAgentPrefetchFacts(f model.AgentPrefetchFacts) (model.AgentPrefetchFacts, bool) {
 	switch f.State {
-	case agentPrefetchFetching, agentPrefetchComplete, agentPrefetchWaiting, agentPrefetchRefused:
+	case model.AgentPrefetchFetching, model.AgentPrefetchComplete, model.AgentPrefetchWaiting, model.AgentPrefetchRefused:
 	default:
-		return agentPrefetchFacts{}, false
+		return model.AgentPrefetchFacts{}, false
 	}
 	if f.ApprovalID == "" || len(f.ApprovalID) > 64 || strings.IndexFunc(f.ApprovalID, func(r rune) bool {
 		return !(r == '-' || r == '_' || (r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'))
 	}) >= 0 {
-		return agentPrefetchFacts{}, false
+		return model.AgentPrefetchFacts{}, false
 	}
 	if f.SHA256 != "" && !agentSHA256Re.MatchString(f.SHA256) {
-		return agentPrefetchFacts{}, false
+		return model.AgentPrefetchFacts{}, false
 	}
 	if f.Size < 0 || f.Size > maxAgentArtifactBytes || f.Bytes < 0 || f.Bytes > f.Size {
-		return agentPrefetchFacts{}, false
+		return model.AgentPrefetchFacts{}, false
 	}
 	f.Reason = strings.Map(func(r rune) rune {
 		if r < 0x20 || r > 0x7e {

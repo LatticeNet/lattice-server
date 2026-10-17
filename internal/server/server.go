@@ -9643,7 +9643,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		Witness *witnessReport `json:"witness"`
 		// Prefetch is the agent's progress on the update binary the config
 		// pull named (design 31, S4); kept in memory like LoopHealth.
-		Prefetch *agentPrefetchFacts `json:"prefetch"`
+		Prefetch *model.AgentPrefetchFacts `json:"prefetch"`
 	}
 	if !decodeAgentJSON(w, r, &req) {
 		return

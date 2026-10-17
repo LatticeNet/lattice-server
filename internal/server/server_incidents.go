@@ -79,6 +79,21 @@ func incidentVisible(p principal, nodeID string) bool {
 	return rbac.Allows(p.Principal, "monitor:read", nodeID)
 }
 
+// incidentVisibleTo is incidentVisible for one incident: a monitor's
+// incident also needs the monitor to be visible, since its title and the
+// error it carries name what the check reaches, and a check that names a
+// node is hidden from a caller who may not read that node.
+func (s *Server) incidentVisibleTo(p principal, inc store.Incident) bool {
+	if !incidentVisible(p, inc.NodeID) {
+		return false
+	}
+	if inc.MonitorID == "" {
+		return true
+	}
+	mon, ok := s.store.Monitor(inc.MonitorID)
+	return !ok || monitorVisibleToPrincipal(p, "monitor:read", mon)
+}
+
 func (s *Server) toIncidentView(inc store.Incident, now time.Time, cover maintenanceCover, names map[string]string) incidentView {
 	v := incidentView{Incident: inc, RecoveryKind: incidentKinds[inc.Kind].recovery, NodeName: names[inc.NodeID]}
 	if inc.Active() || inc.State == incidentStatePending {
@@ -135,7 +150,7 @@ func (s *Server) handleIncidents(w http.ResponseWriter, r *http.Request, p princ
 	}
 	now := s.now()
 	keep := func(inc store.Incident) bool {
-		if !wanted[inc.State] || !incidentVisible(p, inc.NodeID) {
+		if !wanted[inc.State] || !s.incidentVisibleTo(p, inc) {
 			return false
 		}
 		if q.Has("node_id") && inc.NodeID != nodeFilter {
@@ -294,21 +309,35 @@ func (s *Server) pendingIncidents(now time.Time) []store.Incident {
 				continue
 			}
 			for _, pair := range pairs {
-				if pair.Success || pair.FailStreak != 1 || !monitorPairAssigned(mon, pair.NodeID) {
+				// A pair is pending between its first failure and the one
+				// that pages. Generated latency checks, disabled checks and
+				// checks whose alert policy is off never open an incident.
+				after := store.MonitorAlertAfter(mon)
+				if pair.Success || pair.FailStreak < 1 || pair.FailStreak >= after || !mon.Enabled ||
+					!monitorPairAssigned(mon, pair.NodeID) || !monitorPages(mon) || icmpFiltered(mon.Type, pair) {
 					continue
 				}
 				name, where := s.monitorNames(mon, pair.NodeID)
-				msg := monitorDownMessage(name, where, pair.Error)
+				msg := monitorDownMessage(name, where, pair.Error, after)
 				pending(store.Incident{
 					Key: incidentKey(EventMonitorDown, pair.NodeID, monitorID), Kind: EventMonitorDown,
 					NodeID: pair.NodeID, MonitorID: monitorID, Subject: name + " on " + where,
 					Since: pair.ReceivedAt, Title: msg.title,
-					Detail: fmt.Sprintf("%s on %s failed once: %s. A second failure in a row opens it.", name, where, strings.TrimSpace(pair.Error)),
+					Detail: monitorPendingDetail(name, where, pair.Error, pair.FailStreak, after),
 				}, time.Time{})
 			}
 		}
 	}
 	return out
+}
+
+// monitorPendingDetail says how far a pair is from the failure that pages.
+func monitorPendingDetail(name, where, errText string, streak, after int) string {
+	errText = strings.TrimSpace(errText)
+	if streak == 1 && after == 2 {
+		return fmt.Sprintf("%s on %s failed once: %s. A second failure in a row opens it.", name, where, errText)
+	}
+	return fmt.Sprintf("%s on %s failed %s: %s. %d failures in a row open it.", name, where, monitorFailCount(streak), errText, after)
 }
 
 // incidentActionTarget loads an incident for a write and checks the caller
@@ -320,7 +349,7 @@ func (s *Server) incidentActionTarget(w http.ResponseWriter, p principal, incide
 		return store.Incident{}, false
 	}
 	inc, ok := s.store.Incident(incidentID)
-	if !ok || !incidentVisible(p, inc.NodeID) {
+	if !ok || !s.incidentVisibleTo(p, inc) {
 		writeError(w, http.StatusNotFound, errors.New("incident not found"))
 		return store.Incident{}, false
 	}

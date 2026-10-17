@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"slices"
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -74,6 +75,7 @@ func cloneGeoRouting(gr model.GeoRouting) model.GeoRouting {
 // never shares a backing array with persisted state.
 func cloneMonitor(m model.Monitor) model.Monitor {
 	m.NodeIDs = append([]string(nil), m.NodeIDs...)
+	m.PausedNodeIDs = append([]string(nil), m.PausedNodeIDs...)
 	return m
 }
 
@@ -481,6 +483,23 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		}
 	}
 
+	// Step 9b: the node's beacon state, its target key with it, its source
+	// id, and its place in every other beacon's approved set, so a machine
+	// enrolled later under the same node id holds no approval. The id
+	// number itself is never given out again.
+	if s.state.Beacon != nil && mutate {
+		delete(s.state.Beacon.Targets, nodeID)
+		delete(s.state.Beacon.SourceIDs, nodeID)
+		for id, t := range s.state.Beacon.Targets {
+			approved := slices.DeleteFunc(slices.Clone(t.Approved), func(src model.BeaconPlanSource) bool { return src.NodeID == nodeID })
+			table := slices.DeleteFunc(slices.Clone(t.TableSources), func(src string) bool { return src == nodeID })
+			if len(approved) != len(t.Approved) || len(table) != len(t.TableSources) {
+				t.Approved, t.TableSources = approved, table
+				s.state.Beacon.Targets[id] = t
+			}
+		}
+	}
+
 	// Step 10: ProxyNodeProfile (keyed by nodeID; central ProxyUser/ProxyInbound
 	// left intact).
 	if _, ok := s.state.ProxyProfiles[nodeID]; ok {
@@ -502,13 +521,17 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 	// Step 12: Monitor ASSIGNMENT (SHARED - strip; AssignAll monitors unchanged)
 	// + MonitorResult (per-node).
 	for id, m := range s.state.Monitors {
-		if m.AssignAll || !contains(m.NodeIDs, nodeID) {
+		assigned := !m.AssignAll && contains(m.NodeIDs, nodeID)
+		if !assigned && !contains(m.PausedNodeIDs, nodeID) {
 			continue
 		}
 		report.MonitorsStripped++
 		if mutate {
 			clone := cloneMonitor(m)
 			clone.NodeIDs = withoutString(clone.NodeIDs, nodeID)
+			clone.PausedNodeIDs = withoutString(clone.PausedNodeIDs, nodeID)
+			// An edit read before the delete must not write the node back.
+			clone.Version++
 			s.state.Monitors[id] = clone
 		}
 	}

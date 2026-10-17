@@ -262,7 +262,7 @@ func TestAgentMonitorResultAdmission(t *testing.T) {
 	now := time.Date(2026, 10, 2, 12, 0, 0, 0, time.UTC)
 	long := strings.Repeat("é", monitorResultErrorMax)
 	results := []model.MonitorResult{
-		{MonitorID: "mon-all", NodeID: "someone-else", At: now.Add(-time.Minute), Success: false, Error: long, CertNotAfter: now},
+		{MonitorID: "mon-all", NodeID: "node-a", At: now.Add(-time.Minute), Success: false, Error: long, CertNotAfter: now},
 		{MonitorID: "mon-b", At: now, Success: true},
 		{MonitorID: "mon-tls", At: now, Success: true},
 		{MonitorID: "mon-off", At: now, Success: true},
@@ -273,12 +273,15 @@ func TestAgentMonitorResultAdmission(t *testing.T) {
 		{MonitorID: "mon-all", Success: true},
 		{MonitorID: "mon-all", At: now.Add(MonitorResultMaxSkew), Success: true},
 		{MonitorID: "mon-all", At: now.Add(-MonitorResultMaxAge), Success: true},
+		// A result that claims another node is refused, not rebound: an
+		// agent reports for the node its token belongs to.
+		{MonitorID: "mon-all", NodeID: "someone-else", At: now.Add(-2 * time.Minute), Success: true},
 	}
 	out, err := s.IngestAgentMonitorResults("node-a", results, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"", MonitorResultDropNotAssigned, MonitorResultDropServerEvaluated, MonitorResultDropDisabled, MonitorResultDropUnknownMonitor, MonitorResultDropUnknownMonitor, MonitorResultDropOutOfWindow, MonitorResultDropOutOfWindow, MonitorResultDropInvalid, "", ""}
+	want := []string{"", MonitorResultDropNotAssigned, MonitorResultDropServerEvaluated, MonitorResultDropDisabled, MonitorResultDropUnknownMonitor, MonitorResultDropUnknownMonitor, MonitorResultDropOutOfWindow, MonitorResultDropOutOfWindow, MonitorResultDropInvalid, "", "", MonitorResultDropWrongNode}
 	for i, reason := range want {
 		if out[i].Dropped != reason {
 			t.Errorf("result %d: dropped %q, want %q", i, out[i].Dropped, reason)
@@ -550,7 +553,7 @@ func TestTrimTrustsRowsOverADriftedCount(t *testing.T) {
 	defer bs.Close()
 	base := time.Unix(1_000, 0).UTC()
 	for i := 0; i < 3; i++ {
-		if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m", NodeID: "n", At: base.Add(time.Duration(i) * time.Second), Success: true}}}, 10); err != nil {
+		if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m", NodeID: "n", At: base.Add(time.Duration(i) * time.Second), Success: true}}}, MonitorHistoryLimits{PerPair: 10}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -565,7 +568,7 @@ func TestTrimTrustsRowsOverADriftedCount(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m", NodeID: "n", At: base.Add(10 * time.Second), Success: true}}}, 10); err != nil {
+	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m", NodeID: "n", At: base.Add(10 * time.Second), Success: true}}}, MonitorHistoryLimits{PerPair: 10}); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ := bs.MonitorPairResults("m", "n", 0)
@@ -663,7 +666,7 @@ func TestFullExportReadsRowsAndTheLegacyBucket(t *testing.T) {
 	}
 	defer bs.Close()
 	at := time.Unix(5_000, 0).UTC()
-	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m-new", NodeID: "n1", At: at, Success: true, LatencyMs: 3}}}, MonitorResultsPerPair); err != nil {
+	if _, err := bs.RecordMonitorResults([]MonitorResultRecord{{MonitorResult: model.MonitorResult{MonitorID: "m-new", NodeID: "n1", At: at, Success: true, LatencyMs: 3}}}, DefaultMonitorHistoryLimits()); err != nil {
 		t.Fatal(err)
 	}
 	if err := bs.db.Update(func(tx *bolt.Tx) error {

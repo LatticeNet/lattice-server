@@ -5,7 +5,7 @@ go 1.26
 toolchain go1.26.6
 
 require (
-	github.com/LatticeNet/lattice-sdk v0.2.24-0.20261016231928-7284243d1b7c
+	github.com/LatticeNet/lattice-sdk v0.2.24-0.20261017003603-6db24b8fc01b
 	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/descope/virtualwebauthn v1.0.5
 	github.com/go-webauthn/webauthn v0.17.4

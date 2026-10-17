@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -119,6 +120,12 @@ type State struct {
 	// LatencyProbes is the operator's latency probe configuration
 	// (latency_probes.go), nil until one is saved. Written only on an edit.
 	LatencyProbes *model.LatencyProbeConfig `json:"latency_probes,omitempty"`
+	// MonitorSettings is the operator's monitor history setting
+	// (monitor_settings.go), nil until one is saved. Written only on an edit.
+	MonitorSettings *model.MonitorSettings `json:"monitor_settings,omitempty"`
+	// Beacon is the measurement beacon's state (beacon.go): source ids,
+	// applied plans and target keys, nil until the first is written.
+	Beacon *BeaconRegistry `json:"beacon,omitempty"`
 	// EvidenceSettings are the operator's evidence budgets
 	// (evidence_settings.go), nil until saved. Written only on an edit.
 	EvidenceSettings *model.EvidenceSettings `json:"evidence_settings,omitempty"`
@@ -792,7 +799,7 @@ func syncRuntimeBoltHotState(bs *BoltStateStore, st State) error {
 	// behind their own flag. Production had no monitors when this moved, but
 	// a self-hosted store may carry history, and the latest records and
 	// failure streaks the alert hold reads are rebuilt from it.
-	return bs.MigrateMonitorResults(st.MonResults, MonitorResultsPerPair)
+	return bs.MigrateMonitorResults(st.MonResults, monitorHistoryLimitsOf(st.MonitorSettings))
 }
 
 func mergeSubscriptionHotSeed(jsonState, unmarkedBolt State) State {
@@ -1853,6 +1860,26 @@ func (s *Store) UpdateMetrics(nodeID string, metrics model.Metrics, version, pub
 		return cameOnline, err
 	}
 	return cameOnline, nil
+}
+
+// SetNodeProbeFacts stores the probe methods and refusals a node's agent
+// reported (design 29 M2a), writing only when they changed: an agent sends
+// them on every beat, and they change when the agent is upgraded or the
+// host's ICMP permission does. nil methods is an agent that reports none.
+func (s *Store) SetNodeProbeFacts(nodeID string, methods []string, refusals map[string]string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, ok := s.state.Nodes[nodeID]
+	if !ok {
+		return fmt.Errorf("node %q not found", nodeID)
+	}
+	if slices.Equal(n.ProbeMethods, methods) && maps.Equal(n.ProbeRefusals, refusals) {
+		return nil
+	}
+	n.ProbeMethods = slices.Clone(methods)
+	n.ProbeRefusals = maps.Clone(refusals)
+	s.state.Nodes[nodeID] = n
+	return s.Save()
 }
 
 func hostFactsDurableChanged(prev, next model.HostFacts) bool {
@@ -5574,7 +5601,9 @@ func (s *Store) MonitorsForNode(nodeID string) []model.Monitor {
 		if m.Type == model.MonitorTypeTLS {
 			continue
 		}
-		if m.AssignAll || contains(m.NodeIDs, nodeID) {
+		// A paused source keeps its assignment and history but is not
+		// handed the monitor until it is resumed.
+		if (m.AssignAll || contains(m.NodeIDs, nodeID)) && !contains(m.PausedNodeIDs, nodeID) {
 			out = append(out, m)
 		}
 	}

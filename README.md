@@ -571,14 +571,23 @@ Use the compose file and deployment guide in the umbrella repository:
   need the node's bearer token and answer
   `{"ok": true, "accepted": n, "duplicates": n, "dropped": [{"index", "monitor_id", "reason"}]}`.
   A result is admitted only for an existing, enabled, non-tls monitor assigned
-  to the posting node, with the node id taken from the token and the error
-  text capped at 512 bytes. It must carry the agent's own stamp, no more than
+  to the posting node, with the node id taken from the token (a result that
+  names another node is dropped as `wrong_node`) and the error text capped at
+  512 bytes, with the user info, query and fragment of every URL in it
+  removed. An icmp result may carry `sent` (1 to 10), `lost` and `rtts_ms`
+  (one per echo that came back); inconsistent packets are `invalid`, and the
+  server derives `success` (an echo came back) and `latency_ms` (the median
+  RTT) from them. Other kinds' packet fields are cleared. A result with a
+  `reason` (a code such as `icmp_not_permitted`, `destination_refused` or
+  `agent_too_old`) measured nothing: it is stored and shown, counts as
+  neither a success nor a failure in rollups and streaks, and makes the path
+  read unknown with that reason. It must carry the agent's own stamp, no more than
   24 hours behind and no more than a minute ahead of the server's clock: a
   result without one is `invalid` and one outside that window is
   `out_of_window`. The server never restamps a result, because the stamp is
   what makes a result sent again a duplicate. A dropped reason
   (`unknown_monitor`, `server_evaluated`, `disabled`, `not_assigned`,
-  `out_of_window`, `invalid`) is final, so the agent drops that result. The
+  `out_of_window`, `invalid`, `wrong_node`) is final, so the agent drops that result. The
   server logs drops at most once per node and reason every 15 minutes, with the
   stamp's offset for `out_of_window`, so a broken agent clock shows in the log.
   Results are judged in array order, so a buffered backlog goes oldest first.
@@ -612,8 +621,16 @@ Use the compose file and deployment guide in the umbrella repository:
   60 s, from each node named `cd-hs-sh` to each node whose country is set and
   is not `CN`. The default source is found by name at every plan, so a node
   renamed to `cd-hs-sh` becomes a source within one sweep; a saved
-  configuration names its sources by node id and ends that. The control plane turns the configuration into tcp monitors
-  marked `managed_by: "latency"`, one per target and assigned to its sources,
+  configuration names its sources by node id and ends that. The control plane turns the configuration into monitors
+  marked `managed_by: "latency"`, one per target and kind (`mon_lat_<target>`
+  for tcp, `mon_lati_<target>` for icmp, `mon_latb_<target>` for the beacon)
+  and assigned to the sources that use that kind. `method` (`tcp`, `icmp`,
+  `beacon` or `auto`; empty reads as `tcp`) and
+  `source_methods` (per-source pins) choose the kind: `auto` takes icmp where
+  the source's agent runs it and the target has a public IPv4, else tcp; a
+  pin never falls back, and a pair whose source cannot run its kind reads
+  unknown with the reason (`agent_too_old`, `icmp_not_permitted`). A check
+  of a kind no source uses any more stays, paused, with its history,
   which agents run like any other monitor; it re-plans every two minutes and
   after each save, writes the state file only when a generated monitor
   changed, and audits that change as `monitor.latency.sync`. A probe dials
@@ -634,7 +651,127 @@ Use the compose file and deployment guide in the umbrella repository:
   `GET /api/monitors/latency/series?source=&target=&window=` returns one
   pair's buckets (1 min, 5 min or 1 h), empty ones included. Both reads are
   narrowed to pairs whose two nodes the caller may read, and no probe result
-  is ever audited.
+  is ever audited. The series route stays for one release beside
+  `GET /api/monitors/series`, which replaces it.
+- Monitoring paths (design 29): a path is one source probing one target, a
+  (monitor, source node) pair. `GET /api/monitors/paths?window=` returns the
+  matrix of every path the caller may read (both its source and its target
+  node, and the check itself for an operator's check): sources, targets, and
+  per path the state now (`up`, `down` after two failures in a row, or
+  `unknown` with `agent_offline`, `source_paused`, `not_probeable`,
+  `no_data`, `agent_too_old`, `icmp_not_permitted`, `icmp_filtered` (every
+  echo lost on a path that has never had one back; once one has, all-loss
+  runs read down and page) or a result's own reason), p50, p95, jitter (mean jump between consecutive successful
+  runs), loss, samples beside expected, the same figures one window earlier
+  (`prev`) and the newest run's stamp. Windows are `1h`, `6h`, `24h`, `3d`,
+  `7d` and `14d`; `1h` reads raw rows, `6h` and `24h` five-minute rollups,
+  and `3d` and longer hourly rollups, and each window's figures are cached
+  until its next bucket closes. A tls check's path has the control plane as
+  its source, an empty node id. `GET /api/monitors/series` returns one path's
+  buckets, every step present (a gap has `n` 0 and `expected` above 0):
+  `?source=&target_node=&window=` joins every generated check from that
+  source to that node by time and marks `method_changes`;
+  `?monitor=&source=&window=` reads one check. The step is the smallest
+  multiple of the finest covering tier's resolution that keeps the series
+  within 720 points and is no shorter than the interval: 1 h at one minute,
+  24 h at five, 3 d at ten, 7 d at fifteen, 14 d at thirty (hourly when the
+  fine retention is under the window, or while the five-minute tier is still
+  filling and the hourly one holds the older part). Both need `monitor:read`.
+  Buckets carry `sent` and `lost`, counting probes (every echo of an icmp
+  run, one per tcp or http run), and loss is `lost / sent` (`fail / n` in
+  buckets written before the counts existed).
+- Checks (design 29 M2a, wire contract in design 29 D11): `POST
+  /api/monitors` creates `tcp`, `http`, `icmp` and `tls` checks. `icmp` and
+  `tcp` may name a node in `target_node` instead of a `target`; the server
+  resolves it each time it hands the check to an agent (icmp: the node's
+  public IPv4; tcp: its public line port by the latency port rule) and
+  refuses the create when it cannot, and the caller needs `monitor:read` on
+  that node. A literal target must be public: loopback, link-local,
+  metadata, multicast, private, carrier-grade NAT, unspecified and broadcast
+  addresses and `localhost` are refused. icmp takes an IPv4 literal or a
+  node, `packets` 1 to 10 (default 5, 200 ms apart), a run that ends before
+  the next one, and at most 2 packets a second per source and target across
+  every enabled icmp check, generated ones included. http takes an absolute
+  http or https URL without user info, `expect_status` (codes and ranges,
+  default `200-399`, stored canonical) and up to 8 `headers`; a header with
+  `secret` must travel over https, its value is encrypted at rest, returned
+  by no read (reads show `{"name", "secret": true, "set": true}`), named but
+  never valued in audit records, sent only to the agents assigned the check,
+  and bound to `secrets_origin`. `GET /api/agent/monitors` hands an agent
+  only the kinds it reports in `probe_methods` on hello and heartbeat (an
+  agent that reports none runs tcp and http), with node targets resolved;
+  node reads carry the effective `probe_methods` and `probe_refusals`.
+- Measurement beacon (design 29 D3, wire contract in design 29 D12, wire
+  format in the SDK's `beacon` package): an authenticated UDP responder an
+  agent opens only while an applied `node.beacon` plan enables it.
+  `POST /api/nodes/beacon/plan` (`monitor:admin`, `node:admin` and
+  `network:plan` on the node, `netguard:admin` too when NetGuard manages it,
+  and `monitor:read` on every source the plan names) takes `node_id`,
+  `action` (`enable`, `disable`, `change`) and optional `port` (1024 to
+  65535; by default a random port in 40000 to 59999 assigned once per node),
+  `bind` (an IPv4 literal; by default the node's primary interface address,
+  so a NAT node binds its private address) and `endpoint` (the advertised
+  IPv4 literal and port, a NAT mapping allowed; host names, loopback,
+  link-local, multicast and 240.0.0.0/4 refused). It answers `{approval,
+  plan, findings}`: the approval (plugin `beacon`, action `node.beacon`)
+  carries the plan document, whose hash covers the settings, the limits, the
+  source set (the path set's auto and beacon sources running the beacon
+  client, and the sources of operator beacon checks) and, under NetGuard,
+  the node's whole ruleset with the companion rules (UDP to the port from
+  each source's public and WireGuard /32 and its observed egress, `notrack`
+  in both directions). Findings refuse a port a sing-box inbound, sshd, a
+  knock sequence or WireGuard holds and a bind on the WireGuard address,
+  and warn on a mapped endpoint, no sources and a node NetGuard does not
+  manage. Deciding it renders the document again and answers 409 stale when
+  the bytes differ, needs the same scopes as planning plus `network:apply`,
+  and, with a companion, must queue its apply task. The server mints the
+  node's 32-byte key on the first enable, keeps it encrypted at rest, and
+  hands each target its table and each source only its own path key per
+  target in `GET /api/agent/config` (`beacon`); a source the plan did not
+  approve reads `firewall_pending` (`beacon_source_pending` without
+  NetGuard) until a change plan applies. `POST /api/nodes/beacon/rotate`
+  (`monitor:admin` and `node:admin`, audited as `beacon.rotate`) moves the
+  key to a new epoch; a source leaving the table does too. `GET
+  /api/nodes/beacon?node_id=` (`monitor:read`) answers the beacon's state,
+  applied settings, epoch, last authenticated request, the agent's report,
+  the reachability verdict of the check one approved source runs after an
+  apply (`mon_beaconr_<node>`), the exposure, `firewall_pending` and each
+  source; no read and no audit record ever carries a key. Beacon checks
+  (`type: "beacon"`) name `target_node` only, resolve to the endpoint, and
+  share icmp's packet rules and budget. The path set takes `beacon` as a
+  method, and `auto` prefers the beacon for approved sources of a listening
+  target, then icmp unless that pair reads `icmp_filtered` (then tcp, and it
+  stays there), then tcp; generated beacon checks are `mon_latb_<target>`.
+- `GET /api/monitors/settings` (`monitor:read`, no node allowlist, since the
+  figures cover the fleet) returns the history setting
+  (`fine_retention_days`, 3 to 14, 7 by default; the hourly tier is fixed at
+  35 days and raw rows at 1440 per path), the paths recording history, and
+  `measured_bytes` (bbolt page statistics of the monitor buckets) beside
+  `projected_bytes` (every current path filling every tier at the setting).
+  `POST /api/monitors/settings/update` saves it with the `version` it was
+  read at (409 when stale), needs `monitor:admin` without a node allowlist,
+  and is audited as `monitor.settings.update`; a lower retention starts the
+  pruning sweep at once. The sweep otherwise runs hourly and deletes, for
+  every pair including paused ones, the buckets and rows behind each tier's
+  line in write transactions of at most 2000 deletes. bbolt reuses freed
+  pages but never shrinks its file.
+- `POST /api/monitors/update` (`monitor:admin` on every source it names)
+  edits an operator's check with the `version` it was read at (409 when
+  stale) and only the fields it sends: `name`, `interval_sec` (10 s floor),
+  `timeout_sec`, `threshold_days` (tls), `alert` (`down` or `off`),
+  `alert_after` (failures in a row that page and read as down, 1 to 20,
+  default 2; also accepted on create), `enabled`, `assign_all`, `node_ids`,
+  `paused_node_ids`, `packets` (icmp), `expect_status` (http) and `headers`
+  (http) as a list of `{name, op, value, secret}` with `op` `keep` (refused
+  when the header is gone), `set` (needs a value) or `delete`; a header the
+  list does not name is kept, so an edit that echoes a read neither wipes nor
+  leaks a secret. `target_node` cannot change. A paused source
+  keeps its history, is not handed the check and has its results refused as
+  `not_assigned`. Changing `type` or `target` is refused with 400: that is a
+  new check. Generated checks answer 409, as a delete does. Edits are audited
+  as `monitor.update`. A check whose alert policy is `off`, like a generated
+  latency check, and a disabled check open no incident and show no pending
+  one; the incident sweep closes what such a check had open.
 - Control-plane task views expose script hash and byte size, not the full script
   body or agent-only lease credential.
 - Task read and run permissions are split: `task:read` lists task metadata and
@@ -731,10 +868,11 @@ Use the compose file and deployment guide in the umbrella repository:
   too: one row per result and one latest record per monitor and node (with the
   failure streak the alert hold reads), 1440 rows per pair, and any JSON
   history is migrated once on the first enable. Each result is also counted,
-  in the same transaction, into a five-minute bucket kept two days and an
-  hourly bucket kept eight days for its pair (count, failures, latency
-  extremes and a histogram), which answer the 24 hour and 7 day latency
-  windows the rows no longer reach. Without the sidecar the JSON
+  in the same transaction, into a five-minute bucket kept for the fine
+  retention (7 days by default) and an hourly bucket kept 35 days for its
+  pair (count, failures, latency extremes, a histogram and the jitter sum),
+  which answer the windows the rows no longer reach. History reads run in a
+  bolt read transaction outside the store lock. Without the sidecar the JSON
   file keeps 120 rows per pair and is rewritten only when a pair changes state,
   reaches its second failure in a row, or has not been written for five
   minutes. The in-memory read model

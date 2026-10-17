@@ -7,10 +7,12 @@ import (
 )
 
 // Monitor result rollups: per (monitor, node) pair, one record per time
-// bucket holding the count of results, the count of failures and a histogram
-// of the successful probes' latency. Two tiers: five-minute buckets kept two
-// days, which answer the 1 h and 24 h windows and their series, and one-hour
-// buckets kept eight days, which answer 7 d.
+// bucket holding the count of results, the count of failures, a histogram of
+// the successful probes' latency and the sum of the jumps between consecutive
+// successful probes (jitter). Two tiers: five-minute buckets kept for the
+// operator's fine retention (3 to 14 days, 7 by default), which answer every
+// series up to that span, and one-hour buckets kept 35 days, which answer
+// the longer windows and the matrix from three days up.
 //
 // Raw rows cannot answer those windows. A pair keeps MonitorResultsPerPair
 // rows, which is 24 hours at a 60 s interval and 12 at 30 s, and nothing
@@ -30,11 +32,15 @@ import (
 const (
 	MonitorRollupFine   = 5 * time.Minute
 	MonitorRollupCoarse = time.Hour
-	// monitorRollupFineKeep covers the 24 h window, its series, and a day of
-	// slack for a late batch.
-	monitorRollupFineKeep = 48 * time.Hour
-	// monitorRollupCoarseKeep covers the 7 d window and a day of slack.
-	monitorRollupCoarseKeep = 8 * 24 * time.Hour
+	// monitorRetentionSlack is kept beyond each tier's retention, so the
+	// oldest step of the longest window a tier answers is whole: that step
+	// starts up to one step before the window does.
+	monitorRetentionSlack = time.Hour
+	// monitorJitterGap is the longest time between two successful probes
+	// whose difference still counts as jitter. A probe after a longer
+	// silence (a pause, an outage) starts afresh instead of comparing
+	// itself with a reading from another part of the day.
+	monitorJitterGap = time.Hour
 
 	monitorRollupBinsPerOctave = 8
 	monitorRollupFloorMs       = 0.5
@@ -56,6 +62,18 @@ type MonitorRollup struct {
 	// estimate never lands outside what was measured.
 	Min float64 `json:"min,omitzero"`
 	Max float64 `json:"max,omitzero"`
+	// JS sums the absolute differences between consecutive successful
+	// latencies, JN counts them. Each difference lands in the bucket of the
+	// later probe, so merged buckets add up exactly and JS/JN over any merge
+	// is the mean jump. Buckets written before jitter existed carry neither.
+	JS float64 `json:"js,omitzero"`
+	JN int     `json:"jn,omitempty"`
+	// S counts probes sent and L the lost ones: every echo of a
+	// multi-packet run (icmp), one per run of a single-probe kind, so Loss
+	// reads the same for every kind. Buckets written before the fields
+	// existed carry neither, and their loss is F over N.
+	S int `json:"s,omitempty"`
+	L int `json:"l,omitempty"`
 }
 
 // MonitorPair names one (monitor, node) result pair.
@@ -101,14 +119,98 @@ func (r *MonitorRollup) add(success bool, latencyMs float64) {
 	}
 }
 
+// countable reports whether a result is counted in rollups: a result with a
+// reason measured nothing, so it is stored and shown but counts as neither
+// a success nor a failure.
+func countable(rec MonitorResultRecord) bool { return rec.Reason == "" }
+
+// addResult counts one countable result, its probes included.
+func (r *MonitorRollup) addResult(rec MonitorResultRecord) {
+	if r.S == 0 && r.N > 0 {
+		// A bucket written before buckets counted probes: count its runs
+		// as one probe each first, so its loss keeps them.
+		r.S, r.L = r.N, r.F
+	}
+	r.add(rec.Success, rec.LatencyMs)
+	if rec.Sent > 0 {
+		r.S += rec.Sent
+		r.L += min(max(rec.Lost, 0), rec.Sent)
+		return
+	}
+	r.S++
+	if !rec.Success {
+		r.L++
+	}
+}
+
+// Loss is the share of probes lost, L over S where the bucket counted
+// probes and F over N in a bucket written before it did. False when the
+// bucket holds no result.
+func (r MonitorRollup) Loss() (float64, bool) {
+	switch {
+	case r.S > 0:
+		return float64(r.L) / float64(r.S), true
+	case r.N > 0:
+		return float64(r.F) / float64(r.N), true
+	}
+	return 0, false
+}
+
+// addJitter counts one jump between consecutive successful probes.
+func (r *MonitorRollup) addJitter(delta float64) {
+	if math.IsNaN(delta) || math.IsInf(delta, 0) {
+		return
+	}
+	r.JS += math.Abs(delta)
+	r.JN++
+}
+
+// Jitter is the mean absolute difference between consecutive successful
+// probes counted in the bucket. False when it holds no such pair.
+func (r MonitorRollup) Jitter() (float64, bool) {
+	if r.JN <= 0 {
+		return 0, false
+	}
+	return r.JS / float64(r.JN), true
+}
+
+// monitorJitterDelta is the jump a successful probe at at with latency ms
+// makes from the last successful one, false when there is none close enough
+// in time to compare with.
+func monitorJitterDelta(lastAt time.Time, lastMs float64, at time.Time, ms float64) (float64, bool) {
+	if lastAt.IsZero() {
+		return 0, false
+	}
+	gap := at.Sub(lastAt)
+	if gap < 0 {
+		gap = -gap
+	}
+	if gap > monitorJitterGap {
+		return 0, false
+	}
+	return math.Abs(ms - lastMs), true
+}
+
 // Merge folds o into r. The bucket start stays r's.
 func (r *MonitorRollup) Merge(o MonitorRollup) {
 	if o.N == 0 {
 		return
 	}
 	hadSuccess, otherSuccess := r.Successes() > 0, o.Successes() > 0
+	if r.S == 0 && o.S > 0 && r.N > 0 {
+		// r was written before buckets counted probes: count its runs as
+		// one probe each, so the merged loss weighs both sides.
+		r.S, r.L = r.N, r.F
+	}
+	if o.S == 0 && r.S > 0 {
+		o.S, o.L = o.N, o.F
+	}
 	r.N += o.N
 	r.F += o.F
+	r.JS += o.JS
+	r.JN += o.JN
+	r.S += o.S
+	r.L += o.L
 	if len(o.H) > 0 && r.H == nil {
 		r.H = make(map[int]int, len(o.H))
 	}
@@ -160,11 +262,23 @@ func (r MonitorRollup) Quantile(q float64) (float64, bool) {
 // RollupMonitorResults buckets raw results at res, keeping the buckets whose
 // start lies in [from, to), oldest first. The JSON fallback answers rollup
 // reads with it, and a reader folds a pair's recent rows with it at a finer
-// step than the stored tiers.
+// step than the stored tiers. rows are one pair's, oldest first; jitter is
+// counted between consecutive successes as the hot store counts it, so a
+// row before from still serves as the first one's predecessor.
 func RollupMonitorResults(rows []MonitorResultRecord, res time.Duration, from, to time.Time) []MonitorRollup {
 	byStart := map[time.Time]*MonitorRollup{}
+	var lastAt time.Time
+	var lastMs float64
 	for _, rec := range rows {
+		if !countable(rec) {
+			continue
+		}
 		start := rec.At.UTC().Truncate(res)
+		delta, jump := 0.0, false
+		if rec.Success {
+			delta, jump = monitorJitterDelta(lastAt, lastMs, rec.At, rec.LatencyMs)
+			lastAt, lastMs = rec.At, rec.LatencyMs
+		}
 		if start.Before(from) || !start.Before(to) {
 			continue
 		}
@@ -173,7 +287,10 @@ func RollupMonitorResults(rows []MonitorResultRecord, res time.Duration, from, t
 			b = &MonitorRollup{At: start}
 			byStart[start] = b
 		}
-		b.add(rec.Success, rec.LatencyMs)
+		b.addResult(rec)
+		if jump {
+			b.addJitter(delta)
+		}
 	}
 	out := make([]MonitorRollup, 0, len(byStart))
 	for _, b := range byStart {
@@ -183,31 +300,18 @@ func RollupMonitorResults(rows []MonitorResultRecord, res time.Duration, from, t
 	return out
 }
 
-func monitorRollupKeep(res time.Duration) time.Duration {
-	if res == MonitorRollupCoarse {
-		return monitorRollupCoarseKeep
-	}
-	return monitorRollupFineKeep
-}
-
 // MonitorRollups returns each pair's buckets at res (MonitorRollupFine or
 // MonitorRollupCoarse) whose start lies in [from, to), oldest first. A pair
 // with no buckets in the range has no entry.
 func (s *Store) MonitorRollups(pairs []MonitorPair, res time.Duration, from, to time.Time) (map[MonitorPair][]MonitorRollup, error) {
 	from, to = from.UTC().Truncate(res), to.UTC()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.runtimeBoltHot != nil {
-		return s.runtimeBoltHot.MonitorRollups(pairs, res, from, to)
+	if hot := s.hotForMonitorRead(); hot != nil {
+		return hot.MonitorRollups(pairs, res, from, to)
 	}
+	defer s.mu.Unlock()
 	out := map[MonitorPair][]MonitorRollup{}
 	for _, pair := range pairs {
-		var rows []MonitorResultRecord
-		for _, r := range s.state.MonResults[pair.MonitorID] {
-			if r.NodeID == pair.NodeID {
-				rows = append(rows, r)
-			}
-		}
+		rows := s.jsonPairRowsLocked(pair)
 		if folded := RollupMonitorResults(rows, res, from, to); len(folded) > 0 {
 			out[pair] = folded
 		}
@@ -228,14 +332,27 @@ func MergeMonitorRollups(buckets []MonitorRollup) MonitorRollup {
 	return out
 }
 
-// SummarizeMonitorResults counts raw results into one bucket.
+// SummarizeMonitorResults counts raw results (one pair's, oldest first) into
+// one bucket, jitter included.
 func SummarizeMonitorResults(rows []MonitorResultRecord) MonitorRollup {
 	var out MonitorRollup
+	var lastAt time.Time
+	var lastMs float64
 	for i, rec := range rows {
 		if i == 0 {
 			out.At = rec.At
 		}
-		out.add(rec.Success, rec.LatencyMs)
+		if !countable(rec) {
+			continue
+		}
+		out.addResult(rec)
+		if !rec.Success {
+			continue
+		}
+		if delta, ok := monitorJitterDelta(lastAt, lastMs, rec.At, rec.LatencyMs); ok {
+			out.addJitter(delta)
+		}
+		lastAt, lastMs = rec.At, rec.LatencyMs
 	}
 	return out
 }

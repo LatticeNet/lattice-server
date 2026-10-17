@@ -30,18 +30,19 @@ func monitorRollupBucket(res time.Duration) ([]byte, error) {
 	return nil, fmt.Errorf("no monitor rollup at %s", res)
 }
 
-// addMonitorRollupsTx counts one stored result in both tiers. The caller has
-// just written the result's row, so a duplicate never reaches here. A result
+// addMonitorRollupsTx counts one stored result in both tiers, and its jump
+// from the pair's previous success when jump is set. The caller has just
+// written the result's row, so a duplicate never reaches here. A result
 // whose bucket starts before a tier's retention line is not counted there:
 // the trim below would delete that bucket the moment it was written.
-func addMonitorRollupsTx(tx *bolt.Tx, rec MonitorResultRecord) error {
+func addMonitorRollupsTx(tx *bolt.Tx, rec MonitorResultRecord, jitter float64, jump bool, limits MonitorHistoryLimits) error {
 	newest := rec.At
 	if rec.ReceivedAt.After(newest) {
 		newest = rec.ReceivedAt
 	}
 	for _, tier := range monitorRollupTiers {
 		start := rec.At.UTC().Truncate(tier.res)
-		cutoff := newest.Add(-monitorRollupKeep(tier.res))
+		cutoff := newest.Add(-limits.keep(tier.res))
 		if start.Before(cutoff) {
 			continue
 		}
@@ -51,7 +52,10 @@ func addMonitorRollupsTx(tx *bolt.Tx, rec MonitorResultRecord) error {
 		if err != nil {
 			return err
 		}
-		bucket.add(rec.Success, rec.LatencyMs)
+		bucket.addResult(rec)
+		if jump {
+			bucket.addJitter(jitter)
+		}
 		if err := putRecord(tx, tier.bucket, key, bucket); err != nil {
 			return err
 		}

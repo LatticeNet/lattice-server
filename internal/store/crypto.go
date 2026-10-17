@@ -35,6 +35,7 @@ import (
 //   - model.ProxyInbound.RealityPrivateKey REALITY server private key
 //   - model.ProxyUser.UUID/Password/SubToken subscriber credentials and subscription bearer token
 //   - model.Task.Script                 node-executed script body; may carry generated deployment secrets
+//   - BeaconTarget.Key                  a node's beacon target key (design 29 D3)
 //
 // When adding a new persisted credential, encrypt it here AND extend
 // stateHasEnvelope so the lost-key guard stays accurate.
@@ -117,6 +118,22 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 	}
 	out.VpnUserSecrets = vpnUserSecrets
 
+	if st.Beacon != nil {
+		reg := cloneBeaconRegistry(st.Beacon)
+		for id, t := range reg.Targets {
+			if t.Key == "" {
+				continue
+			}
+			key, err := c.Encrypt(t.Key)
+			if err != nil {
+				return State{}, fmt.Errorf("encrypt beacon key of node %s: %w", id, err)
+			}
+			t.Key = key
+			reg.Targets[id] = t
+		}
+		out.Beacon = reg
+	}
+
 	managedLineSecrets := make(map[string]ManagedLineSecretRecord, len(st.ManagedLineSecrets))
 	for id, record := range st.ManagedLineSecrets {
 		key, err := c.Encrypt(record.RealityPrivateKey)
@@ -147,6 +164,16 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 		notify[id] = enc
 	}
 	out.NotifyChannels = notify
+
+	monitors := make(map[string]model.Monitor, len(st.Monitors))
+	for id, m := range st.Monitors {
+		enc, err := encryptMonitorRecord(id, m, c)
+		if err != nil {
+			return State{}, err
+		}
+		monitors[id] = enc
+	}
+	out.Monitors = monitors
 
 	providers := make(map[string]model.OIDCProvider, len(st.OIDCProviders))
 	for id, p := range st.OIDCProviders {
@@ -326,6 +353,23 @@ func decryptState(st *State, c secret.Cipher) error {
 	}
 	st.VpnUserSecrets = vpnUserSecrets
 
+	if st.Beacon != nil {
+		for id, t := range st.Beacon.Targets {
+			if t.Key == "" {
+				continue
+			}
+			if !c.Enabled() && secret.IsEnvelope(t.Key) {
+				return lostMasterKeyError()
+			}
+			key, err := c.Decrypt(t.Key)
+			if err != nil {
+				return fmt.Errorf("decrypt beacon key of node %s: %w", id, err)
+			}
+			t.Key = key
+			st.Beacon.Targets[id] = t
+		}
+	}
+
 	managedLineSecrets := make(map[string]ManagedLineSecretRecord, len(st.ManagedLineSecrets))
 	for id, record := range st.ManagedLineSecrets {
 		if !c.Enabled() && secret.IsEnvelope(record.RealityPrivateKey) {
@@ -359,6 +403,18 @@ func decryptState(st *State, c secret.Cipher) error {
 		notify[id] = dec
 	}
 	st.NotifyChannels = notify
+
+	if st.Monitors != nil {
+		monitors := make(map[string]model.Monitor, len(st.Monitors))
+		for id, m := range st.Monitors {
+			dec, err := decryptMonitorRecord(id, m, c)
+			if err != nil {
+				return err
+			}
+			monitors[id] = dec
+		}
+		st.Monitors = monitors
+	}
 
 	providers := make(map[string]model.OIDCProvider, len(st.OIDCProviders))
 	for id, p := range st.OIDCProviders {
@@ -482,6 +538,13 @@ func stateHasEnvelope(st *State) bool {
 			return true
 		}
 	}
+	if st.Beacon != nil {
+		for _, t := range st.Beacon.Targets {
+			if secret.IsEnvelope(t.Key) {
+				return true
+			}
+		}
+	}
 	for _, d := range st.DDNS {
 		if secret.IsEnvelope(d.CFAPIToken) || secret.IsEnvelope(d.WebhookHeaders) {
 			return true
@@ -495,6 +558,13 @@ func stateHasEnvelope(st *State) bool {
 	for _, n := range st.NotifyChannels {
 		for _, v := range n.Config {
 			if secret.IsEnvelope(v) {
+				return true
+			}
+		}
+	}
+	for _, m := range st.Monitors {
+		for _, h := range m.Headers {
+			if h.Secret && secret.IsEnvelope(h.Value) {
 				return true
 			}
 		}
@@ -737,6 +807,50 @@ func encryptNotifyRecord(id string, n model.NotifyChannel, c secret.Cipher) (mod
 		n.Config = cfg
 	}
 	return n, nil
+}
+
+// encryptMonitorRecord encrypts the values of an http check's secret
+// headers (design 29 D1), as notification channel secrets are. Plain
+// headers and every other field stay readable.
+func encryptMonitorRecord(id string, m model.Monitor, c secret.Cipher) (model.Monitor, error) {
+	if !model.MonitorHasSecrets(m) {
+		return m, nil
+	}
+	headers := make([]model.MonitorHeader, len(m.Headers))
+	for i, h := range m.Headers {
+		if h.Secret {
+			ev, err := c.Encrypt(h.Value)
+			if err != nil {
+				return model.Monitor{}, fmt.Errorf("encrypt monitor %s header %s: %w", id, h.Name, err)
+			}
+			h.Value = ev
+		}
+		headers[i] = h
+	}
+	m.Headers = headers
+	return m, nil
+}
+
+func decryptMonitorRecord(id string, m model.Monitor, c secret.Cipher) (model.Monitor, error) {
+	if !model.MonitorHasSecrets(m) {
+		return m, nil
+	}
+	headers := make([]model.MonitorHeader, len(m.Headers))
+	for i, h := range m.Headers {
+		if h.Secret {
+			if !c.Enabled() && secret.IsEnvelope(h.Value) {
+				return model.Monitor{}, lostMasterKeyError()
+			}
+			dv, err := c.Decrypt(h.Value)
+			if err != nil {
+				return model.Monitor{}, fmt.Errorf("decrypt monitor %s header %s: %w", id, h.Name, err)
+			}
+			h.Value = dv
+		}
+		headers[i] = h
+	}
+	m.Headers = headers
+	return m, nil
 }
 
 func decryptNotifyRecord(id string, n model.NotifyChannel, c secret.Cipher) (model.NotifyChannel, error) {

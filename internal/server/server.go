@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -20,6 +21,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -371,6 +373,16 @@ type Server struct {
 	// monitorDrops rate-limits the log line for agent monitor results the
 	// store refused; see server_monitor_results.go.
 	monitorDrops monitorDropLog
+	// monitorPaths holds the paths matrix cache and the history pruning
+	// sweep's guard; see monitor_paths.go and monitor_settings.go.
+	monitorPaths monitorPathState
+	// beacon holds the measurement beacon's in-memory state: each agent's
+	// latest report and egress address; see beacon.go.
+	beacon beaconRuntime
+	// monitorSaves holds a check or path set save from the packet budget
+	// check to the write it guards, so two saves cannot both pass against
+	// the same stored set (monitor_checks.go). Taken before latencySync.
+	monitorSaves sync.Mutex
 	// latencySync serializes latency probe syncs, so the background sweep
 	// and a configuration save never plan against each other's half-written
 	// monitors; see latency_probes.go.
@@ -889,6 +901,7 @@ func New(opts Options) (*Server, error) {
 		s.startShareFetchStatsFlush()
 		s.startLineClientTemplateSync()
 		s.startLatencyProbeSync()
+		s.startMonitorHistoryPrune()
 		s.startPluginTaskScheduler()
 		s.startStateWriteSummary()
 		if s.selfmon != nil {
@@ -1330,6 +1343,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/agent-updates/artifacts", s.withAuth("", s.handleAgentArtifacts))
 	mux.HandleFunc("/api/nodes/agent-updates/artifacts/import", s.withAuth("node:admin", s.handleAgentArtifactImport))
 	mux.HandleFunc("/api/nodes/agent-updates/artifacts/delete", s.withAuth("node:admin", s.handleDeleteAgentArtifact))
+	mux.HandleFunc("/api/nodes/beacon", s.withAuth("monitor:read", s.handleNodeBeacon))
+	mux.HandleFunc("/api/nodes/beacon/plan", s.withAuth("", s.handleBeaconPlan))
+	mux.HandleFunc("/api/nodes/beacon/rotate", s.withAuth("", s.handleBeaconRotate))
 	mux.HandleFunc("/api/nodes/enroll-token", s.withAuth("node:admin", s.handleEnrollNode))
 	mux.HandleFunc("/api/nodes/reconfigure-command", s.withAuth("node:admin", s.handleNodeReconfigureCommand))
 	mux.HandleFunc("/api/nodes/rotate-token", s.withAuth("node:admin", s.handleRotateNodeToken))
@@ -1473,6 +1489,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/monitors", s.withAuth("", s.handleMonitors))
 	mux.HandleFunc("/api/monitors/delete", s.withAuth("monitor:admin", s.handleDeleteMonitor))
 	mux.HandleFunc("/api/monitors/results", s.withAuth("monitor:read", s.handleMonitorResults))
+	mux.HandleFunc("/api/monitors/update", s.withAuth("monitor:admin", s.handleMonitorUpdate))
+	mux.HandleFunc("/api/monitors/series", s.withAuth("monitor:read", s.handleMonitorSeries))
+	mux.HandleFunc("/api/monitors/paths", s.withAuth("monitor:read", s.handleMonitorPaths))
+	mux.HandleFunc("/api/monitors/settings", s.withAuth("monitor:read", s.handleMonitorSettings))
+	mux.HandleFunc("/api/monitors/settings/update", s.withAuth("monitor:admin", s.handleMonitorSettingsUpdate))
 	mux.HandleFunc("/api/incidents", s.withAuth("monitor:read", s.handleIncidents))
 	mux.HandleFunc("/api/incidents/ack", s.withAuth("monitor:admin", s.handleIncidentAck))
 	mux.HandleFunc("/api/incidents/unack", s.withAuth("monitor:admin", s.handleIncidentUnack))
@@ -2771,7 +2792,12 @@ type nodeView struct {
 	LoopHealth           *agentLoopHealthView     `json:"loop_health,omitempty"`
 	IPConfig             *model.NodeIPConfig      `json:"ip_config,omitempty"`
 	GroupIDs             []string                 `json:"group_ids,omitempty"`
-	CreatedAt            time.Time                `json:"created_at"`
+	// ProbeMethods are the monitor kinds the node's agent runs: what it
+	// reported, or tcp and http for an agent that reports nothing.
+	// ProbeRefusals are the kinds its host refuses, with why.
+	ProbeMethods  []string          `json:"probe_methods"`
+	ProbeRefusals map[string]string `json:"probe_refusals,omitempty"`
+	CreatedAt     time.Time         `json:"created_at"`
 }
 
 type agentRuntimeConfig struct {
@@ -2806,8 +2832,39 @@ func (s *Server) toNodeView(n model.Node) nodeView {
 		PublicIP: n.PublicIP, PublicIPv6: n.PublicIPv6, InternalIP: n.InternalIP, InternalIPv6: n.InternalIPv6, AgentVersion: n.AgentVersion,
 		Online: n.Online, Reachability: nodeReachability(n), Disabled: n.Disabled, AgentSourceAllowlist: append([]string(nil), n.AgentSourceAllowlist...), TokenLastUsedAt: n.TokenLastUsedAt, LastSeen: n.LastSeen, Metrics: n.Metrics,
 		HostFacts: n.HostFacts, Geo: n.Geo, AgentDebug: n.AgentDebug, AgentLaunch: n.AgentLaunch, AgentRuntime: s.agentRuntimeSnapshot(n.ID), LoopHealth: s.agentLoopHealthViewFor(n.ID, now), IPConfig: redactNodeIPConfig(n.IPConfig), GroupIDs: n.GroupIDs, CreatedAt: n.CreatedAt,
+		ProbeMethods: model.EffectiveProbeMethods(n.ProbeMethods), ProbeRefusals: n.ProbeRefusals,
 	}
 }
+
+// maxProbeRefusals bounds the refusals one agent may report: one per kind.
+const maxProbeRefusals = 8
+
+// normalizeProbeFacts keeps what an agent reported about the kinds it runs
+// (design 29 M2a): known kinds, once each and sorted, and refusals of known
+// kinds the agent does not also claim to run, each with a reason code.
+// Anything else is dropped rather than refused: the report is the agent's
+// own telemetry, and a newer agent may name a kind this server does not
+// know.
+func normalizeProbeFacts(methods []string, refusals map[string]string) ([]string, map[string]string) {
+	methods = model.NormalizeProbeMethods(methods)
+	var out map[string]string
+	for kind, reason := range refusals {
+		kind, reason = strings.TrimSpace(kind), strings.TrimSpace(reason)
+		if !model.KnownProbeMethod(kind) || slices.Contains(methods, kind) || !probeReasonPattern.MatchString(reason) {
+			continue
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		if len(out) < maxProbeRefusals {
+			out[kind] = reason
+		}
+	}
+	return methods, out
+}
+
+// probeReasonPattern is the shape of a reason code, as results carry them.
+var probeReasonPattern = regexp.MustCompile(`^[a-z0-9_]{1,40}$`)
 
 func ensureNodeIdentityUUIDInPlace(n *model.Node) error {
 	if strings.TrimSpace(n.LatticeIdentityUUID) != "" {
@@ -5334,7 +5391,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		views := toMonitorViews(visible)
+		views := s.monitorViews(visible, s.now())
 		for i, mon := range visible {
 			views[i].Latest = monitorLatestViews(p, mon, latest[mon.ID])
 		}
@@ -5347,12 +5404,30 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		if !decodeClientJSON(w, r, &req) {
 			return
 		}
-		if strings.TrimSpace(req.Name) == "" || strings.TrimSpace(req.Target) == "" {
-			writeError(w, http.StatusBadRequest, errors.New("name and target are required"))
+		s.monitorSaves.Lock()
+		defer s.monitorSaves.Unlock()
+		req.TargetNode = strings.TrimSpace(req.TargetNode)
+		if strings.TrimSpace(req.Name) == "" || (strings.TrimSpace(req.Target) == "" && req.TargetNode == "") {
+			writeError(w, http.StatusBadRequest, errors.New("name and target (or target_node) are required"))
 			return
 		}
+		if !validMonitorAlert(req.Alert) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("alert must be %q or %q", model.MonitorAlertDown, model.MonitorAlertOff))
+			return
+		}
+		if req.Alert == "" {
+			req.Alert = model.MonitorAlertDown
+		}
+		if req.AlertAfter < 0 || req.AlertAfter > model.MonitorAlertAfterMax {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax))
+			return
+		}
+		// Sources are paused through an edit of a check that exists, and
+		// only the control plane binds secrets to an origin.
+		req.PausedNodeIDs = nil
+		req.SecretsOrigin = ""
 		switch req.Type {
-		case model.MonitorTypeTCP, model.MonitorTypeHTTP:
+		case model.MonitorTypeTCP, model.MonitorTypeHTTP, model.MonitorTypeICMP, model.MonitorTypeBeacon:
 			if !req.AssignAll && len(req.NodeIDs) == 0 {
 				writeError(w, http.StatusBadRequest, errors.New("set assign_all or provide node_ids"))
 				return
@@ -5364,6 +5439,12 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			if !req.AssignAll && !s.requireAllNodeScopes(w, p, "monitor:admin", req.NodeIDs) {
 				return
 			}
+			// A check that names a node reveals that node's addresses and
+			// measures it, so the caller must be able to read it.
+			if req.TargetNode != "" && !latencyNodeVisible(p, req.TargetNode) {
+				writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden: target_node is not a node this token may read"))
+				return
+			}
 			req.ThresholdDays = 0
 			if req.IntervalSec <= 0 {
 				req.IntervalSec = 30
@@ -5371,7 +5452,37 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			if req.TimeoutSec <= 0 {
 				req.TimeoutSec = 5
 			}
+			targets := s.monitorTargetsAt(s.now())
+			var err error
+			switch req.Type {
+			case model.MonitorTypeHTTP:
+				err = normalizeHTTPMonitor(&req, true)
+			case model.MonitorTypeICMP:
+				err = targets.normalizeICMPMonitor(&req)
+			case model.MonitorTypeBeacon:
+				err = targets.normalizeBeaconMonitor(&req)
+			default:
+				err = targets.normalizeTCPMonitor(&req)
+			}
+			if err == nil {
+				err = validMonitorTiming(req.IntervalSec, req.TimeoutSec)
+			}
+			if err == nil {
+				err = validMonitorRun(req)
+			}
+			if err == nil && model.MonitorKindSendsPackets(req.Type) {
+				req.Enabled = true
+				err = targets.checkPacketBudget(s.store.Monitors(), req)
+			}
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
 		case model.MonitorTypeTLS:
+			if req.TargetNode != "" || req.Packets != 0 || req.ExpectStatus != "" || len(req.Headers) > 0 {
+				writeError(w, http.StatusBadRequest, errors.New("a tls check takes a host:port target and a warning window; target_node, packets, expect_status and headers do not apply"))
+				return
+			}
 			// A tls monitor has no node to be restricted to, so a token that
 			// may only touch some nodes may not create one.
 			if principalHasNodeRestriction(p) {
@@ -5385,10 +5496,15 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			}
 			req = normalized
 		default:
-			writeError(w, http.StatusBadRequest, errors.New("only tcp, http and tls monitors are supported (icmp pending)"))
+			writeError(w, http.StatusBadRequest, errors.New("only tcp, http, icmp, beacon and tls monitors are supported"))
+			return
+		}
+		if err := validMonitorTiming(req.IntervalSec, req.TimeoutSec); err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		req.ID = id.New("mon")
+		req.Version = 1
 		req.Enabled = true
 		// Only the control plane marks a monitor as generated; a client
 		// that sends the field would make a monitor nobody can delete.
@@ -5397,8 +5513,19 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "monitor.create", Scope: "monitor:admin", Metadata: map[string]string{"monitor_id": req.ID, "type": req.Type}})
-		writeJSON(w, http.StatusOK, req)
+		meta := map[string]string{"monitor_id": req.ID, "type": req.Type}
+		if req.TargetNode != "" {
+			meta["target_node"] = req.TargetNode
+		}
+		if len(req.Headers) > 0 {
+			meta["headers"] = monitorHeaderNames(req.Headers)
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "monitor.create", Scope: "monitor:admin", Metadata: meta})
+		stored, ok := s.store.Monitor(req.ID)
+		if !ok {
+			stored = req
+		}
+		writeJSON(w, http.StatusOK, s.monitorViews([]model.Monitor{stored}, s.now())[0])
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -5495,19 +5622,26 @@ func monitorLatestViews(p principal, mon model.Monitor, pairs []store.MonitorLat
 	return out
 }
 
+// monitorPairAssigned reports whether the monitor checks from nodeID now: an
+// assigned source that is not paused, or the control plane for tls.
 func monitorPairAssigned(mon model.Monitor, nodeID string) bool {
 	if mon.Type == model.MonitorTypeTLS {
 		return nodeID == ""
 	}
-	return nodeID != "" && (mon.AssignAll || slices.Contains(mon.NodeIDs, nodeID))
+	return nodeID != "" && (mon.AssignAll || slices.Contains(mon.NodeIDs, nodeID)) && !slices.Contains(mon.PausedNodeIDs, nodeID)
 }
 
 func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) bool {
-	if target, ok := strings.CutPrefix(mon.ID, latencyMonitorPrefix); ok && mon.ManagedBy == model.MonitorManagedLatency &&
-		!rbac.Allows(p.Principal, scope, target) {
-		// A generated latency monitor carries its target's address and
-		// name; a principal confined to the source must also be able to
-		// read the target, as the latency reads demand.
+	target := mon.TargetNode
+	if target == "" && mon.ManagedBy == model.MonitorManagedLatency {
+		// A generated check stored before checks carried their target
+		// node names it in its id.
+		target, _ = latencyGeneratedTarget(mon.ID)
+	}
+	if target != "" && !rbac.Allows(p.Principal, scope, target) {
+		// A check that names a node carries that node's address and name;
+		// a principal confined to the source must also be able to read
+		// the target, as the path reads demand.
 		return false
 	}
 	if mon.AssignAll {
@@ -5525,6 +5659,12 @@ func monitorVisibleToPrincipal(p principal, scope string, mon model.Monitor) boo
 }
 
 func monitorManageableByPrincipal(p principal, mon model.Monitor) bool {
+	// A check that names a node is managed only by a caller who may read
+	// that node, as creating it required: an edit's answer carries the
+	// node's resolved address.
+	if mon.TargetNode != "" && !latencyNodeVisible(p, mon.TargetNode) {
+		return false
+	}
 	if mon.AssignAll {
 		return !principalHasNodeRestriction(p) && rbac.Allows(p.Principal, "monitor:admin", "")
 	}
@@ -5540,11 +5680,67 @@ func monitorManageableByPrincipal(p principal, mon model.Monitor) bool {
 // handleAgentMonitors returns the monitors an authenticated agent should run.
 func (s *Server) handleAgentMonitors(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.URL.Query().Get("node_id")
-	if _, ok := s.authenticateNode(r, nodeID, bearerToken(r)); !ok {
+	node, ok := s.authenticateNode(r, nodeID, bearerToken(r))
+	if !ok {
 		writeError(w, http.StatusUnauthorized, apiError(model.APIErrorInvalidNodeToken, "invalid node token"))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.MonitorsForNode(nodeID))
+	writeJSON(w, http.StatusOK, s.agentMonitorsFor(node, s.store.MonitorsForNode(nodeID), s.now()))
+}
+
+// agentMonitorsFor is the monitor list one agent runs (design 29 D1): the
+// enabled checks assigned to it and not paused, less the kinds its agent
+// does not run (an older agent would report an unknown kind as a
+// failure), with every node target resolved now. A check whose node cannot
+// be resolved for its kind is left out until it can. Secret header values
+// are included: this list goes only to the node the check is assigned to.
+func (s *Server) agentMonitorsFor(node model.Node, assigned []model.Monitor, now time.Time) []model.Monitor {
+	out := make([]model.Monitor, 0, len(assigned))
+	var targets *monitorTargets
+	for _, mon := range assigned {
+		if monitorProbeGate(node, mon) != "" {
+			continue
+		}
+		// A beacon check goes only to a source the target's applied plan
+		// approved, to a target that can answer; the key it signs with
+		// comes in the same pull's config.
+		if mon.Type == model.MonitorTypeBeacon && (mon.TargetNode == "" || s.beaconMonitorGate(node, mon.TargetNode, now) != "") {
+			continue
+		}
+		if mon.TargetNode != "" && mon.ManagedBy == "" {
+			if targets == nil {
+				t := s.monitorTargetsAt(now)
+				targets = &t
+			}
+			resolved, ok := targets.resolved(mon)
+			if !ok {
+				continue
+			}
+			mon = resolved
+		}
+		out = append(out, mon)
+	}
+	return out
+}
+
+// monitorViews is the read form of monitors: node targets resolved as an
+// agent would be handed them now, and secret header values removed.
+func (s *Server) monitorViews(monitors []model.Monitor, now time.Time) []monitorView {
+	views := toMonitorViews(monitors)
+	var targets *monitorTargets
+	for i, mon := range monitors {
+		if mon.TargetNode == "" || mon.ManagedBy != "" {
+			continue
+		}
+		if targets == nil {
+			t := s.monitorTargetsAt(now)
+			targets = &t
+		}
+		if resolved, ok := targets.resolved(mon); ok {
+			views[i].Target = resolved.Target
+		}
+	}
+	return views
 }
 
 // notifyChannelView is the secret-free projection of a notification channel.
@@ -6000,15 +6196,18 @@ func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorRes
 	if current.Success && priorFailStreak == 0 {
 		return
 	}
-	if !current.Success && priorFailStreak != 1 {
+	mon, _ := s.store.Monitor(current.MonitorID)
+	after := store.MonitorAlertAfter(mon)
+	if !current.Success && priorFailStreak != after-1 {
 		return
 	}
-	mon, _ := s.store.Monitor(current.MonitorID)
-	if mon.ManagedBy == model.MonitorManagedLatency {
+	if !monitorPages(mon) {
 		// Latency probes do not page one pair at a time: a path from China
 		// drops probes routinely, and twenty targets would page twenty
 		// times. A degradation alert belongs to the incident path, judged
-		// on the pair's rollups (latencyRollupsFor) instead.
+		// on the pair's rollups (latencyRollupsFor) instead. A check whose
+		// alert policy is off never pages; the incident sweep closes what
+		// it had open when the policy changed.
 		return
 	}
 	if mon.ID == "" {
@@ -6030,7 +6229,7 @@ func (s *Server) notifyMonitorTransition(nodeID string, current model.MonitorRes
 	s.openIncident(incidentSignal{
 		kind: EventMonitorDown, nodeID: nodeID, monitorID: current.MonitorID,
 		subject: name + " on " + where, since: now, sortKey: name + "\x00" + where,
-		msg: monitorDownMessage(name, where, current.Error),
+		msg: monitorDownMessage(name, where, current.Error, after),
 	}, now)
 }
 
@@ -6052,15 +6251,27 @@ func (s *Server) monitorNames(mon model.Monitor, nodeID string) (name, where str
 	return name, where
 }
 
-func monitorDownMessage(name, where, errText string) incidentMessage {
+func monitorDownMessage(name, where, errText string, after int) incidentMessage {
 	detail := strings.TrimSpace(errText)
 	if detail == "" {
 		detail = "probe failed"
 	}
 	return incidentMessage{
 		title:  fmt.Sprintf("Monitor down: %s on %s", name, where),
-		detail: fmt.Sprintf("%s on %s failed twice in a row: %s", name, where, detail),
+		detail: fmt.Sprintf("%s on %s failed %s: %s", name, where, monitorFailCount(after), detail),
 		line:   fmt.Sprintf("%s on %s: %s", name, where, detail),
+	}
+}
+
+// monitorFailCount says how many failures in a row a page waited for.
+func monitorFailCount(n int) string {
+	switch n {
+	case 1:
+		return "once"
+	case 2:
+		return "twice in a row"
+	default:
+		return fmt.Sprintf("%d times in a row", n)
 	}
 }
 
@@ -7383,6 +7594,19 @@ func requestBool(r *http.Request, key string) bool {
 // real fix and needs an SDK field.
 func (s *Server) approvalPlanReach(approval model.Approval) (string, []string) {
 	switch {
+	case isBeaconApproval(approval):
+		// The plan names every source with its addresses.
+		plan, err := beaconPlanOf(approval)
+		if err != nil {
+			return "", nil
+		}
+		sources := make([]string, 0, len(plan.Sources))
+		for _, src := range plan.Sources {
+			if src.NodeID != approval.NodeID {
+				sources = append(sources, src.NodeID)
+			}
+		}
+		return "monitor:read", sources
 	case approval.Plugin == "wireguard" && approval.Action == "apply-config":
 		// The plan is a mesh config: every member's public key, mesh IP and
 		// endpoint is in the bytes.
@@ -7507,6 +7731,11 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 		// so reading one needs it unconfined as well.
 		return !principalHasNodeRestriction(p) &&
 			rbac.Allows(p.Principal, "notify:admin", "") &&
+			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
+	case model.BeaconApprovalPlugin:
+		// A node.beacon plan names the beacon's sources and their addresses
+		// and, under NetGuard, the node's whole ruleset; it carries no key.
+		return rbac.Allows(p.Principal, "monitor:read", approval.NodeID) &&
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
 	case sshGuardPlugin:
 		// An SSH Guard plan carries the node's knock sequence in plaintext,
@@ -8671,6 +8900,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	if isSubStorePlanApproval(approval) {
 		return s.subStorePlanApprove(ctx, p, approval, queueApply)
 	}
+	// A node.beacon plan's effect is the control plane's own state, which
+	// reaches the node through its config pull; only its NetGuard
+	// companion, when there is one, is a node task (beacon_plan.go).
+	if isBeaconApproval(approval) {
+		return s.beaconApprove(ctx, p, approval, queueApply)
+	}
 	if queueApply && s.taskExecutionDisabled {
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:       id.New("audit"),
@@ -9200,6 +9435,11 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 	case witnessPlugin:
 		// Approving hands a stored channel's device key to a node.
 		return "notify:admin"
+	case model.BeaconApprovalPlugin:
+		// Approving opens or closes a port on the node; beaconApprove also
+		// asks for node:admin, and netguard:admin when NetGuard rules ride
+		// along.
+		return "monitor:admin"
 	case subStorePlanApprovalPlugin:
 		// Approving changes what existing share holders receive, which the
 		// share API guards with proxy:admin.
@@ -9297,6 +9537,15 @@ func (s *Server) handleAgentHello(w http.ResponseWriter, r *http.Request) {
 	if hostFacts, ok := normalizeHostFacts(req.HostFacts, s.now()); ok {
 		n.HostFacts = hostFacts
 	}
+	n.ProbeMethods, n.ProbeRefusals = normalizeProbeFacts(req.ProbeMethods, req.ProbeRefusals)
+	// The beacon report is replaced on every hello, as probe_methods are.
+	if facts := normalizeBeaconFacts(req.Beacon, s.now()); facts != nil {
+		s.beacon.noteFacts(n.ID, *facts)
+		n.Beacon = beaconFactsDurable(facts)
+	} else {
+		n.Beacon = nil
+		s.beacon.forgetFacts(n.ID)
+	}
 	n.LastSeen = time.Now().UTC()
 	cameOnline := !n.Online
 	if cameOnline {
@@ -9373,6 +9622,14 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	s.selfmon.observeBeat(req.NodeID, req.Metrics, s.now())
 	s.replaceAgentCapabilities(req.NodeID, req.Capabilities)
+	// The facts are written only when they changed; a failed write is
+	// logged, never a failed beat, and the next beat tries again.
+	if methods, refusals := normalizeProbeFacts(req.ProbeMethods, req.ProbeRefusals); !slices.Equal(methods, old.ProbeMethods) || !maps.Equal(refusals, old.ProbeRefusals) {
+		if err := s.store.SetNodeProbeFacts(req.NodeID, methods, refusals); err != nil {
+			s.logger.Printf("agent probe facts for node %s not stored: %v", req.NodeID, err)
+		}
+	}
+	s.noteBeaconFacts(req.NodeID, old.Beacon, req.Beacon)
 	if old.PublicIP != v4 || old.PublicIPv6 != v6 {
 		s.invalidateLineReadModel()
 	}
@@ -9650,6 +9907,9 @@ func (s *Server) handleApprovalTaskResult(r *http.Request, task model.Task, resu
 	if isWitnessApproval(approval) {
 		return s.handleWitnessTaskResult(r, approval, task, result)
 	}
+	if isBeaconApproval(approval) {
+		return s.handleBeaconTaskResult(r, approval, task, result)
+	}
 	if isPluginOperationApproval(approval) {
 		return s.handlePluginOperationTaskResult(r, approval, task, result)
 	}
@@ -9869,6 +10129,14 @@ type agentAuthRequest struct {
 	WGEndpoint   string          `json:"wireguard_endpoint"`
 	WGPort       int             `json:"wireguard_port"`
 	HostFacts    model.HostFacts `json:"host_facts"`
+	// ProbeMethods and ProbeRefusals are the monitor kinds the agent runs
+	// and the ones its host refuses (design 29 M2a); absent from agents
+	// that predate them.
+	ProbeMethods  []string          `json:"probe_methods"`
+	ProbeRefusals map[string]string `json:"probe_refusals"`
+	// Beacon is the agent's report about its beacon responder (design 29
+	// D12); absent from agents that predate it.
+	Beacon *model.BeaconFacts `json:"beacon"`
 }
 
 var blockedReportedPublicPrefixes = []netip.Prefix{

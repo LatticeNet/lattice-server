@@ -18,7 +18,13 @@ import (
 // the defaults a test reads paths through.
 func newPathsServer(t testing.TB) (*Server, http.Handler, *store.Store) {
 	t.Helper()
-	dir := t.TempDir()
+	return newPathsServerAt(t, t.TempDir())
+}
+
+// newPathsServerAt is newPathsServer on the state in dir, so a test can stop
+// a server and start another on what the first one wrote.
+func newPathsServerAt(t testing.TB, dir string) (*Server, http.Handler, *store.Store) {
+	t.Helper()
 	st, err := store.OpenWithCipher(filepath.Join(dir, "state.json"), nil)
 	if err != nil {
 		t.Fatal(err)

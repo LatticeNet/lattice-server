@@ -35,11 +35,11 @@ const (
 const beaconErrorMax = 200
 
 // beaconRuntime is the in-memory beacon state: each node's latest facts
-// report and the egress address its authenticated requests came from.
+// report. The egress addresses a plan depends on are durable
+// (store.BeaconRegistry.Egress).
 type beaconRuntime struct {
-	mu     sync.Mutex
-	facts  map[string]model.BeaconFacts
-	egress map[string]string
+	mu    sync.Mutex
+	facts map[string]model.BeaconFacts
 	// reachMu serializes the reachability check's writes: a sync and a
 	// verdict arriving together must not overwrite each other.
 	reachMu sync.Mutex
@@ -67,10 +67,13 @@ func (b *beaconRuntime) latestFacts(nodeID string) (model.BeaconFacts, bool) {
 	return f, ok
 }
 
-// noteEgress records the address a node's agent connected from, kept only
-// when it is a global IPv4 address: an agent reaching the control plane over
-// WireGuard or a private network says nothing about where its probes leave.
-func (b *beaconRuntime) noteEgress(nodeID, ip string) {
+// noteBeaconEgress records the address a node's agent connected from, kept
+// only when it is a global IPv4 address: an agent reaching the control plane
+// over WireGuard or a private network says nothing about where its probes
+// leave. The record is durable and written only when the address moves, so
+// a node.beacon plan rendered again after a restart admits the same
+// addresses it was made with, before every source has pulled again.
+func (s *Server) noteBeaconEgress(nodeID, ip string) {
 	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
 	if err != nil || !addr.Unmap().Is4() {
 		return
@@ -79,18 +82,9 @@ func (b *beaconRuntime) noteEgress(nodeID, ip string) {
 	if model.MonitorDestinationRefused(addr) || beacon.AddressRefused(addr) {
 		return
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.egress == nil {
-		b.egress = map[string]string{}
+	if err := s.store.SetBeaconEgress(nodeID, addr.String()); err != nil {
+		s.logger.Printf("beacon egress of node %s not recorded: %v", nodeID, err)
 	}
-	b.egress[nodeID] = addr.String()
-}
-
-func (b *beaconRuntime) egressOf(nodeID string) string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.egress[nodeID]
 }
 
 // beaconFactsOf is a node's latest beacon report: the in-memory one when

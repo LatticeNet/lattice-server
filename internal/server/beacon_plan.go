@@ -249,7 +249,7 @@ func (s *Server) buildBeaconPlan(node model.Node, action string, settings model.
 // seen connecting from when that differs from both.
 func (s *Server) beaconSourceAllow(n model.Node) []string {
 	var out []string
-	for _, raw := range []string{n.PublicIP, n.WireGuardIP, s.beacon.egressOf(n.ID)} {
+	for _, raw := range []string{n.PublicIP, n.WireGuardIP, s.store.BeaconEgress(n.ID)} {
 		addr, err := beacon.ParseIPv4(strings.TrimSpace(raw))
 		if err != nil {
 			continue

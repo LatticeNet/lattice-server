@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -64,5 +66,53 @@ func TestBeaconPortChangeStartsAReachabilityCheck(t *testing.T) {
 		if bt, _ := st.BeaconTarget("node-t"); bt.ReachArmed || bt.Reach.State != model.BeaconReachReachable {
 			t.Fatalf("%s change: verdict = %+v armed=%v", c.name, bt.Reach, bt.ReachArmed)
 		}
+	}
+}
+
+// A pending node.beacon approval renders the same document after a server
+// restart. A NetGuard plan admits each source's egress address, which the
+// server sees on the source's config pulls; after a restart, before a NAT
+// source pulls again, the approval must not read stale for want of it.
+func TestBeaconApprovalSurvivesARestart(t *testing.T) {
+	dir := t.TempDir()
+	srv, handler, st := newPathsServerAt(t, dir)
+	seedBeaconFleet(t, srv, st)
+	if _, err := st.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "node-t", Managed: true}); err != nil {
+		t.Fatal(err)
+	}
+	srv.replaceAgentCapabilities("node-t", []string{netGuardManagedSHACapability})
+	srv.noteBeaconEgress("node-b", "203.0.113.122") // a NAT source's real egress
+	code, out, raw := planBeacon(t, handler, model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionEnable})
+	if code != 200 {
+		t.Fatalf("plan = %d %s", code, raw)
+	}
+	if out.Plan.NetGuard == nil || !slices.Contains(out.Plan.NetGuard.Allow, "203.0.113.122/32") {
+		t.Fatalf("the plan does not admit node-b's egress: %+v", out.Plan.NetGuard)
+	}
+	if _, err := srv.currentBeaconPlan(out.Approval, srv.now()); err != nil {
+		t.Fatalf("before the restart: %v", err)
+	}
+
+	// Restart: a new server on what the first one wrote. node-t reconnects
+	// (its agent capabilities are per connection); node-b has not pulled.
+	srv.Close(context.Background())
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	srv2, _, st2 := newPathsServerAt(t, dir)
+	srv2.now = func() time.Time { return beaconT0.Add(time.Minute) }
+	srv2.replaceAgentCapabilities("node-t", []string{netGuardManagedSHACapability})
+	approval, ok := st2.Approval(out.Approval.ID)
+	if !ok || approval.Status != model.ApprovalPending {
+		t.Fatalf("the approval after the restart = %+v %v", approval, ok)
+	}
+	if _, err := srv2.currentBeaconPlan(approval, srv2.now()); err != nil {
+		t.Fatalf("after the restart the pending plan re-renders differently: %v", err)
+	}
+	if _, err := decideBeacon(srv2, approval, beaconAdmin()); err != nil {
+		t.Fatalf("approve after the restart: %v", err)
+	}
+	if bt, _ := st2.BeaconTarget("node-t"); bt.Companion == nil || !slices.Contains(bt.Companion.Allow, "203.0.113.122/32") {
+		t.Fatalf("the applied companion = %+v", bt.Companion)
 	}
 }

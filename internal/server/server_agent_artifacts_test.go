@@ -596,7 +596,7 @@ func TestAgentArtifactListingSaysWhenItCannotServeWhatItHolds(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedLinuxAgentNode(t, st)
-	if _, ok := srv.controlPlaneAgentBinaryURL("0.3.4", "linux", "amd64", digest); ok {
+	if _, ok := srv.controlPlaneAgentArtifact("0.3.4", "linux", "amd64", digest); ok {
 		t.Fatal("without an https public URL there is no address a node can be sent to")
 	}
 

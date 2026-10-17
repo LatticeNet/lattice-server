@@ -40,10 +40,10 @@ const (
 	// maxAgentArtifactStoreBytes caps everything the bucket holds, measured on
 	// the stored base64 form. Static is read into memory at startup, so this is
 	// a resident-memory ceiling as much as a disk one. A raw 14 MB binary takes
-	// about 18.7 MB of it, so 128 MiB held only six or seven, three versions
-	// across linux/amd64 and linux/arm64, and it filled once. An import stores
-	// the gzip form instead (5.55 MB for 0.3.10-alpha.6 linux/amd64, 7.4 MB
-	// encoded), which fits about seventeen. Uploads past the cap are refused
+	// 18.7 MB of it encoded, so 128 MiB held seven, three versions across
+	// linux/amd64 and linux/arm64, and it filled once. An import stores the
+	// gzip form instead (5,552,813 bytes for 0.3.10-alpha.6 linux/amd64,
+	// 7,403,752 encoded), which fits eighteen. Uploads past the cap are refused
 	// with the current usage named, never silently evicted: evicting a binary a
 	// queued approval still needs would strand exactly the nodes this feature
 	// exists to unstick.
@@ -355,16 +355,6 @@ func normalizeAgentBinaryBaseURL(publicURL string) string {
 	return raw
 }
 
-// controlPlaneAgentBinaryURL returns the node-facing URL when the control plane
-// already holds exactly the bytes the plan pins. The stored digest must equal
-// the pinned digest: serving from a closer place must never become a way to
-// serve different bytes, so a stored artifact that disagrees with the pin is
-// ignored rather than substituted.
-func (s *Server) controlPlaneAgentBinaryURL(version, osName, arch, sha256Hex string) (string, bool) {
-	artifact, ok := s.controlPlaneAgentArtifact(version, osName, arch, sha256Hex)
-	return artifact.url, ok
-}
-
 // agentControlPlaneArtifact is what a plan takes from a stored artifact: the
 // URL a node fetches, the digests it names, and, for a gzip object, both
 // sizes, which the apply script needs to bound decompression and to compare
@@ -376,6 +366,11 @@ type agentControlPlaneArtifact struct {
 	compressedSize int
 }
 
+// controlPlaneAgentArtifact returns what a plan needs when the control plane
+// already holds exactly the binary the plan pins. The stored digest must
+// equal the pinned digest: serving from a closer place must never become a
+// way to serve different bytes, so a stored artifact that disagrees with the
+// pin is ignored rather than substituted.
 func (s *Server) controlPlaneAgentArtifact(version, osName, arch, sha256Hex string) (agentControlPlaneArtifact, bool) {
 	base := s.agentBinaryBaseURL()
 	if base == "" {
@@ -388,9 +383,11 @@ func (s *Server) controlPlaneAgentArtifact(version, osName, arch, sha256Hex stri
 	out := agentControlPlaneArtifact{ref: ref, url: base + ref.urlPath()}
 	if ref.GzipSHA256 != "" {
 		out.binarySize, out.compressedSize = agentArtifactSizes(ref, obj.Content)
-		if out.binarySize <= 0 || out.binarySize > maxAgentArtifactBytes || out.compressedSize <= 0 {
-			// A gzip object whose sizes cannot be read is not something a plan
-			// can bound, so it is not offered at all and the plan stays on the
+		if out.binarySize <= 0 || out.binarySize > maxAgentArtifactBytes ||
+			out.compressedSize <= 0 || out.compressedSize > maxAgentArtifactBytes {
+			// A gzip object whose sizes cannot be read, or that the payload
+			// check would refuse at apply time, is not something a plan can
+			// bound, so it is not offered at all and the plan stays on the
 			// upstream release.
 			return agentControlPlaneArtifact{}, false
 		}
@@ -1048,8 +1045,9 @@ func (s *Server) authorizeAgentBinaryRequest(r *http.Request, ref agentArtifactR
 	if payload.TargetVersion != ref.Version || !strings.EqualFold(payload.SHA256, ref.SHA256) {
 		return node, task, errAgentBinaryDenied
 	}
-	// The compressed object goes only to a plan that pinned exactly it.
-	if ref.GzipSHA256 != "" && payload.CompressedSHA256 != ref.GzipSHA256 {
+	// The compressed object goes only to a plan that pinned exactly it, and
+	// a plan that pinned it fetches nothing else.
+	if payload.CompressedSHA256 != ref.GzipSHA256 {
 		return node, task, errAgentBinaryDenied
 	}
 	osName, arch, err := agentPlatformForNode(node)

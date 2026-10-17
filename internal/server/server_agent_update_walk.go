@@ -203,7 +203,8 @@ func agentUpdateWalkCandidateStep(compressed bool) string {
 // with the reason named.
 //
 // A kept file that already holds the pinned bytes ends the walk before any
-// fetch (agentWalkKeptCheck).
+// fetch, and an incomplete walk checks its files once more before it fails
+// (agentWalkKeptCheck).
 func agentUpdateWalkStep(payload agentUpdatePayload) string {
 	sources := agentUpdateFetchSources(payload)
 	var b strings.Builder
@@ -365,8 +366,11 @@ func agentUpdateWalkStep(payload agentUpdatePayload) string {
 		"  done\n" +
 		"fi\n")
 
-	// An incomplete walk: drop a partial no source could continue, report
-	// what is kept, and fail with the last fetch's status.
+	// An incomplete walk: a fetch may have completed a file and still
+	// failed, so check the kept files again. Otherwise drop a partial no
+	// source could continue, report what is kept, and fail with the last
+	// fetch's status.
+	b.WriteString("if [ \"$FETCH_DONE\" = 0 ]; then fetch_kept; fi\n")
 	b.WriteString("if [ \"$FETCH_DONE\" = 0 ]; then\n")
 	for _, file := range agentWalkFiles(sources) {
 		var reached, refused []string
@@ -395,15 +399,17 @@ func agentUpdateWalkStep(payload agentUpdatePayload) string {
 	return b.String()
 }
 
-// agentWalkKeptCheck finishes the walk before it fetches anything when a kept
-// file already holds the pinned bytes. Fetching it would not: a range request
-// that starts at the end of the file is answered 416, which curl 8 treats as
-// done and curl 7 (Debian 12 ships 7.88, Ubuntu 22.04 7.81) reports as exit
-// 22, so on those nodes a complete kept file, one a later step failed on or
-// one fetched in full by a run that was then cut, could never be finished
-// again. A compressed plan pins both sizes, so a kept file of full length
-// that fails its digest is dropped here too, rather than asked for a range
-// past its end.
+// agentWalkKeptCheck renders fetch_kept, which finishes the walk when a kept
+// file already holds the pinned bytes, and runs it before the first fetch.
+// Fetching such a file would not finish it: a range request that starts at
+// its end is answered 416, which curl 8 treats as done and curl 7 (Debian 12
+// ships 7.88, Ubuntu 22.04 7.81) reports as exit 22, so on those nodes a
+// complete kept file, one a later step failed on or one fetched in full by a
+// run that was then cut, could never be finished again. The walk runs it once
+// more after an incomplete walk, for a file that a fetch completed before
+// failing, or that a second-pass range request then found complete. A
+// compressed plan pins both sizes, so a kept file of full length that fails
+// its digest is dropped as well, rather than asked for a range past its end.
 func agentWalkKeptCheck(compressed bool) string {
 	var b strings.Builder
 	b.WriteString("fetch_sha() {\n" +
@@ -411,29 +417,32 @@ func agentWalkKeptCheck(compressed bool) string {
 		"  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 \"$1\" | awk '{print $1}'\n" +
 		"  fi\n" +
 		"}\n")
-	b.WriteString("if [ -s \"$CANDIDATE\" ]; then\n" +
-		"  if [ \"$(fetch_sha \"$CANDIDATE\")\" = \"$EXPECT_SHA\" ]; then\n" +
-		"    FETCH_DONE=kept\n" +
-		"    FETCH_DONE_FILE=$CANDIDATE\n")
+	b.WriteString("fetch_kept() {\n" +
+		"  if [ -s \"$CANDIDATE\" ]; then\n" +
+		"    if [ \"$(fetch_sha \"$CANDIDATE\")\" = \"$EXPECT_SHA\" ]; then\n" +
+		"      FETCH_DONE=kept\n" +
+		"      FETCH_DONE_FILE=$CANDIDATE\n")
 	if compressed {
-		b.WriteString("  elif [ \"$(fetch_size \"$CANDIDATE\")\" -ge \"$EXPECT_SIZE\" ]; then\n" +
-			"    rm -f \"$CANDIDATE\"\n")
+		b.WriteString("    elif [ \"$(fetch_size \"$CANDIDATE\")\" -ge \"$EXPECT_SIZE\" ]; then\n" +
+			"      rm -f \"$CANDIDATE\"\n")
 	}
-	b.WriteString("  fi\n" +
-		"fi\n")
+	b.WriteString("    fi\n" +
+		"  fi\n")
 	if compressed {
-		b.WriteString("if [ \"$FETCH_DONE\" = 0 ] && [ -s \"$PACKED\" ]; then\n" +
-			"  if [ \"$(fetch_sha \"$PACKED\")\" = \"$EXPECT_PACKED_SHA\" ]; then\n" +
-			"    FETCH_DONE=kept\n" +
-			"    FETCH_DONE_FILE=$PACKED\n" +
-			"  elif [ \"$(fetch_size \"$PACKED\")\" -ge \"$EXPECT_PACKED_SIZE\" ]; then\n" +
-			"    rm -f \"$PACKED\"\n" +
-			"  fi\n" +
-			"fi\n")
+		b.WriteString("  if [ \"$FETCH_DONE\" = 0 ] && [ -s \"$PACKED\" ]; then\n" +
+			"    if [ \"$(fetch_sha \"$PACKED\")\" = \"$EXPECT_PACKED_SHA\" ]; then\n" +
+			"      FETCH_DONE=kept\n" +
+			"      FETCH_DONE_FILE=$PACKED\n" +
+			"    elif [ \"$(fetch_size \"$PACKED\")\" -ge \"$EXPECT_PACKED_SIZE\" ]; then\n" +
+			"      rm -f \"$PACKED\"\n" +
+			"    fi\n" +
+			"  fi\n")
 	}
-	b.WriteString("if [ \"$FETCH_DONE\" != 0 ]; then\n" +
-		"  echo \"lattice agent update: the download kept in $FETCH_DONE_FILE is already complete\"\n" +
-		"fi\n")
+	b.WriteString("  if [ \"$FETCH_DONE\" = kept ]; then\n" +
+		"    echo \"lattice agent update: $FETCH_DONE_FILE already holds the pinned bytes\"\n" +
+		"  fi\n" +
+		"}\n" +
+		"fetch_kept\n")
 	return b.String()
 }
 

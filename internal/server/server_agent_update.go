@@ -1711,7 +1711,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"  echo 'lattice agent update: sha256sum or shasum is required' >&2\n" +
 		"  exit 1\n" +
 		"fi\n" +
-		agentUpdateMismatch(payload.ResumeDownload, walk, compressed) +
+		agentUpdateMismatch(payload, walk) +
 		agentUpdateVerifiedModeStep(payload.ResumeDownload) +
 		"CANDIDATE_VERSION=$(\"$CANDIDATE\" -version)\n" +
 		"if [ \"$CANDIDATE_VERSION\" != \"$TARGET_VERSION\" ]; then\n" +
@@ -1728,7 +1728,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"fi\n" +
 		"install -m 0755 \"$CANDIDATE\" \"$TARGET.new\"\n" +
 		"mv \"$TARGET.new\" \"$TARGET\"\n" +
-		agentUpdateInstalled(payload.ResumeDownload, walk, compressed) +
+		agentUpdateInstalled(payload, walk) +
 		agentUpdateKeepaliveStep(approval.Plan) +
 		"systemctl daemon-reload\n" +
 		agentUpdateGuardStep(approval.Plan) +
@@ -1752,18 +1752,18 @@ func agentUpdateDownload(payload agentUpdatePayload, source string, walk bool) s
 		agentUpdateFetchStep(source, payload.FallbackURL != "", payload.ResumeDownload)
 }
 
-func agentUpdateMismatch(resume, walk, compressed bool) string {
+func agentUpdateMismatch(payload agentUpdatePayload, walk bool) string {
 	if walk {
-		return agentUpdateWalkDigestMismatchStep(compressed)
+		return agentUpdateWalkDigestMismatchStep(payload.CompressedSHA256 != "")
 	}
-	return agentUpdateDigestMismatchStep(resume)
+	return agentUpdateDigestMismatchStep(payload.ResumeDownload)
 }
 
-func agentUpdateInstalled(resume, walk, compressed bool) string {
+func agentUpdateInstalled(payload agentUpdatePayload, walk bool) string {
 	if walk {
-		return agentUpdateWalkInstalledStep(compressed)
+		return agentUpdateWalkInstalledStep(payload.CompressedSHA256 != "")
 	}
-	return agentUpdateInstalledStep(resume)
+	return agentUpdateInstalledStep(payload.ResumeDownload)
 }
 
 // agentUpdateLeasePreflight stops a control-plane download before it starts on
@@ -2124,6 +2124,7 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 	// applied before its task result lands. A result cannot un-apply what the
 	// node has proven, so it is recorded as a task result and nothing else.
 	if approval.Status == model.ApprovalApplied {
+		s.recordAgentUpdateFetch(r, approval, payload, result)
 		return nil
 	}
 	policy, ok := s.store.AgentUpdatePolicy(payload.NodeID)
@@ -2160,6 +2161,7 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 		return err
 	}
 	if !written {
+		s.recordAgentUpdateFetch(r, approval, payload, result)
 		return nil
 	}
 	if err := s.store.UpsertAgentUpdatePolicy(policy); err != nil {
@@ -2183,6 +2185,23 @@ func (s *Server) handleAgentUpdateTaskResult(r *http.Request, approval model.App
 	}
 	s.recordRequestAudit(r, ev)
 	return nil
+}
+
+// recordAgentUpdateFetch keeps the fetch summary of a result that arrives
+// after the node's own report already applied its approval. Those are often
+// the slow downloads that finished, the measurement the summary exists for.
+func (s *Server) recordAgentUpdateFetch(r *http.Request, approval model.Approval, payload agentUpdatePayload, result model.TaskResult) {
+	summary, ok := parseAgentFetchSummary(result.Stderr)
+	if !ok {
+		return
+	}
+	s.recordRequestAudit(r, model.AuditEvent{
+		ID:       id.New("audit"),
+		NodeID:   approval.NodeID,
+		Action:   "agent.update.fetch",
+		Decision: "observe",
+		Metadata: map[string]string{"target_version": payload.TargetVersion, "approval_id": approval.ID, "fetch": summary},
+	})
 }
 
 func agentUpdateAwaitingConfirmationReason(targetVersion string) string {

@@ -212,6 +212,16 @@ if [ "$code" != 0 ]; then echo "stub: ($code) failed" >&2; fi
 exit "$code"
 `
 
+// walkToolMissing skips a run that needs a tool the host lacks, except in
+// CI, where a missing curl or wget would silently drop the real-source tests.
+func walkToolMissing(t *testing.T, tool string) {
+	t.Helper()
+	if os.Getenv("CI") != "" {
+		t.Fatalf("no %s on this CI runner; the walk's real-source tests need it", tool)
+	}
+	t.Skipf("no %s on this host", tool)
+}
+
 func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 	t.Helper()
 	dir := t.TempDir()
@@ -244,7 +254,7 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 		path, err := exec.LookPath(tool)
 		if err != nil {
 			if tool == r.fetcher {
-				t.Skipf("no %s on this host", tool)
+				walkToolMissing(t, tool)
 			}
 			continue
 		}
@@ -278,7 +288,7 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 	wrap := func(name string) {
 		path, err := exec.LookPath(name)
 		if err != nil {
-			t.Skipf("no %s on this host", name)
+			walkToolMissing(t, name)
 		}
 		stubs[name] = "#!/bin/sh\nprintf '" + name + " %s\\n' \"$*\" >>\"$STUB_CALLS\"\nexec " + shellQuote(path) + " \"$@\"\n"
 	}
@@ -378,6 +388,18 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 	out.installed, _ = os.ReadFile(target)
 	out.summary, _ = parseAgentFetchSummary(out.stderr)
 	return out
+}
+
+// The cutoff line is the key that renders the walk for an approval, so its
+// text is part of every approved plan made now. Changing a constant it names
+// changes the text, and every open approval would then render without the
+// walk (or, compressed, not at all) until it is re-planned. Change it only
+// together with a deploy that is meant to retire them.
+func TestAgentUpdateCutoffPlanLineIsFrozen(t *testing.T) {
+	const approved = "- slow sources are left early: with more than one source, each gets at most an equal share of what is left of the 480 s download budget and is left once it delivers under 32 KiB/s for 30 s, keeping what it delivered; with 20 s or more left, the rest goes, without the cutoff, to the source that delivered the largest part of its file, retried up to 3 times after a transient failure; with wget each source is fetched once, inside what is left of the budget when timeout is available; the task output ends with a lattice-agent-fetch line recording what each source delivered, in bytes and seconds"
+	if agentUpdateCutoffPlanLine != approved {
+		t.Fatalf("the cutoff line changed; approvals planned with the old text would lose the walk:\nwas %q\nnow %q", approved, agentUpdateCutoffPlanLine)
+	}
 }
 
 // The walk's plan line states the numbers the script uses, and every plan
@@ -573,8 +595,15 @@ func TestAgentUpdateWalkKeepsAPartialPastASourceThatIgnoresRanges(t *testing.T) 
 	r := walkRun{fetcher: "curl", cpURL: payload.BinaryURL, fbURL: payload.FallbackURL, cpBody: data, fbBody: data,
 		cpSteps: "22:-1:1", fbSteps: "22:-1:1", kept: map[string][]byte{partial: data}}
 	if o := runWalkScript(t, script, r); o.exit != 0 || !bytes.Equal(o.installed, data) || len(o.fetches("curl")) != 0 ||
-		o.summary != "lattice-agent-fetch v1 result:0:done" || !strings.Contains(o.stdout, "is already complete") {
+		o.summary != "lattice-agent-fetch v1 result:0:done" || !strings.Contains(o.stdout, "already holds the pinned bytes") {
 		t.Fatalf("a complete kept file must install without a fetch: exit %d calls %q summary %q", o.exit, o.calls, o.summary)
+	}
+	// A fetch that completes the file and still fails, followed by curl 7's
+	// exit 22 for a range at its end, is finished in the same attempt.
+	r.kept = nil
+	r.cpSteps, r.fbSteps = "18:0:10 22:-1:1", "22:-1:1"
+	if o := runWalkScript(t, script, r); o.exit != 0 || !bytes.Equal(o.installed, data) || len(o.fetches("curl")) != 3 {
+		t.Fatalf("a file completed by a failing fetch must install in the same attempt: exit %d calls %q stderr:\n%s", o.exit, o.calls, o.stderr)
 	}
 	o = run(t, script, walkRun{cpSteps: "33:-1:1", fbSteps: "33:-1:1"})
 	if _, ok := o.kept(partial); o.exit != 33 || ok {
@@ -780,5 +809,20 @@ func TestAgentUpdateTaskResultRecordsTheFetchSummary(t *testing.T) {
 		if want, _ := parseAgentFetchSummary(tc.result.Stderr); !ok || ev.Metadata["fetch"] != want {
 			t.Fatalf("%s must record the fetch summary %q, got %v", tc.action, want, ev.Metadata)
 		}
+	}
+	// The node's own report can apply the approval before the old agent's
+	// result lands; the summary of that successful download is still kept.
+	approval.Status = model.ApprovalApplied
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.handleAgentUpdateTaskResult(httptest.NewRequest("POST", "/api/tasks/results", nil), approval, model.TaskResult{Stderr: line + "\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if ev, ok := lastAuditFor(st, "agent.update.fetch"); !ok || ev.Metadata["fetch"] != line || ev.Metadata["approval_id"] != approval.ID {
+		t.Fatalf("a result after the approval was applied must still record its fetch summary: %v", ev.Metadata)
+	}
+	if current, _ := st.Approval(approval.ID); current.Status != model.ApprovalApplied {
+		t.Fatalf("recording the summary must leave the applied approval alone, it is %s", current.Status)
 	}
 }

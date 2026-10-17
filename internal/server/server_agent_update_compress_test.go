@@ -253,11 +253,12 @@ func TestAgentBinaryServesTheCompressedObjectOnlyToAPlanThatPinsIt(t *testing.T)
 		t.Fatalf("a range must address the compressed bytes: status %d", res.StatusCode)
 	}
 
+	// A plan that pinned the compressed object fetches nothing else.
 	raw := agentArtifactRef{Version: ref.Version, OS: ref.OS, Arch: ref.Arch, SHA256: ref.SHA256}
 	res = getAgentBinary(t, handler, raw.urlPath(), task.ID, task.LeaseID)
 	res.Body.Close()
-	if res.StatusCode != http.StatusNotFound {
-		t.Fatalf("only the compressed copy is held, so the raw route must answer 404, got %d", res.StatusCode)
+	if res.StatusCode != http.StatusForbidden {
+		t.Fatalf("a compressed plan must not be served the raw route, got %d", res.StatusCode)
 	}
 
 	payload, err := agentUpdatePayloadFromApproval(approval)
@@ -512,22 +513,27 @@ func TestAgentUpdateWalkAgainstRealSources(t *testing.T) {
 		}
 	})
 	t.Run("the equal share stops a source that stays above the cutoff", func(t *testing.T) {
-		cp := newWalkServer(t, handler, walkBehaviour{rate: 96 << 10})
-		fb := newWalkServer(t, serveBytes(data))
-		o := runWalkScript(t, script, walkRun{fetcher: "curl", real: true, clock: "host", caFile: walkCAFile(t, cp),
-			cpURL: cp.URL + ref.urlPath(), fbURL: fb.URL + "/lattice-agent-linux-amd64",
-			overrides: realWalkOverrides(10), env: lease})
-		if o.exit != 0 || !bytes.Equal(o.installed, data) {
+		big, _ := walkTestBinary("0.3.4", 4<<20)
+		bigRef, bigApproval, bigTask := seedWalkUpdate(t, srv, st, big, false)
+		bigScript, _ := walkScript(t, bigApproval, nil)
+		cp := newWalkServer(t, handler, walkBehaviour{rate: 256 << 10})
+		fb := newWalkServer(t, serveBytes(big))
+		o := runWalkScript(t, bigScript, walkRun{fetcher: "curl", real: true, clock: "host", caFile: walkCAFile(t, cp),
+			cpURL: cp.URL + bigRef.urlPath(), fbURL: fb.URL + "/lattice-agent-linux-amd64", overrides: realWalkOverrides(10),
+			env: []string{"LATTICE_TASK_ID=" + bigTask.ID, "LATTICE_TASK_LEASE_ID=" + bigTask.LeaseID}})
+		if o.exit != 0 || !bytes.Equal(o.installed, big) {
 			t.Fatalf("exit %d, stderr:\n%s", o.exit, o.stderr)
 		}
 		f := summaryFields(t, o.summary)
 		if len(f) != 3 || f[0][2] != "28" || f[1][1] != "up" || f[1][2] != "0" {
 			t.Fatalf("the control plane must stop at its share and the fallback finish: %q", o.summary)
 		}
+		// 256 KiB/s is eight times the cutoff, so even a starved runner keeps
+		// it above, and the source runs its whole 5 s share.
 		took, _ := strconv.Atoi(f[0][4])
 		got, _ := strconv.Atoi(f[0][3])
-		if took < 4 || took > 6 || got < 192<<10 {
-			t.Fatalf("a 96 KiB/s source must run its whole 5 s share, not be cut: %q", o.summary)
+		if took < 4 || took > 6 || got < 512<<10 {
+			t.Fatalf("a 256 KiB/s source must run its whole 5 s share, not be cut: %q", o.summary)
 		}
 	})
 }

@@ -58,7 +58,7 @@
       "p95_ms": 158,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 61,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 158.8,
@@ -79,7 +79,7 @@
       "p95_ms": 212,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 61,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 210,
@@ -100,7 +100,7 @@
       "p95_ms": 163,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 61,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 162,
@@ -120,8 +120,8 @@
       "p50_ms": 38,
       "p95_ms": 38,
       "jitter_ms": 0,
-      "loss": 0.0492,
-      "samples": 61,
+      "loss": 0.0333,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 38,
@@ -140,9 +140,9 @@
       "reason": "degraded_latency",
       "p50_ms": 140,
       "p95_ms": 140,
-      "jitter_ms": 1.6,
+      "jitter_ms": 1.7,
       "loss": 0,
-      "samples": 61,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 40.1,
@@ -174,7 +174,7 @@
       "p95_ms": 140,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 61,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 52,
@@ -204,8 +204,8 @@
       "p50_ms": 40,
       "p95_ms": 40,
       "jitter_ms": 0,
-      "loss": 0.082,
-      "samples": 61,
+      "loss": 0.0833,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 40,
@@ -276,7 +276,7 @@
       "p95_ms": 50,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 61,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 50,
@@ -297,7 +297,7 @@
       "p95_ms": 51,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 61,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 51.5,
@@ -317,8 +317,8 @@
       "p50_ms": 140,
       "p95_ms": 140,
       "jitter_ms": 0,
-      "loss": 0.082,
-      "samples": 61,
+      "loss": 0.0833,
+      "samples": 60,
       "expected": 60,
       "prev": {
         "p50_ms": 40,
@@ -343,5 +343,6 @@
         }
       }
     }
-  ]
+  ],
+  "beacon_replans": []
 }

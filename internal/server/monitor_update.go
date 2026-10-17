@@ -26,13 +26,6 @@ import (
 // the console creates the new check and pauses the old one. Generated
 // checks refuse edits as they refuse deletes.
 
-const (
-	// monitorMinIntervalSec is the interval floor every save enforces.
-	monitorMinIntervalSec = 10
-	monitorMaxIntervalSec = 24 * 3600
-	monitorMaxTimeoutSec  = 60
-)
-
 // errMonitorMethodChange is the answer to an edit that changes the method
 // or the target.
 func errMonitorMethodChange(field string) error {
@@ -100,13 +93,29 @@ func degradedRuleSummary(r *model.MonitorDegradedRule) string {
 	return strings.Join(parts, ",")
 }
 
-// validMonitorTiming checks the interval and timeout a save stores.
-func validMonitorTiming(intervalSec, timeoutSec int) error {
-	if intervalSec < monitorMinIntervalSec || intervalSec > monitorMaxIntervalSec {
-		return fmt.Errorf("interval_sec must be %d to %d", monitorMinIntervalSec, monitorMaxIntervalSec)
+// validMonitorAlertAfter is the one alert_after rule a create, an edit and a
+// path set save apply: 1 to model.MonitorAlertAfterMax, or 0 for the default
+// (model.MonitorAlertAfterDefault). A create cannot tell an absent field from
+// zero, so zero must mean the default there, and an edit reads it the same
+// way rather than refusing what a create accepts. Zero is stored as given and
+// reads as the default (store.MonitorAlertAfter).
+func validMonitorAlertAfter(n int) error {
+	if n < 0 || n > model.MonitorAlertAfterMax {
+		return fmt.Errorf("alert_after must be 1 to %d, or 0 for the default (%d)", model.MonitorAlertAfterMax, model.MonitorAlertAfterDefault)
 	}
-	if timeoutSec < 1 || timeoutSec > monitorMaxTimeoutSec || timeoutSec >= intervalSec {
-		return fmt.Errorf("timeout_sec must be 1 to %d and shorter than interval_sec", monitorMaxTimeoutSec)
+	return nil
+}
+
+// validMonitorTiming checks the interval and timeout a save stores, a
+// create of any kind and an edit alike. The bounds are the SDK's
+// (model.MonitorIntervalMinSec, model.MonitorIntervalMaxSec,
+// model.MonitorTimeoutMaxSec), which the console mirrors.
+func validMonitorTiming(intervalSec, timeoutSec int) error {
+	if intervalSec < model.MonitorIntervalMinSec || intervalSec > model.MonitorIntervalMaxSec {
+		return fmt.Errorf("interval_sec must be %d to %d", model.MonitorIntervalMinSec, model.MonitorIntervalMaxSec)
+	}
+	if timeoutSec < 1 || timeoutSec > model.MonitorTimeoutMaxSec || timeoutSec >= intervalSec {
+		return fmt.Errorf("timeout_sec must be 1 to %d and shorter than interval_sec", model.MonitorTimeoutMaxSec)
 	}
 	return nil
 }
@@ -269,7 +278,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	}
 	if req.Packets != nil {
 		if !model.MonitorKindSendsPackets(mon.Type) {
-			return model.Monitor{}, nil, false, errors.New("packets applies to icmp and beacon checks only")
+			return model.Monitor{}, nil, false, errMonitorPacketsKinds
 		}
 		if *req.Packets < 1 || *req.Packets > model.MonitorPacketsMax {
 			return model.Monitor{}, nil, false, fmt.Errorf("packets must be 1 to %d", model.MonitorPacketsMax)
@@ -339,11 +348,11 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 		next.Degraded = rule
 	}
 	if req.AlertAfter != nil {
-		if *req.AlertAfter < 1 || *req.AlertAfter > model.MonitorAlertAfterMax {
-			return model.Monitor{}, nil, false, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax)
+		if err := validMonitorAlertAfter(*req.AlertAfter); err != nil {
+			return model.Monitor{}, nil, false, err
 		}
-		note("alert_after", *req.AlertAfter != store.MonitorAlertAfter(mon))
 		next.AlertAfter = *req.AlertAfter
+		note("alert_after", store.MonitorAlertAfter(next) != store.MonitorAlertAfter(mon))
 	}
 	if req.Enabled != nil {
 		note("enabled", *req.Enabled != mon.Enabled)

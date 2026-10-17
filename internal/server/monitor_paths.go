@@ -24,7 +24,7 @@ import (
 // A path is a (monitor, source) result pair. A generated latency path is
 // addressed by (source, target node) and joins every generated check that
 // reaches the target from the source, so its line continues across a method
-// change; in this release only the tcp check (mon_lat_<target>) exists. An
+// change between the tcp, icmp and beacon checks (latencyCheckMethods). An
 // operator's check is addressed by (monitor, source); a tls check's source
 // is the control plane, an empty node id.
 //
@@ -34,19 +34,22 @@ import (
 //     hour, five-minute rollups up to the fine retention, one-hour rollups
 //     beyond), merged on the server into the smallest multiple of that
 //     tier's resolution that keeps the series within 720 points and is no
-//     shorter than the check's interval (pathSeriesStep).
+//     shorter than the check's interval (pathSeriesStep). A window of span
+//     holds ceil(span/step) steps, the last of them the step in progress
+//     (pathSeriesFrom).
 //   - Matrix: raw rows for 1 h, five-minute rollups for 6 h and 24 h, one-hour
-//     rollups from 3 d up. Each window's figures are cached until the
-//     window's next bucket closes; states are judged on every read from the
-//     pairs' latest records.
+//     rollups from 3 d up, over the window's whole buckets: span/resolution
+//     of them, ending where the bucket in progress begins
+//     (pathWindowBounds). Each window's figures are cached until that
+//     bucket closes; states are judged on every read from the pairs' latest
+//     records.
 //
 // Unknown stays unknown: a bucket with no runs where runs were expected is a
 // gap, and a path with no current result is unknown with the reason when
 // the control plane knows it. Neither is ever drawn as up.
 
 const (
-	// pathSeriesMaxPoints bounds a series, the partial step at its end
-	// included.
+	// pathSeriesMaxPoints bounds a series, the step in progress included.
 	pathSeriesMaxPoints = 720
 	// pathMatrixCoarseFrom is the shortest matrix window read from the
 	// one-hour tier.
@@ -112,9 +115,10 @@ func (t pathTier) resolution() time.Duration {
 // pathSeriesStep is the step rule. The tier is the finest that covers span:
 // raw rows up to an hour, five-minute rollups up to fineDays, one-hour
 // rollups beyond. The step is the smallest multiple of the tier's resolution
-// that keeps the series within pathSeriesMaxPoints (the window starts on a
-// step boundary, so it holds one partial step more than span/step) and that
-// is no shorter than the interval, so every whole step expects a run.
+// that keeps span/step under pathSeriesMaxPoints, one step to spare (a
+// window holds ceil(span/step) steps, pathSeriesFrom; the console's
+// expectedStepSeconds mirrors this rule), and that is no shorter than the
+// interval, so every whole step expects a run.
 func pathSeriesStep(span time.Duration, fineDays int, interval time.Duration) (pathTier, time.Duration) {
 	tier := pathTierCoarse
 	switch {
@@ -181,6 +185,24 @@ func pathExpected(covered, interval time.Duration) int {
 	return int(covered / interval)
 }
 
+// pathSeriesFrom is where a series of span at step starts: as many steps as
+// fit in span, ceil(span/step), the last of them the one holding now. A
+// window of N steps then reads N buckets, not N+1 with a partial step at
+// each end.
+func pathSeriesFrom(span, step time.Duration, now time.Time) time.Time {
+	steps := (span + step - 1) / step
+	return now.Truncate(step).Add(-(steps - 1) * step)
+}
+
+// pathInProgressExpected is what the step in progress expects: the runs
+// certainly due over the part that has passed (covered), and never fewer
+// than it has heard, since a run lands anywhere in its interval and one that
+// landed was expected. A step that has heard nothing reads a gap only once a
+// whole interval has passed in it.
+func pathInProgressExpected(covered, interval time.Duration, heard int) int {
+	return max(pathExpected(covered, interval), heard)
+}
+
 func pathBucketOf(b store.MonitorRollup, t time.Time, expected int) model.PathBucket {
 	out := model.PathBucket{T: t, N: b.N, Fail: b.F, Expected: expected, Loss: pathLoss(b), Sent: b.S, Lost: b.L}
 	if b.Successes() > 0 {
@@ -237,7 +259,7 @@ func (s *Server) pathSeriesFor(checks []pathCheck, source, window string, interv
 	now = now.UTC()
 	fineDays := s.store.MonitorSettings().FineRetentionDays
 	tier, step := pathSeriesStep(span, fineDays, interval)
-	from := now.Add(-span).Truncate(step)
+	from := pathSeriesFrom(span, step, now)
 	if tier == pathTierFine {
 		short, err := s.fineTierShort(checks, source, from, now)
 		if err != nil {
@@ -245,7 +267,7 @@ func (s *Server) pathSeriesFor(checks []pathCheck, source, window string, interv
 		}
 		if short {
 			tier, step = pathSeriesStep(span, 0, interval)
-			from = now.Add(-span).Truncate(step)
+			from = pathSeriesFrom(span, step, now)
 		}
 	}
 	end := now.Add(time.Nanosecond)
@@ -301,15 +323,15 @@ func (s *Server) pathSeriesFor(checks []pathCheck, source, window string, interv
 	}
 	method := ""
 	for t := from; !t.After(now); t = t.Add(step) {
-		covered := step
-		if stepEnd := t.Add(step); stepEnd.After(now) {
-			covered = now.Sub(t)
-		}
 		var b store.MonitorRollup
 		if m := merged[t]; m != nil {
 			b = *m
 		}
-		out.Buckets = append(out.Buckets, pathBucketOf(b, t, pathExpected(covered, interval)))
+		expected := pathExpected(step, interval)
+		if t.Add(step).After(now) {
+			expected = pathInProgressExpected(now.Sub(t), interval, b.N)
+		}
+		out.Buckets = append(out.Buckets, pathBucketOf(b, t, expected))
 		if b.N == 0 {
 			continue
 		}
@@ -830,10 +852,12 @@ type pathWindowFigures struct {
 	pathWindowSnapshot
 }
 
-// pathWindowSnapshot is what one matrix read uses of a window's figures.
+// pathWindowSnapshot is what one matrix read uses of a window's figures:
+// read at at, over [from, to).
 type pathWindowSnapshot struct {
 	at      time.Time
 	from    time.Time
+	to      time.Time
 	figures map[store.MonitorPair]pathFigures
 }
 
@@ -921,16 +945,16 @@ func (m *monitorPathState) window(name string) *pathWindowFigures {
 	return w
 }
 
-// pathWindowBounds is where a matrix window reads from and until when its
-// figures hold: the window starts on its tier's step and the figures hold
-// until that step's next boundary.
-func pathWindowBounds(span time.Duration, now time.Time) (tier pathTier, from, until time.Time) {
+// pathWindowBounds is what a matrix window reads, [from, to), and until
+// when its figures hold: the span/resolution whole buckets of its tier that
+// end where the bucket in progress begins, held until that bucket closes.
+// Every matrix span is a whole number of its tier's buckets, so a path that
+// ran every interval reads as many samples as it expected.
+func pathWindowBounds(span time.Duration, now time.Time) (tier pathTier, from, to, until time.Time) {
 	tier = pathMatrixTier(span)
 	res := tier.resolution()
-	if tier == pathTierRaw {
-		return tier, now.Add(-span), now.Truncate(res).Add(res)
-	}
-	return tier, now.Add(-span).Truncate(res), now.Truncate(res).Add(res)
+	to = now.Truncate(res)
+	return tier, to.Add(-span), to, to.Add(res)
 }
 
 // pathFiguresFor returns the window's figures for pairs, reading the store
@@ -951,12 +975,12 @@ func (s *Server) pathFiguresFor(window string, span time.Duration, pairs []store
 	if len(missing) == 0 {
 		return w.pathWindowSnapshot, nil
 	}
-	read := func(pairs []store.MonitorPair, from, at time.Time) (map[store.MonitorPair]store.MonitorWindowSummary, error) {
+	read := func(pairs []store.MonitorPair, from, to time.Time) (map[store.MonitorPair]store.MonitorWindowSummary, error) {
 		prevFrom := from.Add(-span)
 		if tier == pathTierRaw {
-			return s.store.MonitorRowSummaries(pairs, prevFrom, from, at.Add(time.Nanosecond))
+			return s.store.MonitorRowSummaries(pairs, prevFrom, from, to)
 		}
-		return s.store.MonitorRollupSummaries(pairs, tier.resolution(), prevFrom, from, at.Add(time.Nanosecond))
+		return s.store.MonitorRollupSummaries(pairs, tier.resolution(), prevFrom, from, to)
 	}
 	if live {
 		// Within the same bucket, read only the paths this caller adds,
@@ -964,7 +988,7 @@ func (s *Server) pathFiguresFor(window string, span time.Duration, pairs []store
 		// different scopes then share one cache instead of evicting each
 		// other. The maps are copied, never written, so snapshots handed
 		// out earlier stay as they were.
-		sums, err := read(missing, w.from, w.at)
+		sums, err := read(missing, w.from, w.to)
 		if err != nil {
 			return pathWindowSnapshot{}, err
 		}
@@ -985,12 +1009,12 @@ func (s *Server) pathFiguresFor(window string, span time.Duration, pairs []store
 		w.read, w.figures = readSet, figures
 		return w.pathWindowSnapshot, nil
 	}
-	_, from, until := pathWindowBounds(span, now)
-	sums, err := read(pairs, from, now)
+	_, from, to, until := pathWindowBounds(span, now)
+	sums, err := read(pairs, from, to)
 	if err != nil {
 		return pathWindowSnapshot{}, err
 	}
-	w.at, w.from, w.until = now, from, until
+	w.at, w.from, w.to, w.until = now, from, to, until
 	w.read = make(map[store.MonitorPair]bool, len(pairs))
 	w.figures = make(map[store.MonitorPair]pathFigures, len(sums))
 	for _, pair := range pairs {
@@ -1081,6 +1105,13 @@ func beaconFiltered(method string, latest store.MonitorLatest) bool {
 	return method == model.MonitorTypeBeacon && !latest.Success && latest.LastOKAt.IsZero()
 }
 
+// pathFiltered reports whether a pair's failures read filtered rather than
+// down, by either rule. Such a pair never pages (resultMayPage), so it is
+// neither pending nor paged in the incident lists.
+func pathFiltered(method string, latest store.MonitorLatest) bool {
+	return icmpFiltered(method, latest) || beaconFiltered(method, latest)
+}
+
 // beaconTargetListenGate is beacon_not_listening while the target is
 // online and its agent reports no socket where its plan put one, so the
 // path names the target's state instead of reading down for it.
@@ -1123,11 +1154,12 @@ func (s *Server) pathMatrixFor(p principal, window string, now time.Time) (model
 		}
 	}
 	out := model.PathMatrix{
-		Window:     window,
-		ObservedAt: now,
-		Sources:    []model.PathSource{},
-		Targets:    []model.PathTarget{},
-		Paths:      make([]model.PathCell, 0, len(entries)),
+		Window:        window,
+		ObservedAt:    now,
+		Sources:       []model.PathSource{},
+		Targets:       []model.PathTarget{},
+		Paths:         make([]model.PathCell, 0, len(entries)),
+		BeaconReplans: s.beaconReplans(p, nodes, now),
 	}
 	degraded := s.pathDegradedSnapshot()
 	if !degraded.evaluatedAt.IsZero() {
@@ -1151,7 +1183,7 @@ func (s *Server) pathMatrixFor(p principal, window string, now time.Time) (model
 			latest[store.MonitorPair{MonitorID: monitorID, NodeID: list[i].NodeID}] = &list[i]
 		}
 	}
-	covered := figures.at.Sub(figures.from)
+	covered := figures.to.Sub(figures.from)
 	sources, targets := map[string]bool{}, map[string]bool{}
 	for _, e := range entries {
 		cell := e.cell

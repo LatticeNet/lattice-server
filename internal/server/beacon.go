@@ -35,11 +35,11 @@ const (
 const beaconErrorMax = 200
 
 // beaconRuntime is the in-memory beacon state: each node's latest facts
-// report and the egress address its authenticated requests came from.
+// report. The egress addresses a plan depends on are durable
+// (store.BeaconRegistry.Egress).
 type beaconRuntime struct {
-	mu     sync.Mutex
-	facts  map[string]model.BeaconFacts
-	egress map[string]string
+	mu    sync.Mutex
+	facts map[string]model.BeaconFacts
 	// reachMu serializes the reachability check's writes: a sync and a
 	// verdict arriving together must not overwrite each other.
 	reachMu sync.Mutex
@@ -67,10 +67,13 @@ func (b *beaconRuntime) latestFacts(nodeID string) (model.BeaconFacts, bool) {
 	return f, ok
 }
 
-// noteEgress records the address a node's agent connected from, kept only
-// when it is a global IPv4 address: an agent reaching the control plane over
-// WireGuard or a private network says nothing about where its probes leave.
-func (b *beaconRuntime) noteEgress(nodeID, ip string) {
+// noteBeaconEgress records the address a node's agent connected from, kept
+// only when it is a global IPv4 address: an agent reaching the control plane
+// over WireGuard or a private network says nothing about where its probes
+// leave. The record is durable and written only when the address moves, so
+// a node.beacon plan rendered again after a restart admits the same
+// addresses it was made with, before every source has pulled again.
+func (s *Server) noteBeaconEgress(nodeID, ip string) {
 	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
 	if err != nil || !addr.Unmap().Is4() {
 		return
@@ -79,18 +82,9 @@ func (b *beaconRuntime) noteEgress(nodeID, ip string) {
 	if model.MonitorDestinationRefused(addr) || beacon.AddressRefused(addr) {
 		return
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.egress == nil {
-		b.egress = map[string]string{}
+	if err := s.store.SetBeaconEgress(nodeID, addr.String()); err != nil {
+		s.logger.Printf("beacon egress of node %s not recorded: %v", nodeID, err)
 	}
-	b.egress[nodeID] = addr.String()
-}
-
-func (b *beaconRuntime) egressOf(nodeID string) string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.egress[nodeID]
 }
 
 // beaconFactsOf is a node's latest beacon report: the in-memory one when
@@ -180,8 +174,10 @@ func beaconFactsDurableChanged(prev, next *model.BeaconFacts) bool {
 // noteBeaconFacts takes a heartbeat's report: kept in memory always,
 // written to the node record when it changed durably. A beat without one
 // (an agent older than M2b, or one downgraded to it) clears the report, as
-// a beat without probe_methods clears those. A change to a target's
-// listening state starts its pending reachability check.
+// a beat without probe_methods clears those. A change to where a target
+// listens (its state, bind address or port) starts its pending reachability
+// check: a change plan that moves the port leaves the agent reporting
+// listening before and after, and only the port says it moved.
 func (s *Server) noteBeaconFacts(nodeID string, stored *model.BeaconFacts, reported *model.BeaconFacts) {
 	facts := normalizeBeaconFacts(reported, s.now())
 	if facts == nil {
@@ -201,11 +197,20 @@ func (s *Server) noteBeaconFacts(nodeID string, stored *model.BeaconFacts, repor
 		s.logger.Printf("beacon facts for node %s not stored: %v", nodeID, err)
 		return
 	}
-	if stored == nil || stored.State != facts.State {
+	if beaconListenMoved(stored, facts) {
 		if t, ok := s.store.BeaconTarget(nodeID); ok && t.ReachArmed {
 			s.syncBeaconReach(s.now())
 		}
 	}
+}
+
+// beaconListenMoved reports whether a report changes where the agent says
+// it listens: its state, its bind address or its port.
+func beaconListenMoved(prev, next *model.BeaconFacts) bool {
+	if prev == nil || next == nil {
+		return prev != next
+	}
+	return prev.State != next.State || prev.Bind != next.Bind || prev.Port != next.Port
 }
 
 // beaconListening reports whether a node's agent says it listens where its

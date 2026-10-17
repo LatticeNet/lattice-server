@@ -485,12 +485,13 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 	}
 
 	// Step 9b: the node's beacon state, its target key with it, its source
-	// id, and its place in every other beacon's approved set, so a machine
-	// enrolled later under the same node id holds no approval. The id
-	// number itself is never given out again.
+	// id, its egress address, and its place in every other beacon's
+	// approved set, so a machine enrolled later under the same node id
+	// holds no approval. The id number itself is never given out again.
 	if s.state.Beacon != nil && mutate {
 		delete(s.state.Beacon.Targets, nodeID)
 		delete(s.state.Beacon.SourceIDs, nodeID)
+		delete(s.state.Beacon.Egress, nodeID)
 		for id, t := range s.state.Beacon.Targets {
 			approved := slices.DeleteFunc(slices.Clone(t.Approved), func(src model.BeaconPlanSource) bool { return src.NodeID == nodeID })
 			table := slices.DeleteFunc(slices.Clone(t.TableSources), func(src string) bool { return src == nodeID })

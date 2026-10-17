@@ -103,7 +103,7 @@ func (s *Server) handleAgentConfig(w http.ResponseWriter, r *http.Request) {
 	collect := node.AgentDebug.Enabled && node.AgentDebug.Collect && s.logStore != nil
 	// The beacon companion admits a source's egress address when it is not
 	// one of the node's pinned ones (design 29 D12), as seen here.
-	s.beacon.noteEgress(node.ID, s.clientIP(r))
+	s.noteBeaconEgress(node.ID, s.clientIP(r))
 	writeJSON(w, http.StatusOK, model.AgentConfig{
 		LatticeIdentityUUID: node.LatticeIdentityUUID,
 		Debug: model.AgentDebugConfig{

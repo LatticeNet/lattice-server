@@ -2117,7 +2117,9 @@ func (s *Server) sanitizeProxyUsageLineUserBytes(nodeID string, input map[string
 
 func (s *Server) proxyUsageEligibleUsers(profile model.ProxyNodeProfile) map[string]model.ProxyUser {
 	out := map[string]model.ProxyUser{}
+	stored := map[string]model.ProxyUser{}
 	for _, user := range s.store.ProxyUsers() {
+		stored[user.ID] = user
 		if proxyUserAppliesToProfile(user, profile) {
 			out[user.ID] = user
 		}
@@ -2141,8 +2143,14 @@ func (s *Server) proxyUsageEligibleUsers(profile model.ProxyNodeProfile) map[str
 			}
 		}
 		if applies {
+			// The identity's stored projection carries the line-scoped marker
+			// as its inbound, so it never applies to a profile and is not in
+			// out. Its running total and notification cursors still come from
+			// it: rebuilt empty on every report, UsedBytes restarted from the
+			// report's delta and every alert the cursor had recorded fired
+			// again on the next report.
 			projection := vpnUserUsageProjection(user)
-			if previous, ok := out[user.ID]; ok {
+			if previous, ok := stored[user.ID]; ok {
 				projection.UsedBytes = previous.UsedBytes
 				projection.LastSeenAt = previous.LastSeenAt
 				projection.LastQuotaNotifiedKey = previous.LastQuotaNotifiedKey

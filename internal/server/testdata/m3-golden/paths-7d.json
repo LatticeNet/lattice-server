@@ -58,8 +58,8 @@
       "p95_ms": 160,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 10128,
-      "expected": 10127,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 160,
         "loss": 0
@@ -79,8 +79,8 @@
       "p95_ms": 212,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 10128,
-      "expected": 10127,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 210,
         "loss": 0
@@ -100,8 +100,8 @@
       "p95_ms": 163,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 10128,
-      "expected": 10127,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 162,
         "loss": 0
@@ -120,9 +120,9 @@
       "p50_ms": 38,
       "p95_ms": 38,
       "jitter_ms": 0,
-      "loss": 0.0003,
-      "samples": 10128,
-      "expected": 10127,
+      "loss": 0,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 38,
         "loss": 0
@@ -142,8 +142,8 @@
       "p95_ms": 41.3,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 10128,
-      "expected": 10127,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 40,
         "loss": 0
@@ -174,8 +174,8 @@
       "p95_ms": 53.6,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 10128,
-      "expected": 10127,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 52,
         "loss": 0
@@ -204,9 +204,9 @@
       "p50_ms": 40,
       "p95_ms": 40,
       "jitter_ms": 0,
-      "loss": 0.0007,
-      "samples": 10128,
-      "expected": 10127,
+      "loss": 0.0003,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 40,
         "loss": 0
@@ -237,7 +237,7 @@
       "p95_ms": 85,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 168,
+      "samples": 167,
       "expected": 168,
       "prev": null,
       "last_at": "2026-09-14T09:15:00Z"
@@ -256,7 +256,7 @@
       "jitter_ms": null,
       "loss": null,
       "samples": 0,
-      "expected": 10127,
+      "expected": 10080,
       "prev": null,
       "last_at": null
     },
@@ -273,8 +273,8 @@
       "p95_ms": 50,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 10128,
-      "expected": 10127,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 50,
         "loss": 0
@@ -294,8 +294,8 @@
       "p95_ms": 52,
       "jitter_ms": 0,
       "loss": 0,
-      "samples": 10128,
-      "expected": 10127,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 52,
         "loss": 0
@@ -314,9 +314,9 @@
       "p50_ms": 40,
       "p95_ms": 41.3,
       "jitter_ms": 0,
-      "loss": 0.0007,
-      "samples": 10128,
-      "expected": 10127,
+      "loss": 0.0003,
+      "samples": 10080,
+      "expected": 10080,
       "prev": {
         "p50_ms": 40,
         "loss": 0
@@ -340,5 +340,6 @@
         }
       }
     }
-  ]
+  ],
+  "beacon_replans": []
 }

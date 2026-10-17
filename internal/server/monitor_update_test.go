@@ -371,18 +371,26 @@ func TestLatencyHistoryKeepsItsIDsUnderTheNewTiers(t *testing.T) {
 	for _, b := range day.Buckets {
 		runs += b.N
 	}
-	// The window starts on the step at or before now minus 24 h, so the
-	// hourly result taken exactly then is inside it.
-	if runs != 23+60 {
-		t.Fatalf("24h series holds %d runs, want the 23 hourly and 60 recent ones", runs)
+	// The window is the 288 five-minute steps up to the one holding now, so
+	// it starts after now minus 24 h and the hourly result taken exactly
+	// then is outside it.
+	if runs != 22+60 {
+		t.Fatalf("24h series holds %d runs, want the 22 hourly and 60 recent ones", runs)
 	}
 	m, err := srv.pathMatrixFor(principal{Principal: adminPrincipalForTest()}, model.PathWindowThreeDays, now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The 3d matrix counts the whole hours before the one in progress.
+	inWindow := 0
+	for _, r := range batch {
+		if hour := now.Truncate(time.Hour); r.At.Before(hour) && !r.At.Before(hour.Add(-72*time.Hour)) {
+			inWindow++
+		}
+	}
 	cell := pathCellTo(t, m, "node-sh", "node-jp")
-	if cell.MonitorID != id || cell.Samples != len(batch) || cell.State != model.PathStateUp {
-		t.Fatalf("3d matrix cell = %+v", cell)
+	if cell.MonitorID != id || cell.Samples != inWindow || cell.State != model.PathStateUp {
+		t.Fatalf("3d matrix cell = %+v, want %d samples", cell, inWindow)
 	}
 	// The latency reads of the previous release still answer.
 	rollups, err := srv.latencyRollupsFor(srv.planLatencyProbes(now).plan, now)

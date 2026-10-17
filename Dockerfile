@@ -60,16 +60,23 @@ RUN apk add --no-cache ca-certificates su-exec tzdata \
 # Design 30: the server runs each plugin child as its own uid, which needs
 # CAP_SETUID and CAP_SETGID, and reaps that child across the uid with
 # CAP_KILL. The three are file capabilities on the binary, permitted and
-# effective but never inheritable or ambient: they land on the server's own
-# execve whoever execs it (su-exec included), and a plugin child's execve of
-# an artifact without file capabilities computes an empty set. They apply
-# only while the container keeps no-new-privileges off; with it on, the
-# server starts with none and every plugin drop fails closed. setcap comes
-# from libcap and is removed again in the same step. The binary is installed
-# in the layer that sets the capability, so the image carries one copy.
+# effective but never inheritable or ambient, so a plugin child's execve of
+# an artifact without file capabilities computes an empty set. File
+# capabilities land on whoever execs the file, whatever their uid, so the
+# binary is 0750 root:lattice: the server (uid lattice, gid lattice, through
+# su-exec or directly) execs it, and a plugin child (its own uid as its gid,
+# no supplementary groups) gets EACCES instead of the three capabilities.
+# chown clears file capabilities, so install sets owner and mode first and
+# setcap runs last. They apply only while the container keeps
+# no-new-privileges off; with it on, the server starts with none and every
+# plugin drop fails closed. setcap comes from libcap and is removed again in
+# the same step. The binary is installed in the layer that sets the
+# capability, so the image carries one copy. Until S2's compose drops every
+# other capability, a server compromise could use CAP_SETUID to become
+# container root inside Docker's default capability set.
 RUN --mount=type=bind,from=build,source=/out/lattice-server,target=/tmp/lattice-server \
     apk add --no-cache --virtual .setcap libcap-utils \
-    && install -m 0755 /tmp/lattice-server /usr/local/bin/lattice-server \
+    && install -o root -g lattice -m 0750 /tmp/lattice-server /usr/local/bin/lattice-server \
     && setcap cap_setuid,cap_setgid,cap_kill+ep /usr/local/bin/lattice-server \
     && apk del .setcap
 COPY --from=dashboard /src/dashboard/dist /app/dashboard

@@ -65,18 +65,36 @@ do
 done
 
 # Design 30: the server binary carries exactly the three file capabilities
-# the plugin uid drop needs, and the entrypoint chowns the data directory
-# only when lattice does not own it yet, so no CAP_CHOWN is needed to boot.
-if ! grep -Fq "setcap cap_setuid,cap_setgid,cap_kill+ep /usr/local/bin/lattice-server" "$dockerfile"; then
+# the plugin uid drop needs, and only the server's own identity can exec it:
+# file capabilities land on whoever execs the file, so a binary a plugin uid
+# could exec would hand the plugin CAP_SETUID back. It is installed 0750
+# root:lattice before setcap runs, because chown clears file capabilities,
+# and nothing touches it afterwards.
+# scripts/check-image-isolation.sh checks the same on a built image.
+install_line='install -o root -g lattice -m 0750 /tmp/lattice-server /usr/local/bin/lattice-server'
+setcap_line='setcap cap_setuid,cap_setgid,cap_kill+ep /usr/local/bin/lattice-server'
+install_at="$(grep -nF "$install_line" "$dockerfile" | head -n 1 | cut -d: -f1)"
+setcap_at="$(grep -nF "$setcap_line" "$dockerfile" | head -n 1 | cut -d: -f1)"
+if [ -z "$setcap_at" ]; then
   echo "Dockerfile must set cap_setuid,cap_setgid,cap_kill+ep on /usr/local/bin/lattice-server (design 30)." >&2
+  exit 1
+fi
+if [ -z "$install_at" ] || [ "$install_at" -ge "$setcap_at" ]; then
+  echo "Dockerfile must install the server binary with '$install_line' before setcap: a plugin uid must not be able to exec a binary that carries file capabilities." >&2
+  exit 1
+fi
+if grep -nE "(chmod|chown|install|COPY|ADD)[^#]*/usr/local/bin/lattice-server" "$dockerfile" | grep -vF "$install_line" | grep -q .; then
+  echo "Dockerfile must not copy, chmod or chown /usr/local/bin/lattice-server except through '$install_line'." >&2
   exit 1
 fi
 if grep -Eq "setcap [^ ]*(\+[a-z]*i|=[a-z]*i)" "$dockerfile"; then
   echo "Dockerfile must not grant the server inheritable capabilities: a plugin child could inherit them." >&2
   exit 1
 fi
-if ! grep -Fq 'if [ "$(stat -c %u "$data_dir")" != "$(id -u lattice)" ]; then' "$entrypoint"; then
-  echo "$entrypoint must chown the data directory only when lattice does not own it (design 30)." >&2
+# The entrypoint decides on the content of the data directory, not on its
+# top-level owner, so a file a plugin uid owns inside it is chowned back.
+if ! grep -Fq 'if [ -n "$(su-exec lattice find "$data_dir/" \( ! -user lattice -o ! -group lattice \) -print -quit 2>/dev/null)" ]; then' "$entrypoint"; then
+  echo "$entrypoint must chown the data directory when anything in it is not owned by lattice:lattice (design 30)." >&2
   exit 1
 fi
 

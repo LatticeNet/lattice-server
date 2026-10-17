@@ -27,8 +27,8 @@ type storageTokenView struct {
 	Kind       string    `json:"kind"`
 	Access     string    `json:"access"`
 	Buckets    []string  `json:"buckets,omitempty"`
-	RevokedAt  time.Time `json:"revoked_at,omitempty"`
-	LastUsedAt time.Time `json:"last_used_at,omitempty"`
+	RevokedAt  time.Time `json:"revoked_at,omitzero"`
+	LastUsedAt time.Time `json:"last_used_at,omitzero"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }

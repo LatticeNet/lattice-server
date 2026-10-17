@@ -79,9 +79,9 @@ type proxyUserView struct {
 	HasPassword       bool      `json:"has_password"`
 	InboundIDs        []string  `json:"inbound_ids,omitempty"`
 	TrafficLimitBytes int64     `json:"traffic_limit_bytes,omitempty"`
-	ExpiresAt         time.Time `json:"expires_at,omitempty"`
+	ExpiresAt         time.Time `json:"expires_at,omitzero"`
 	UsedBytes         int64     `json:"used_bytes"`
-	LastSeenAt        time.Time `json:"last_seen_at,omitempty"`
+	LastSeenAt        time.Time `json:"last_seen_at,omitzero"`
 	Status            string    `json:"status"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
@@ -101,15 +101,15 @@ type proxyNodeProfileView struct {
 	ConfigPath    string    `json:"config_path,omitempty"`
 	StatsAPI      string    `json:"stats_api,omitempty"`
 	AppliedSHA256 string    `json:"applied_sha256,omitempty"`
-	LastApplyAt   time.Time `json:"last_apply_at,omitempty"`
+	LastApplyAt   time.Time `json:"last_apply_at,omitzero"`
 	LastError     string    `json:"last_error,omitempty"`
 
 	UsageCollectorSource      string    `json:"usage_collector_source,omitempty"`
 	UsageCollectorStatus      string    `json:"usage_collector_status,omitempty"`
-	UsageCollectorCheckedAt   time.Time `json:"usage_collector_checked_at,omitempty"`
-	UsageCollectorLastOKAt    time.Time `json:"usage_collector_last_ok_at,omitempty"`
+	UsageCollectorCheckedAt   time.Time `json:"usage_collector_checked_at,omitzero"`
+	UsageCollectorLastOKAt    time.Time `json:"usage_collector_last_ok_at,omitzero"`
 	UsageCollectorLastError   string    `json:"usage_collector_last_error,omitempty"`
-	UsageCollectorLastErrorAt time.Time `json:"usage_collector_last_error_at,omitempty"`
+	UsageCollectorLastErrorAt time.Time `json:"usage_collector_last_error_at,omitzero"`
 
 	// ConfigStale and friends report whether the applied config still matches the
 	// current policy render. They are an operator signal toward a reviewed apply;
@@ -118,7 +118,7 @@ type proxyNodeProfileView struct {
 	PendingConfigSHA256 string    `json:"pending_config_sha256,omitempty"`
 	IneligibleUsers     int       `json:"ineligible_users,omitempty"`
 	DriftReason         string    `json:"drift_reason,omitempty"`
-	DriftCheckedAt      time.Time `json:"drift_checked_at,omitempty"`
+	DriftCheckedAt      time.Time `json:"drift_checked_at,omitzero"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -140,7 +140,7 @@ type proxyUsageSnapshotView struct {
 	CollectorSource    string                               `json:"collector_source,omitempty"`
 	CollectorStatus    string                               `json:"collector_status,omitempty"`
 	CollectorError     string                               `json:"collector_error,omitempty"`
-	CollectorCheckedAt time.Time                            `json:"collector_checked_at,omitempty"`
+	CollectorCheckedAt time.Time                            `json:"collector_checked_at,omitzero"`
 }
 
 type proxyUsageUserView struct {
@@ -149,7 +149,7 @@ type proxyUsageUserView struct {
 	Enabled           bool      `json:"enabled"`
 	UsedBytes         int64     `json:"used_bytes"`
 	TrafficLimitBytes int64     `json:"traffic_limit_bytes,omitempty"`
-	LastSeenAt        time.Time `json:"last_seen_at,omitempty"`
+	LastSeenAt        time.Time `json:"last_seen_at,omitzero"`
 	Status            string    `json:"status"`
 }
 

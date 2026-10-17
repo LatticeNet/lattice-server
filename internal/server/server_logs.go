@@ -379,9 +379,9 @@ type logSourceStatsView struct {
 	Enabled      bool      `json:"enabled"`
 	Lines        uint64    `json:"lines"`
 	Bytes        uint64    `json:"bytes"`
-	FirstAt      time.Time `json:"first_at,omitempty"`
-	LastAt       time.Time `json:"last_at,omitempty"`
-	LastIngestAt time.Time `json:"last_ingest_at,omitempty"`
+	FirstAt      time.Time `json:"first_at,omitzero"`
+	LastAt       time.Time `json:"last_at,omitzero"`
+	LastIngestAt time.Time `json:"last_ingest_at,omitzero"`
 	RotID        string    `json:"rot_id,omitempty"`
 }
 

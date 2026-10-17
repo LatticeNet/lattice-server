@@ -44,8 +44,8 @@ type RuntimeStatus struct {
 	State     string    `json:"state"`
 	Runner    string    `json:"runner,omitempty"`
 	Message   string    `json:"message,omitempty"`
-	StartedAt time.Time `json:"started_at,omitempty"`
-	StoppedAt time.Time `json:"stopped_at,omitempty"`
+	StartedAt time.Time `json:"started_at,omitzero"`
+	StoppedAt time.Time `json:"stopped_at,omitzero"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 

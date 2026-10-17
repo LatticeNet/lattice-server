@@ -463,7 +463,7 @@ func (s Sample) point() Point {
 
 // WriteResult reports one Write.
 type WriteResult struct {
-	At     time.Time `json:"at"`
+	At     time.Time `json:"at,omitzero"`
 	Points int       `json:"points"`
 	Rows   int       `json:"rows"`
 	// Refused counts the samples whose series was not stored (a cap, a bad

@@ -106,7 +106,7 @@ type Line struct {
 	// line's port". They must never be merged back into one field: their
 	// disagreement is exactly the incident signal.
 	ServiceState     string    `json:"service_state,omitempty"` // running | down | restarting | unknown
-	ServiceCheckedAt time.Time `json:"service_checked_at,omitempty"`
+	ServiceCheckedAt time.Time `json:"service_checked_at,omitzero"`
 	// ServiceNote is the probe's own account of why the state is not
 	// "running": the refused candidate and the rule it failed, or the command
 	// that could not run. Empty when the service is proven running, so a

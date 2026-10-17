@@ -1102,10 +1102,10 @@ type pluginInstallationView struct {
 	Available      bool                  `json:"available"`
 	Status         string                `json:"status"`
 	Runtime        *plugin.RuntimeStatus `json:"runtime,omitempty"`
-	VerifiedAt     time.Time             `json:"verified_at,omitempty"`
-	InstalledAt    time.Time             `json:"installed_at,omitempty"`
-	ActivatedAt    time.Time             `json:"activated_at,omitempty"`
-	DisabledAt     time.Time             `json:"disabled_at,omitempty"`
+	VerifiedAt     time.Time             `json:"verified_at,omitzero"`
+	InstalledAt    time.Time             `json:"installed_at,omitzero"`
+	ActivatedAt    time.Time             `json:"activated_at,omitzero"`
+	DisabledAt     time.Time             `json:"disabled_at,omitzero"`
 	CreatedAt      time.Time             `json:"created_at"`
 	UpdatedAt      time.Time             `json:"updated_at"`
 }
@@ -2811,8 +2811,8 @@ type nodeView struct {
 	StatusReason         string                   `json:"status_reason"`
 	Disabled             bool                     `json:"disabled,omitempty"`
 	AgentSourceAllowlist []string                 `json:"agent_source_allowlist,omitempty"`
-	TokenLastUsedAt      time.Time                `json:"token_last_used_at,omitempty"`
-	LastSeen             time.Time                `json:"last_seen"`
+	TokenLastUsedAt      time.Time                `json:"token_last_used_at,omitzero"`
+	LastSeen             time.Time                `json:"last_seen,omitzero"`
 	Metrics              model.Metrics            `json:"metrics"`
 	HostFacts            model.HostFacts          `json:"host_facts"`
 	Geo                  *model.NodeGeo           `json:"geo,omitempty"`
@@ -2848,7 +2848,7 @@ type agentRuntimeConfig struct {
 	ProxyUsageXrayBin     string    `json:"proxy_usage_xray_bin,omitempty"`
 	ProxyUsageXrayPattern string    `json:"proxy_usage_xray_pattern,omitempty"`
 	SingBoxStatsAPI       string    `json:"singbox_stats_api,omitempty"`
-	ReportedAt            time.Time `json:"reported_at,omitempty"`
+	ReportedAt            time.Time `json:"reported_at,omitzero"`
 }
 
 func (s *Server) toNodeView(n model.Node) nodeView {
@@ -4311,8 +4311,8 @@ type taskView struct {
 	RerunOfTaskID   string    `json:"rerun_of_task_id,omitempty"`
 	RerunOfNodeID   string    `json:"rerun_of_node_id,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
-	StartedAt       time.Time `json:"started_at,omitempty"`
-	FinishedAt      time.Time `json:"finished_at,omitempty"`
+	StartedAt       time.Time `json:"started_at,omitzero"`
+	FinishedAt      time.Time `json:"finished_at,omitzero"`
 	// Attempts, LeaseAgeSeconds and StalledReason summarise a single-target
 	// task; TargetStates carries the same per node for every leased task, so
 	// a fan-out row can say which node is on its third try. All omitted when
@@ -4671,7 +4671,7 @@ type taskExecContextView struct {
 	NonRoot      bool      `json:"non_root,omitempty"`
 	RootExec     bool      `json:"root_exec,omitempty"`
 	ExecDisabled bool      `json:"exec_disabled,omitempty"`
-	ReportedAt   time.Time `json:"reported_at,omitempty"`
+	ReportedAt   time.Time `json:"reported_at,omitzero"`
 }
 
 type taskResultView struct {
@@ -6384,7 +6384,7 @@ type ddnsView struct {
 	LastIPv4        string    `json:"last_ipv4,omitempty"`
 	LastIPv6        string    `json:"last_ipv6,omitempty"`
 	LastTarget      string    `json:"last_target,omitempty"`
-	LastRunAt       time.Time `json:"last_run_at,omitempty"`
+	LastRunAt       time.Time `json:"last_run_at,omitzero"`
 	LastError       string    `json:"last_error,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`

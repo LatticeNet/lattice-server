@@ -465,7 +465,7 @@ type nodeCapabilityEffectiveView struct {
 	State        string    `json:"state,omitempty"`
 	RecordReason string    `json:"record_reason,omitempty"`
 	ActorID      string    `json:"actor_id,omitempty"`
-	UpdatedAt    time.Time `json:"updated_at,omitempty"`
+	UpdatedAt    time.Time `json:"updated_at,omitzero"`
 }
 
 type nodeCapabilityView struct {

@@ -114,6 +114,7 @@ func (s *Server) forgetNodeOfflineAlert(nodeID string) {
 	delete(a.watchFrom, nodeID)
 	s.forgetAgentHealth(nodeID)
 	s.forgetTraceCollector(nodeID)
+	s.forgetAgentPrefetch(nodeID)
 }
 
 // notifyNodeLiveness opens node.offline incidents for nodes silent past

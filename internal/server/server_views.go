@@ -58,6 +58,13 @@ type approvalView struct {
 	// shape it already had. Only the listing endpoint fills it in; see
 	// server_approval_waiting.go for why the console cannot derive it.
 	Waiting *approvalWaitView `json:"waiting,omitempty"`
+
+	// Prefetch is the node's progress on this agent update's binary, which
+	// the agent fetches in the background while the approval is open
+	// (design 31, S4). Present only on an open agent update approval whose
+	// node reported it recently, so an operator can see that a node already
+	// holds the whole file before approving.
+	Prefetch *agentPrefetchView `json:"prefetch,omitempty"`
 }
 
 // systemActorID is the recorded creator for approvals the server proposed
@@ -158,7 +165,9 @@ func (s *Server) annotateApprovalRejections(views []approvalView) []approvalView
 
 // approvalViewFor is the single-row form of the listing's projection.
 func (s *Server) approvalViewFor(a model.Approval) approvalView {
-	return s.annotateApprovalRejections([]approvalView{toApprovalView(a)})[0]
+	view := s.annotateApprovalRejections([]approvalView{toApprovalView(a)})[0]
+	view.Prefetch = s.agentPrefetchViewFor(a)
+	return view
 }
 
 type monitorView struct {

@@ -375,6 +375,13 @@ type Server struct {
 	// traceCollectors is each node's last trace collector status, in memory
 	// only; see trace_collector.go.
 	traceCollectors traceCollectorBook
+	// agentPrefetch is each node's last agent update prefetch report and the
+	// prefetch downloads in flight, in memory only; see
+	// server_agent_prefetch.go.
+	agentPrefetch agentPrefetchBook
+	// agentArtifactBytes shares one decoded copy of a stored agent binary
+	// among the downloads serving it; see serveAgentArtifact.
+	agentArtifactBytes agentArtifactByteCache
 	// monitorDrops rate-limits the log line for agent monitor results the
 	// store refused; see server_monitor_results.go.
 	monitorDrops monitorDropLog
@@ -1636,6 +1643,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/agent/debug-events", s.withAgentLimit(s.handleAgentDebugEvents))
 	mux.HandleFunc("/api/agent/event", s.withAgentLimit(s.handleAgentEvent))
 	mux.HandleFunc(agentBinaryPathPrefix, s.withAgentLimit(s.handleAgentBinary))
+	mux.HandleFunc(agentPrefetchPathPrefix, s.withAgentLimit(s.handleAgentPrefetchBinary))
 	// Self-monitoring (metrics.db): a node's long-term history is a node
 	// read; the control plane's own internals need a full administrator,
 	// which the handlers check (server_selfmon_api.go).
@@ -7469,6 +7477,7 @@ func (s *Server) handleApprovals(w http.ResponseWriter, r *http.Request, p princ
 			views = s.annotateApprovalWaitingWith(views, rows, s.newApprovalWaitContext(scoped))
 		}
 		views = s.annotateApprovalRejections(views)
+		views = s.annotateAgentPrefetch(views, rows)
 		if !includePlan {
 			views = withoutPlans(views)
 		}
@@ -9629,6 +9638,9 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 		// Witness is the control-plane witness's status file, sent only by
 		// the node that runs one.
 		Witness *witnessReport `json:"witness"`
+		// Prefetch is the agent's progress on the update binary the config
+		// pull named (design 31, S4); kept in memory like LoopHealth.
+		Prefetch *agentPrefetchFacts `json:"prefetch"`
 	}
 	if !decodeAgentJSON(w, r, &req) {
 		return
@@ -9687,6 +9699,7 @@ func (s *Server) handleAgentMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	s.noteAgentHealth(req.NodeID, req.LoopHealth, req.Metrics.CollectedAt)
 	s.noteTraceCollector(req.NodeID, req.TraceCollector, req.Metrics.CollectedAt)
+	s.noteAgentPrefetch(req.NodeID, req.Prefetch)
 	s.noteWitnessReport(req.NodeID, req.Witness)
 	s.maybeTriggerDDNS(req.NodeID, old.PublicIP, old.PublicIPv6, v4, v6)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

@@ -4103,6 +4103,39 @@ func (s *Store) Approvals() []model.Approval {
 	return out
 }
 
+// NodePluginApprovals returns one node's approvals of one plugin, newest
+// first, copying only those. The agent config pull asks this on every poll of
+// every node, so it does not copy and sort the whole approval table the way
+// Approvals does.
+func (s *Store) NodePluginApprovals(nodeID, plugin string) []model.Approval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []model.Approval
+	for _, a := range s.state.Approvals {
+		if a.NodeID == nodeID && a.Plugin == plugin {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out
+}
+
+// ApprovalTaskLeased reports whether a task created for approvalID is leased
+// to a node now, without copying the task table.
+func (s *Store) ApprovalTaskLeased(approvalID string) bool {
+	if approvalID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.state.Tasks {
+		if t.ApprovalID == approvalID && t.Status == model.TaskLeased {
+			return true
+		}
+	}
+	return false
+}
+
 // PutSession persists a session, pruning expired entries and enforcing the
 // session cap on every write so neither memory nor the state file grows
 // unbounded under credential-stuffing or churn.

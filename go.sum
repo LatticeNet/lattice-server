@@ -2,14 +2,8 @@ c2sp.org/CCTV/age v0.0.0-20240306222714-3ec4d716e805 h1:u2qwJeEvnypw+OCPUHmoZE3I
 c2sp.org/CCTV/age v0.0.0-20240306222714-3ec4d716e805/go.mod h1:FomMrUJ2Lxt5jCLmZkG3FHa72zUprnhd3v/Z18Snm4w=
 filippo.io/age v1.2.1 h1:X0TZjehAZylOIj4DubWYU1vWQxv9bJpo+Uu2/LGhi1o=
 filippo.io/age v1.2.1/go.mod h1:JL9ew2lTN+Pyft4RiNGguFfOpewKwSHm5ayKD/A4004=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261016120438-f2689021eb38 h1:zRJAXZw8AwM3rMZRItxRg7RwhLQvM7ACM+uFSb5ikcI=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261016120438-f2689021eb38/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261016144248-9807b34bfd82 h1:0b9RsQYsqQqdhlh9jhuWLbaoXxpCOV8QN/ryTrbSiDk=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261016144248-9807b34bfd82/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261016152819-8805e6f57d03 h1:f2KUXw7h3dYzSB8Li4E0a9/QVaPJeniB0wCxLL6e3Jc=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261016152819-8805e6f57d03/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261016225847-0a5bf02f17dc h1:MjJlx2Mhk8zGlGWa3ZELZjtxycbXXN4KBgZcrIuglio=
-github.com/LatticeNet/lattice-sdk v0.2.24-0.20261016225847-0a5bf02f17dc/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
+github.com/LatticeNet/lattice-sdk v0.2.24-0.20261017043059-5863aec22d9d h1:irivkVVe3Hy7+LsdeopeXWg3z1AQoCCbUBzgjp8vt/w=
+github.com/LatticeNet/lattice-sdk v0.2.24-0.20261017043059-5863aec22d9d/go.mod h1:jx9PFwMH2zT993VRwecQZBo/rP9W1lgWcZYDdqr5D9M=
 github.com/coreos/go-oidc/v3 v3.18.0 h1:V9orjXynvu5wiC9SemFTWnG4F45v403aIcjWo0d41+A=
 github.com/coreos/go-oidc/v3 v3.18.0/go.mod h1:DYCf24+ncYi+XkIH97GY1+dqoRlbaSI26KVTCI9SrY4=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=

@@ -26,13 +26,6 @@ import (
 // the console creates the new check and pauses the old one. Generated
 // checks refuse edits as they refuse deletes.
 
-const (
-	// monitorMinIntervalSec is the interval floor every save enforces.
-	monitorMinIntervalSec = 10
-	monitorMaxIntervalSec = 24 * 3600
-	monitorMaxTimeoutSec  = 60
-)
-
 // errMonitorMethodChange is the answer to an edit that changes the method
 // or the target.
 func errMonitorMethodChange(field string) error {
@@ -113,13 +106,16 @@ func validMonitorAlertAfter(n int) error {
 	return nil
 }
 
-// validMonitorTiming checks the interval and timeout a save stores.
+// validMonitorTiming checks the interval and timeout a save stores, a
+// create of any kind and an edit alike. The bounds are the SDK's
+// (model.MonitorIntervalMinSec, model.MonitorIntervalMaxSec,
+// model.MonitorTimeoutMaxSec), which the console mirrors.
 func validMonitorTiming(intervalSec, timeoutSec int) error {
-	if intervalSec < monitorMinIntervalSec || intervalSec > monitorMaxIntervalSec {
-		return fmt.Errorf("interval_sec must be %d to %d", monitorMinIntervalSec, monitorMaxIntervalSec)
+	if intervalSec < model.MonitorIntervalMinSec || intervalSec > model.MonitorIntervalMaxSec {
+		return fmt.Errorf("interval_sec must be %d to %d", model.MonitorIntervalMinSec, model.MonitorIntervalMaxSec)
 	}
-	if timeoutSec < 1 || timeoutSec > monitorMaxTimeoutSec || timeoutSec >= intervalSec {
-		return fmt.Errorf("timeout_sec must be 1 to %d and shorter than interval_sec", monitorMaxTimeoutSec)
+	if timeoutSec < 1 || timeoutSec > model.MonitorTimeoutMaxSec || timeoutSec >= intervalSec {
+		return fmt.Errorf("timeout_sec must be 1 to %d and shorter than interval_sec", model.MonitorTimeoutMaxSec)
 	}
 	return nil
 }

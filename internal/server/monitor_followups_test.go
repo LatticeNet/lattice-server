@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -139,6 +140,41 @@ func TestAlertAfterZeroMeansTheDefaultOnCreateAndEdit(t *testing.T) {
 		if create.StatusCode != http.StatusBadRequest || edit.StatusCode != http.StatusBadRequest || message(createBody) != message(editBody) ||
 			!strings.Contains(message(createBody), "or 0 for the default") {
 			t.Fatalf("alert_after %s: create %d %s, edit %d %s", bad, create.StatusCode, createBody, edit.StatusCode, editBody)
+		}
+	}
+}
+
+// The timeout bound a save enforces is 60 s, model.MonitorTimeoutMaxSec, the
+// constant the console mirrors: a create and an edit of every agent kind and
+// a tls check take 60 and refuse 61 with an answer naming the bound.
+func TestCheckTimeoutBoundIsTheSDKs(t *testing.T) {
+	if model.MonitorTimeoutMaxSec != 60 {
+		t.Fatalf("model.MonitorTimeoutMaxSec = %d, want 60", model.MonitorTimeoutMaxSec)
+	}
+	_, handler, st := newInventoryServer(t)
+	cookies, csrf := loginSession(t, handler)
+	upsertNodes(t, st, model.Node{ID: "node-a", Name: "a"})
+	want := fmt.Sprintf("timeout_sec must be 1 to %d", model.MonitorTimeoutMaxSec)
+	for _, c := range []struct{ kind, target, nodes string }{
+		{"tcp", "203.0.113.9:443", `"node_ids":["node-a"],`},
+		{"http", "https://example.com/", `"node_ids":["node-a"],`},
+		{"tls", "example.com:443", ""},
+	} {
+		body := func(timeout int) string {
+			return fmt.Sprintf(`{"name":"x","type":%q,"target":%q,%s"interval_sec":120,"timeout_sec":%d}`, c.kind, c.target, c.nodes, timeout)
+		}
+		over := doJSON(t, handler, http.MethodPost, "/api/monitors", body(model.MonitorTimeoutMaxSec+1), cookies, csrf)
+		if text := readBody(t, over); over.StatusCode != http.StatusBadRequest || !strings.Contains(text, want) {
+			t.Fatalf("%s create at %d s = %d %s", c.kind, model.MonitorTimeoutMaxSec+1, over.StatusCode, text)
+		}
+		at := doJSON(t, handler, http.MethodPost, "/api/monitors", body(model.MonitorTimeoutMaxSec), cookies, csrf)
+		created := decodeMonitorView(t, at)
+		if at.StatusCode != http.StatusOK || created.TimeoutSec != model.MonitorTimeoutMaxSec {
+			t.Fatalf("%s create at %d s = %d %+v", c.kind, model.MonitorTimeoutMaxSec, at.StatusCode, created)
+		}
+		edit := doJSON(t, handler, http.MethodPost, "/api/monitors/update", fmt.Sprintf(`{"id":%q,"version":1,"timeout_sec":%d}`, created.ID, model.MonitorTimeoutMaxSec+1), cookies, csrf)
+		if text := readBody(t, edit); edit.StatusCode != http.StatusBadRequest || !strings.Contains(text, want) {
+			t.Fatalf("%s edit to %d s = %d %s", c.kind, model.MonitorTimeoutMaxSec+1, edit.StatusCode, text)
 		}
 	}
 }

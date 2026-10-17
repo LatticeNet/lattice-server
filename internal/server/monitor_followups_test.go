@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // A beacon path that has never had a reply reads beacon_filtered and can
@@ -70,6 +72,73 @@ func TestNeverAnsweredBeaconPathIsNotPending(t *testing.T) {
 	ingest(allLost("mon-beacon", now.Add(-time.Minute)))
 	if !pending("mon-beacon") {
 		t.Fatal("a beacon path that answered once and then failed is not pending")
+	}
+}
+
+// Adopting the pages sent before incident records applies the same rule: a
+// beacon path past its hold that never had a reply could not have paged, so
+// no monitor.down is adopted for it, exactly as for an icmp path that never
+// had an echo. Once a reply has come back, a path past its hold is adopted.
+func TestNeverAnsweredBeaconPathIsNotAdopted(t *testing.T) {
+	srv, handler, st := beaconFleet(t)
+	enableBeacon(t, srv, handler, model.BeaconPlanRequest{})
+	listenAsPlanned(t, srv, st)
+	now := srv.now()
+	bt, _ := st.BeaconTarget("node-t")
+	for _, mon := range []model.Monitor{
+		{ID: "mon-beacon", Name: "beacon", Type: model.MonitorTypeBeacon, Target: bt.Settings.Endpoint, TargetNode: "node-t", Packets: 3,
+			IntervalSec: 60, TimeoutSec: 2, NodeIDs: []string{"node-a"}, Enabled: true, AlertAfter: 3},
+		{ID: "mon-ping", Name: "ping", Type: model.MonitorTypeICMP, Target: "198.51.100.30", TargetNode: "node-t", Packets: 3,
+			IntervalSec: 60, TimeoutSec: 2, NodeIDs: []string{"node-a"}, Enabled: true, AlertAfter: 3},
+	} {
+		if err := st.UpsertMonitor(mon); err != nil {
+			t.Fatal(err)
+		}
+	}
+	allLost := func(monitorID string, at time.Time) model.MonitorResult {
+		return model.MonitorResult{MonitorID: monitorID, NodeID: "node-a", At: at, Sent: 3, Lost: 3, Error: "no reply"}
+	}
+	ingest := func(results ...model.MonitorResult) {
+		t.Helper()
+		if resp, err := srv.ingestAgentMonitorResults("node-a", results); err != nil || resp.Accepted != len(results) {
+			t.Fatalf("ingest = %+v %v", resp, err)
+		}
+	}
+	adopted := func(monitorID string) bool {
+		t.Helper()
+		if err := st.DeleteIncidentsWhere(func(store.Incident) bool { return true }); err != nil {
+			t.Fatal(err)
+		}
+		srv.adoptLegacyAlerts(now)
+		_, ok := st.ActiveIncident(incidentKey(EventMonitorDown, "node-a", monitorID))
+		return ok
+	}
+	for i := 7; i >= 5; i-- {
+		at := now.Add(-time.Duration(i) * time.Minute)
+		ingest(allLost("mon-beacon", at), allLost("mon-ping", at))
+	}
+	latest, err := st.LatestMonitorResults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, monitorID := range []string{"mon-beacon", "mon-ping"} {
+		if pairs := latest[monitorID]; len(pairs) != 1 || pairs[0].FailStreak < 3 || !pairs[0].LastOKAt.IsZero() {
+			t.Fatalf("%s latest = %+v, want three failures and no reply ever", monitorID, pairs)
+		}
+		if adopted(monitorID) {
+			t.Errorf("%s never answered and was adopted as a monitor.down it could never have paged", monitorID)
+		}
+	}
+	if t.Failed() {
+		t.FailNow()
+	}
+
+	ingest(model.MonitorResult{MonitorID: "mon-beacon", NodeID: "node-a", At: now.Add(-4 * time.Minute), Success: true, Sent: 3, LatencyMs: 20, RTTsMs: []float64{20, 20, 20}})
+	for i := 3; i >= 1; i-- {
+		ingest(allLost("mon-beacon", now.Add(-time.Duration(i)*time.Minute)))
+	}
+	if !adopted("mon-beacon") {
+		t.Fatal("a beacon path that answered once and then failed past its hold was not adopted")
 	}
 }
 

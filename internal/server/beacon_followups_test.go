@@ -197,6 +197,12 @@ func TestBeaconReplanNamesTheNodeAndThePlanRequest(t *testing.T) {
 	if _, ok := st.Approval(applied.AppliedApprovalID); !ok || len(tasksFor(srv, applied.AppliedApprovalID)) != 1 {
 		t.Fatal("the replan filed or applied something on its own")
 	}
+	// A token that may read every source but not the target learns nothing
+	// about the target's beacon: not its id, name, reason or approval.
+	sourcesOnly := principal{Principal: rbac.Principal{ActorID: "op", Scopes: []string{"monitor:read"}, ServerAllowlist: []string{"node-a", "node-b", "node-c", "node-d"}}}
+	if m, err := srv.pathMatrixFor(sourcesOnly, model.PathWindowHour, srv.now()); err != nil || m.BeaconReplans == nil || len(m.BeaconReplans) != 0 {
+		t.Fatalf("a token that cannot read node-t reads beacon_replans %+v (%v)", m.BeaconReplans, err)
+	}
 
 	// One click: the request as it is.
 	code, out, raw = planBeacon(t, handler, r.Request)

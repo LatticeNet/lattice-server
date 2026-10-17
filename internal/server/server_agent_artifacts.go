@@ -2,9 +2,11 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -32,17 +34,27 @@ const (
 	agentArtifactBucket = "agent-releases"
 
 	// maxAgentArtifactBytes caps one decoded binary. The real artifact is about
-	// 12 MiB, so this leaves generous headroom while refusing absurd uploads.
+	// 14 MB, so this leaves generous headroom while refusing absurd uploads.
 	maxAgentArtifactBytes = 48 << 20
 
 	// maxAgentArtifactStoreBytes caps everything the bucket holds, measured on
 	// the stored base64 form. Static is read into memory at startup, so this is
-	// a resident-memory ceiling as much as a disk one. 128 MiB is roughly four
-	// versions across linux/amd64 and linux/arm64. Uploads past it are refused
+	// a resident-memory ceiling as much as a disk one. A raw 14 MB binary takes
+	// about 18.7 MB of it, so 128 MiB held only six or seven, three versions
+	// across linux/amd64 and linux/arm64, and it filled once. An import stores
+	// the gzip form instead (5.55 MB for 0.3.10-alpha.6 linux/amd64, 7.4 MB
+	// encoded), which fits about seventeen. Uploads past the cap are refused
 	// with the current usage named, never silently evicted: evicting a binary a
 	// queued approval still needs would strand exactly the nodes this feature
 	// exists to unstick.
 	maxAgentArtifactStoreBytes = 128 << 20
+
+	// agentArtifactGzipLevel is fixed so an import of the same release always
+	// stores the same bytes: compress/gzip writes no name and a zero
+	// modification time, so its output depends only on the input and the
+	// level.
+	agentArtifactGzipLevel = gzip.BestCompression
+	agentArtifactGzipExt   = ".gz"
 
 	agentArtifactContentType = "application/octet-stream"
 
@@ -77,11 +89,18 @@ var (
 // agentArtifactRef identifies one stored binary. Every component is validated
 // against a fixed pattern before it is ever used to build an object path, so a
 // caller cannot walk out of the bucket or address an object it did not name.
+//
+// SHA256 is always the digest of the binary a node installs. GzipSHA256, when
+// set, says the object holds that binary gzip-compressed and is the digest of
+// the compressed bytes, which are what the route serves and what a range
+// request addresses. Both are in the path, so the plan line names the bytes on
+// the wire and the binary they decompress to.
 type agentArtifactRef struct {
-	Version string
-	OS      string
-	Arch    string
-	SHA256  string
+	Version    string
+	OS         string
+	Arch       string
+	SHA256     string
+	GzipSHA256 string
 }
 
 func (ref agentArtifactRef) validate() error {
@@ -91,7 +110,18 @@ func (ref agentArtifactRef) validate() error {
 	if !agentSHA256Re.MatchString(ref.SHA256) {
 		return errors.New("sha256 must be a 64-character lowercase hex digest")
 	}
+	if ref.GzipSHA256 != "" && !agentSHA256Re.MatchString(ref.GzipSHA256) {
+		return errors.New("compressed sha256 must be a 64-character lowercase hex digest")
+	}
 	return nil
+}
+
+// servedSHA256 is the digest of the bytes the route sends for this object.
+func (ref agentArtifactRef) servedSHA256() string {
+	if ref.GzipSHA256 != "" {
+		return ref.GzipSHA256
+	}
+	return ref.SHA256
 }
 
 // validateAgentArtifactPlatform is the digest-free half, for callers that name
@@ -111,8 +141,14 @@ func validateAgentArtifactPlatform(version, osName, arch string) error {
 	return nil
 }
 
+// objectPath is version/os/arch/sha256 for a raw binary and
+// version/os/arch/sha256/<compressed sha256>.gz for its gzip form.
 func (ref agentArtifactRef) objectPath() string {
-	return agentArtifactPlatformPrefix(ref.Version, ref.OS, ref.Arch) + ref.SHA256
+	path := agentArtifactPlatformPrefix(ref.Version, ref.OS, ref.Arch) + ref.SHA256
+	if ref.GzipSHA256 != "" {
+		path += "/" + ref.GzipSHA256 + agentArtifactGzipExt
+	}
+	return path
 }
 
 func (ref agentArtifactRef) urlPath() string {
@@ -125,10 +161,17 @@ func agentArtifactPlatformPrefix(version, osName, arch string) string {
 
 func parseAgentArtifactPath(objectPath string) (agentArtifactRef, bool) {
 	parts := strings.Split(strings.TrimSpace(objectPath), "/")
-	if len(parts) != 4 {
+	if len(parts) != 4 && len(parts) != 5 {
 		return agentArtifactRef{}, false
 	}
 	ref := agentArtifactRef{Version: parts[0], OS: parts[1], Arch: parts[2], SHA256: strings.ToLower(parts[3])}
+	if len(parts) == 5 {
+		gz, ok := strings.CutSuffix(parts[4], agentArtifactGzipExt)
+		if !ok || gz == "" {
+			return agentArtifactRef{}, false
+		}
+		ref.GzipSHA256 = strings.ToLower(gz)
+	}
 	if ref.validate() != nil {
 		return agentArtifactRef{}, false
 	}
@@ -180,14 +223,46 @@ func agentArtifactDecodedSize(encoded string) int {
 	return size
 }
 
+// agentArtifactGzipRawSize reads the uncompressed size a stored gzip object
+// records in its trailer (ISIZE, the last four bytes, little-endian) by
+// decoding only the last two base64 quanta. The size is what the import
+// verified by decompressing; a node holds its own result to it as well, so a
+// wrong trailer can only make the node refuse.
+func agentArtifactGzipRawSize(encoded string) (int, bool) {
+	if len(encoded) < 8 || len(encoded)%4 != 0 {
+		return 0, false
+	}
+	tail, err := base64.StdEncoding.DecodeString(encoded[len(encoded)-8:])
+	if err != nil || len(tail) < 4 {
+		return 0, false
+	}
+	return int(binary.LittleEndian.Uint32(tail[len(tail)-4:])), true
+}
+
+// agentArtifactSizes reports the installed binary's size and, for a gzip
+// object, the size of the compressed bytes the route serves.
+func agentArtifactSizes(ref agentArtifactRef, encoded string) (binarySize, compressedSize int) {
+	served := agentArtifactDecodedSize(encoded)
+	if ref.GzipSHA256 == "" {
+		return served, 0
+	}
+	raw, ok := agentArtifactGzipRawSize(encoded)
+	if !ok {
+		return 0, served
+	}
+	return raw, served
+}
+
 type agentArtifactView struct {
-	Version    string    `json:"version"`
-	OS         string    `json:"os"`
-	Arch       string    `json:"arch"`
-	SHA256     string    `json:"sha256"`
-	SizeBytes  int       `json:"size_bytes"`
-	StoredSize int       `json:"stored_bytes"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	Version          string    `json:"version"`
+	OS               string    `json:"os"`
+	Arch             string    `json:"arch"`
+	SHA256           string    `json:"sha256"`
+	SizeBytes        int       `json:"size_bytes"`
+	CompressedSHA256 string    `json:"compressed_sha256,omitempty"`
+	CompressedBytes  int       `json:"compressed_bytes,omitempty"`
+	StoredSize       int       `json:"stored_bytes"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // agentArtifacts lists what the control plane can serve. Content is deliberately
@@ -201,14 +276,17 @@ func (s *Server) agentArtifacts() []agentArtifactView {
 		if !ok {
 			continue
 		}
+		binarySize, compressedSize := agentArtifactSizes(ref, obj.Content)
 		out = append(out, agentArtifactView{
-			Version:    ref.Version,
-			OS:         ref.OS,
-			Arch:       ref.Arch,
-			SHA256:     ref.SHA256,
-			SizeBytes:  agentArtifactDecodedSize(obj.Content),
-			StoredSize: len(obj.Content),
-			UpdatedAt:  obj.UpdatedAt,
+			Version:          ref.Version,
+			OS:               ref.OS,
+			Arch:             ref.Arch,
+			SHA256:           ref.SHA256,
+			SizeBytes:        binarySize,
+			CompressedSHA256: ref.GzipSHA256,
+			CompressedBytes:  compressedSize,
+			StoredSize:       len(obj.Content),
+			UpdatedAt:        obj.UpdatedAt,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -236,16 +314,23 @@ func (s *Server) agentArtifactStoreBytes() int {
 // new one replaces the whole prefix; "which bytes does this version install" has
 // exactly one answer.
 func (s *Server) storedAgentArtifact(version, osName, arch string) (agentArtifactRef, bool) {
+	ref, _, ok := s.storedAgentArtifactObject(version, osName, arch)
+	return ref, ok
+}
+
+// storedAgentArtifactObject is storedAgentArtifact with the stored object, for
+// callers that need its sizes. The content is not decoded.
+func (s *Server) storedAgentArtifactObject(version, osName, arch string) (agentArtifactRef, model.StaticObject, bool) {
 	prefix := agentArtifactPlatformPrefix(version, osName, arch)
 	for _, obj := range s.store.Static(agentArtifactBucket) {
 		if !strings.HasPrefix(obj.Path, prefix) {
 			continue
 		}
 		if ref, ok := parseAgentArtifactPath(obj.Path); ok {
-			return ref, true
+			return ref, obj, true
 		}
 	}
-	return agentArtifactRef{}, false
+	return agentArtifactRef{}, model.StaticObject{}, false
 }
 
 // agentBinaryBaseURL is the control plane's own origin, and it is only usable
@@ -276,15 +361,41 @@ func normalizeAgentBinaryBaseURL(publicURL string) string {
 // serve different bytes, so a stored artifact that disagrees with the pin is
 // ignored rather than substituted.
 func (s *Server) controlPlaneAgentBinaryURL(version, osName, arch, sha256Hex string) (string, bool) {
+	artifact, ok := s.controlPlaneAgentArtifact(version, osName, arch, sha256Hex)
+	return artifact.url, ok
+}
+
+// agentControlPlaneArtifact is what a plan takes from a stored artifact: the
+// URL a node fetches, the digests it names, and, for a gzip object, both
+// sizes, which the apply script needs to bound decompression and to compare
+// progress on the compressed file with progress on the release binary.
+type agentControlPlaneArtifact struct {
+	ref            agentArtifactRef
+	url            string
+	binarySize     int
+	compressedSize int
+}
+
+func (s *Server) controlPlaneAgentArtifact(version, osName, arch, sha256Hex string) (agentControlPlaneArtifact, bool) {
 	base := s.agentBinaryBaseURL()
 	if base == "" {
-		return "", false
+		return agentControlPlaneArtifact{}, false
 	}
-	ref, ok := s.storedAgentArtifact(version, osName, arch)
+	ref, obj, ok := s.storedAgentArtifactObject(version, osName, arch)
 	if !ok || !strings.EqualFold(ref.SHA256, strings.TrimSpace(sha256Hex)) {
-		return "", false
+		return agentControlPlaneArtifact{}, false
 	}
-	return base + ref.urlPath(), true
+	out := agentControlPlaneArtifact{ref: ref, url: base + ref.urlPath()}
+	if ref.GzipSHA256 != "" {
+		out.binarySize, out.compressedSize = agentArtifactSizes(ref, obj.Content)
+		if out.binarySize <= 0 || out.binarySize > maxAgentArtifactBytes || out.compressedSize <= 0 {
+			// A gzip object whose sizes cannot be read is not something a plan
+			// can bound, so it is not offered at all and the plan stays on the
+			// upstream release.
+			return agentControlPlaneArtifact{}, false
+		}
+	}
+	return out, true
 }
 
 // requireFleetAgentAdmin gates every operation that changes what the fleet can
@@ -455,7 +566,7 @@ func (s *Server) handleAgentArtifactImport(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	view, err := s.storeAgentArtifact(ref, data)
+	view, err := s.storeCompressedAgentArtifact(ref, data)
 	if err != nil {
 		s.writeAgentArtifactStoreError(w, err)
 		return
@@ -465,12 +576,14 @@ func (s *Server) handleAgentArtifactImport(w http.ResponseWriter, r *http.Reques
 		Action: "agent.artifact.import",
 		Scope:  "node:admin",
 		Metadata: map[string]string{
-			"version": ref.Version,
-			"os":      ref.OS,
-			"arch":    ref.Arch,
-			"sha256":  ref.SHA256,
-			"bytes":   strconv.Itoa(len(data)),
-			"release": tag,
+			"version":           ref.Version,
+			"os":                ref.OS,
+			"arch":              ref.Arch,
+			"sha256":            ref.SHA256,
+			"bytes":             strconv.Itoa(len(data)),
+			"compressed_sha256": view.CompressedSHA256,
+			"compressed_bytes":  strconv.Itoa(view.CompressedBytes),
+			"release":           tag,
 		},
 	})
 	writeJSON(w, http.StatusOK, view)
@@ -535,15 +648,81 @@ var (
 // replaces any earlier digest for the same version and platform so a version
 // never resolves to two different binaries.
 func (s *Server) storeAgentArtifact(ref agentArtifactRef, data []byte) (agentArtifactView, error) {
-	if err := ref.validate(); err != nil {
+	ref.GzipSHA256 = ""
+	if err := verifyAgentArtifactBytes(ref, data); err != nil {
 		return agentArtifactView{}, err
 	}
+	return s.putAgentArtifact(ref, data, len(data))
+}
+
+// storeCompressedAgentArtifact is storeAgentArtifact for an import: it holds
+// the release bytes to their digest, then stores them gzip-compressed, so the
+// store keeps about two and a half times as many versions and a node on a slow
+// line moves 40 percent of the bytes. The compressed bytes are produced here,
+// deterministically, and checked to decompress to exactly the verified binary
+// before anything is stored; the object path names both digests.
+func (s *Server) storeCompressedAgentArtifact(ref agentArtifactRef, data []byte) (agentArtifactView, error) {
+	ref.GzipSHA256 = ""
+	if err := verifyAgentArtifactBytes(ref, data); err != nil {
+		return agentArtifactView{}, err
+	}
+	packed, err := gzipAgentArtifact(data)
+	if err != nil {
+		return agentArtifactView{}, err
+	}
+	sum := sha256.Sum256(packed)
+	ref.GzipSHA256 = hex.EncodeToString(sum[:])
+	return s.putAgentArtifact(ref, packed, len(data))
+}
+
+func verifyAgentArtifactBytes(ref agentArtifactRef, data []byte) error {
+	if err := ref.validate(); err != nil {
+		return err
+	}
 	if len(data) == 0 {
-		return agentArtifactView{}, errors.New("agent binary is empty")
+		return errors.New("agent binary is empty")
 	}
 	sum := sha256.Sum256(data)
 	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(ref.SHA256)) != 1 {
-		return agentArtifactView{}, fmt.Errorf("%w: computed %s", errAgentArtifactDigestMismatch, hex.EncodeToString(sum[:]))
+		return fmt.Errorf("%w: computed %s", errAgentArtifactDigestMismatch, hex.EncodeToString(sum[:]))
+	}
+	return nil
+}
+
+// gzipAgentArtifact compresses a verified binary at the fixed level and
+// proves the result decompresses, with the output bounded, to the same bytes.
+func gzipAgentArtifact(data []byte) ([]byte, error) {
+	var buf bytes.Buffer
+	zw, err := gzip.NewWriterLevel(&buf, agentArtifactGzipLevel)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := zw.Write(data); err != nil {
+		return nil, fmt.Errorf("compress agent binary: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return nil, fmt.Errorf("compress agent binary: %w", err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		return nil, fmt.Errorf("verify compressed agent binary: %w", err)
+	}
+	back, err := io.ReadAll(io.LimitReader(zr, int64(len(data))+1))
+	if err != nil {
+		return nil, fmt.Errorf("verify compressed agent binary: %w", err)
+	}
+	if !bytes.Equal(back, data) {
+		return nil, errors.New("compressed agent binary does not decompress to the verified bytes")
+	}
+	return buf.Bytes(), nil
+}
+
+// putAgentArtifact writes the bytes the route will serve for ref, which the
+// caller has verified, under the bucket's cap. binarySize is the size of the
+// installed binary, for the answer.
+func (s *Server) putAgentArtifact(ref agentArtifactRef, data []byte, binarySize int) (agentArtifactView, error) {
+	if err := ref.validate(); err != nil {
+		return agentArtifactView{}, err
 	}
 	encoded := base64.StdEncoding.EncodeToString(data)
 	superseded := []string{}
@@ -582,7 +761,10 @@ func (s *Server) storeAgentArtifact(ref agentArtifactRef, data []byte) (agentArt
 	// actually stamped rather than a guess made before the write.
 	view := agentArtifactView{
 		Version: ref.Version, OS: ref.OS, Arch: ref.Arch, SHA256: ref.SHA256,
-		SizeBytes: len(data), StoredSize: len(encoded),
+		SizeBytes: binarySize, StoredSize: len(encoded),
+	}
+	if ref.GzipSHA256 != "" {
+		view.CompressedSHA256, view.CompressedBytes = ref.GzipSHA256, len(data)
 	}
 	if stored, ok := s.store.StaticObject(agentArtifactBucket, ref.objectPath()); ok {
 		view.UpdatedAt = stored.UpdatedAt
@@ -675,11 +857,15 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errAgentArtifactNotFound)
 		return
 	}
+	// A gzip object is held to its compressed digest, the bytes this route
+	// sends. The node holds those bytes to the same digest before it
+	// decompresses them, and the result to the binary's own digest.
+	served := ref.servedSHA256()
 	data, decodeErr := base64.StdEncoding.DecodeString(obj.Content)
 	if decodeErr == nil {
 		sum := sha256.Sum256(data)
-		if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(ref.SHA256)) != 1 {
-			decodeErr = fmt.Errorf("stored digest %s does not match the pinned %s", hex.EncodeToString(sum[:]), ref.SHA256)
+		if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(sum[:])), []byte(served)) != 1 {
+			decodeErr = fmt.Errorf("stored digest %s does not match the pinned %s", hex.EncodeToString(sum[:]), served)
 		}
 	}
 	if decodeErr != nil {
@@ -711,6 +897,9 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 		"bytes":   strconv.Itoa(len(data)),
 		"task_id": task.ID,
 	}
+	if ref.GzipSHA256 != "" {
+		meta["compressed_sha256"] = ref.GzipSHA256
+	}
 	if requested := strings.TrimSpace(r.Header.Get("Range")); requested != "" {
 		meta["range"] = auditTruncate(requested, 64)
 	}
@@ -732,11 +921,14 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", agentArtifactContentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
-	// The pinned digest is the validator. It names exactly these bytes, which
-	// were verified against it above, so an If-Range carrying it resumes and
-	// one carrying anything else gets the whole object rather than a range of
-	// different bytes to splice onto what the caller already has.
-	w.Header().Set("ETag", agentBinaryETag(ref.SHA256))
+	// The pinned digest of the served bytes is the validator. It names exactly
+	// these bytes, which were verified against it above, so an If-Range
+	// carrying it resumes and one carrying anything else gets the whole object
+	// rather than a range of different bytes to splice onto what the caller
+	// already has. For a gzip object that is the compressed digest: ranges
+	// address the stored compressed file, never an encoding applied on the
+	// wire, so a resumed download continues stable bytes.
+	w.Header().Set("ETag", agentBinaryETag(served))
 	// The server's write timeout (60 s in cmd/lattice-server) is sized for API
 	// answers. A node on a
 	// slow uplink spends minutes on this one response, and without a longer
@@ -854,6 +1046,10 @@ func (s *Server) authorizeAgentBinaryRequest(r *http.Request, ref agentArtifactR
 		return node, task, errAgentBinaryDenied
 	}
 	if payload.TargetVersion != ref.Version || !strings.EqualFold(payload.SHA256, ref.SHA256) {
+		return node, task, errAgentBinaryDenied
+	}
+	// The compressed object goes only to a plan that pinned exactly it.
+	if ref.GzipSHA256 != "" && payload.CompressedSHA256 != ref.GzipSHA256 {
 		return node, task, errAgentBinaryDenied
 	}
 	osName, arch, err := agentPlatformForNode(node)

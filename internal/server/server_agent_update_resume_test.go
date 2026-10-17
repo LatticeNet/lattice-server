@@ -107,7 +107,9 @@ func TestAgentUpdatePlanStatesTheResumableDownload(t *testing.T) {
 	}
 	fetches := 0
 	for _, line := range strings.Split(script, "\n") {
-		line = strings.TrimSpace(line)
+		// The walk runs wget under fetch_bounded, which adds timeout when the
+		// node has one.
+		line = strings.TrimPrefix(strings.TrimSpace(line), "fetch_bounded ")
 		switch {
 		case strings.HasPrefix(line, "curl "):
 			fetches++
@@ -255,8 +257,9 @@ func TestAgentUpdatePreResumeOfficialApprovalIsStale(t *testing.T) {
 
 // resumableScripts renders the resumable download for each shape a plan can
 // take: the control plane with and without a fallback, and the upstream
-// release alone.
-func resumableScripts(t *testing.T, approval model.Approval) map[string]struct {
+// release alone. walk picks the source walk every plan gets now, or the
+// download approvals planned before it still render.
+func resumableScripts(t *testing.T, approval model.Approval, walk bool) map[string]struct {
 	script  string
 	payload agentUpdatePayload
 } {
@@ -264,6 +267,12 @@ func resumableScripts(t *testing.T, approval model.Approval) map[string]struct {
 	base, err := agentUpdatePayloadFromApproval(approval)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !walk {
+		approval = approvalBeforeTheWalk(approval)
+	}
+	if strings.Contains(approval.Plan, agentUpdateCutoffPlanLine) != walk {
+		t.Fatalf("walk %t but the plan says otherwise:\n%s", walk, approval.Plan)
 	}
 	out := map[string]struct {
 		script  string
@@ -294,7 +303,8 @@ func resumableScripts(t *testing.T, approval model.Approval) map[string]struct {
 
 // What the resumable download does with a file an earlier attempt kept, for
 // every plan shape and both fetchers, under the stub fetchers that continue a
-// file the way curl -C - and wget -c do.
+// file the way curl -C - and wget -c do. This is the download approvals
+// planned before the source walk render; the walk has its own tests.
 func TestAgentUpdateResumableDownloadKeepsAndContinues(t *testing.T) {
 	srv, _, st := newAgentArtifactServer(t)
 	data, _, _ := seedControlPlaneUpdate(t, srv, st)
@@ -305,7 +315,7 @@ func TestAgentUpdateResumableDownloadKeepsAndContinues(t *testing.T) {
 	// does not.
 	corruptHead := append(bytes.Repeat([]byte{'#'}, half), data[half:]...)
 
-	for shape, rendered := range resumableScripts(t, approval) {
+	for shape, rendered := range resumableScripts(t, approval, false) {
 		for _, fetcher := range []string{"curl", "wget"} {
 			first := rendered.payload.BinaryURL
 			run := func(t *testing.T, r fetchStubRun) fetchStubOutcome {
@@ -403,7 +413,7 @@ func TestAgentUpdateResumableDownloadKeepsAndContinues(t *testing.T) {
 	// The fallback continues what the control plane sent instead of starting
 	// over: its first half differs, so only a continuation verifies.
 	t.Run("the fallback continues a control-plane partial", func(t *testing.T) {
-		rendered := resumableScripts(t, approval)["control plane with fallback"]
+		rendered := resumableScripts(t, approval, false)["control plane with fallback"]
 		for _, fetcher := range []string{"curl", "wget"} {
 			o := runAgentUpdateFetch(t, rendered.script, fetchStubRun{fetcher: fetcher,
 				cpURL: rendered.payload.BinaryURL, fbURL: rendered.payload.FallbackURL,
@@ -441,12 +451,14 @@ func (w *cutAfterWriter) Write(p []byte) (int, error) {
 // curl and wget, against the real binary handler over TLS. The control plane
 // drops the first attempt mid-body; the next attempt sends the lease and a
 // range for the rest, and the digest check passes. With a fallback, the
-// release URL continues the control-plane partial, without the lease.
+// release URL continues the control-plane partial, without the lease. This is
+// the download approvals planned before the source walk render; the walk
+// against the real handler is in server_agent_update_walk_test.go.
 func TestAgentUpdateResumableDownloadAgainstTheRealHandler(t *testing.T) {
 	srv, handler, st := newAgentArtifactServer(t)
 	data, ref, task := seedControlPlaneUpdate(t, srv, st)
 	planned, _ := controlPlaneApprovalFor(st, "node-a")
-	scripts := resumableScripts(t, planned)
+	scripts := resumableScripts(t, planned, false)
 
 	var mu sync.Mutex
 	var cpSeen, fbSeen []http.Header

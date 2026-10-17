@@ -7796,19 +7796,20 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 func approvalApplyTaskTimeoutSec(plugin string) int {
 	switch plugin {
 	case agentUpdatePlugin:
-		// 600s, and it must stay at or under ten minutes. The download leg is
-		// github-release egress from the node's own network and a slow uplink
-		// needs minutes for ~12 MiB, so this wants to be generous. But the
-		// agent's task executor treats a timeout over ten minutes as
-		// out-of-range and falls back to its 30s DEFAULT rather than clamping
-		// to the maximum. The previous value here was 900, which is fifteen
-		// minutes, so every agent update ran with a 30 second deadline and
-		// every node slower than ~400 KiB/s failed with "context deadline
-		// exceeded". Raising 300 to 900 to rescue cd-hs-sh is what broke it.
+		// 600s, and it must stay at or under ten minutes. The download leg
+		// needs minutes for the 14 MB binary on a slow uplink, so this wants
+		// to be generous, but no agent runs a task for longer than ten
+		// minutes. Agents from v0.3.10-alpha.1 clamp a larger value to 600 s
+		// (node-agent c8de23e). Older agents treat it as out of range and
+		// fall back to their 30 s default instead: the previous value here
+		// was 900, so every agent update on those agents ran with a 30 second
+		// deadline and every node slower than ~400 KiB/s failed with "context
+		// deadline exceeded". Raising 300 to 900 to rescue cd-hs-sh is what
+		// broke it.
 		//
-		// The agent-side clamp is fixed separately, but this has to hold the
-		// line regardless: a node cannot receive that fix until it completes
-		// an update, which is the thing the bug prevents.
+		// 600 is therefore the ceiling for every agent, and it has to hold
+		// for the older ones: a node only receives the clamp by completing an
+		// update under this deadline.
 		return 600
 	case sshGuardPlugin:
 		// An arm may install knockd, which means an apt-get update plus an
@@ -7817,9 +7818,10 @@ func approvalApplyTaskTimeoutSec(plugin string) int {
 		// The default of 30s cannot cover that: the hardening-only profiles
 		// fit inside it only because they do neither.
 		//
-		// 600 and not more, for the reason spelled out above: the agent treats
-		// a timeout over ten minutes as out-of-range and falls back to 30s
-		// rather than clamping, so asking for more would ask for less.
+		// 600 and not more, for the reason spelled out above: an agent from
+		// v0.3.10-alpha.1 clamps a longer timeout to 600 s and an older one
+		// falls back to 30 s, so asking for more gains nothing on the first
+		// and asks for less on the second.
 		return 600
 	case "nft", "nftpolicy", "selfdns":
 		return networkApplyTaskTimeoutSec

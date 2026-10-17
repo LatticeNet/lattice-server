@@ -5576,7 +5576,9 @@ func (s *Store) Monitor(id string) (model.Monitor, bool) {
 	return m, ok
 }
 
-// Monitors returns all monitors sorted by creation time.
+// Monitors returns all monitors sorted by creation time, then by id: the
+// generated checks one sync creates share a creation time, and the map
+// order must not decide their order.
 func (s *Store) Monitors() []model.Monitor {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -5584,7 +5586,12 @@ func (s *Store) Monitors() []model.Monitor {
 	for _, m := range s.state.Monitors {
 		out = append(out, m)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 

@@ -167,3 +167,125 @@ func TestAgentUpdateTaskResultKeepsTheLastFetchOnThePolicy(t *testing.T) {
 		t.Fatal("a late fetch record re-created a deleted policy")
 	}
 }
+
+// The agent's outbox can deliver an older approval's result after a newer
+// approval's, so the record a policy keeps is the one from the approval
+// planned last, whatever order the results land in.
+func TestAgentUpdateLastFetchKeepsTheNewerApprovalsRecord(t *testing.T) {
+	srv, _, st := newAgentArtifactServer(t)
+	seedControlPlaneUpdate(t, srv, st)
+	older, ok := controlPlaneApprovalFor(st, "node-a")
+	if !ok {
+		t.Fatal("no planned approval")
+	}
+	newer := older
+	newer.ID = "approval_newerplan"
+	newer.CreatedAt = older.CreatedAt.Add(time.Hour)
+	newer.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(newer); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("POST", "/api/tasks/results", nil)
+	if err := srv.handleAgentUpdateTaskResult(req, newer, model.TaskResult{Stderr: "lattice-agent-fetch v1 1:cp.gz:0:5552813:6 result:0:done\n"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The older approval's result, replayed late, on both of its paths.
+	older.Status = model.ApprovalApplied
+	if err := st.UpsertApproval(older); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.handleAgentUpdateTaskResult(req, older, model.TaskResult{Stderr: "lattice-agent-fetch v1 1:cp:28:1:30 result:28:fetch\n"}); err != nil {
+		t.Fatal(err)
+	}
+	older.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(older); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.handleAgentUpdateTaskResult(req, older, model.TaskResult{ExitCode: 28, Stderr: "lattice-agent-fetch v1 1:cp:28:1:30 result:28:fetch\n"}); err != nil {
+		t.Fatal(err)
+	}
+	policy, _ := st.AgentUpdatePolicy("node-a")
+	if policy.LastFetch == nil || policy.LastFetch.ApprovalID != newer.ID {
+		t.Fatalf("an older approval's late result replaced the newer record: %+v", policy.LastFetch)
+	}
+	if policy.LastError == "" {
+		t.Fatal("the older approval's failure must still set last_error")
+	}
+
+	// The other way round, the newer approval's record replaces the older.
+	if _, err := st.MutateAgentUpdatePolicy("node-a", false, func(p *model.AgentUpdatePolicy) bool {
+		p.LastFetch = &model.AgentUpdateFetch{ApprovalID: older.ID, Stage: "fetch", ExitCode: 28}
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.handleAgentUpdateTaskResult(req, newer, model.TaskResult{Stderr: "lattice-agent-fetch v1 1:cp.gz:0:5552813:6 result:0:done\n"}); err != nil {
+		t.Fatal(err)
+	}
+	if policy, _ := st.AgentUpdatePolicy("node-a"); policy.LastFetch == nil || policy.LastFetch.ApprovalID != newer.ID {
+		t.Fatalf("the newer approval's record must replace the older one: %+v", policy.LastFetch)
+	}
+}
+
+// The node's report can confirm the update between the result's approval
+// write and its policy write. The policy then already says the target is
+// applied, and the result must neither put "awaiting confirmation" back nor
+// touch the applied version.
+func TestAgentUpdateSuccessAfterConfirmationKeepsThePolicyConfirmed(t *testing.T) {
+	srv, _, st := newAgentArtifactServer(t)
+	seedControlPlaneUpdate(t, srv, st)
+	approval, ok := controlPlaneApprovalFor(st, "node-a")
+	if !ok {
+		t.Fatal("no planned approval")
+	}
+	approval.Status = model.ApprovalApproved
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	confirmedAt := approval.CreatedAt.Add(time.Minute)
+	if _, err := st.MutateAgentUpdatePolicy("node-a", false, func(p *model.AgentUpdatePolicy) bool {
+		p.LastAppliedVersion, p.LastAppliedAt, p.LastError = "0.3.4", confirmedAt, ""
+		return true
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.handleAgentUpdateTaskResult(httptest.NewRequest("POST", "/api/tasks/results", nil), approval, model.TaskResult{Stderr: "lattice-agent-fetch v1 1:cp.gz:0:5552813:6 result:0:done\n"}); err != nil {
+		t.Fatal(err)
+	}
+	policy, _ := st.AgentUpdatePolicy("node-a")
+	if policy.LastError != "" || policy.LastAppliedVersion != "0.3.4" || !policy.LastAppliedAt.Equal(confirmedAt) {
+		t.Fatalf("a confirmed policy was rolled back: last_error=%q applied=%s at %s", policy.LastError, policy.LastAppliedVersion, policy.LastAppliedAt)
+	}
+	if policy.LastFetch == nil || policy.LastFetch.ApprovalID != approval.ID {
+		t.Fatalf("the fetch record must still be kept: %+v", policy.LastFetch)
+	}
+}
+
+// last_fetch is the control plane's to write. A policy save that carries one
+// keeps the stored record, and a new policy starts without one.
+func TestAgentUpdatePolicySaveIgnoresAClientLastFetch(t *testing.T) {
+	srv, _, st := newInventoryServer(t)
+	seedAgentUpdateNode(t, st)
+	forged := &model.AgentUpdateFetch{ApprovalID: "approval_forged", Stage: "done"}
+	req := model.AgentUpdatePolicy{NodeID: "node-a", Enabled: true, TargetVersion: "0.2.0", BinaryURL: "https://downloads.example.com/lattice-agent-linux-amd64", SHA256: agentUpdateTestSHA, LastFetch: forged}
+	fresh, err := srv.normalizeAgentUpdatePolicy(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.LastFetch != nil {
+		t.Fatalf("a new policy took the client's last_fetch: %+v", fresh.LastFetch)
+	}
+	stored := &model.AgentUpdateFetch{ApprovalID: "approval_real", Stage: "fetch", ExitCode: 28}
+	fresh.LastFetch = stored
+	if err := st.UpsertAgentUpdatePolicy(fresh); err != nil {
+		t.Fatal(err)
+	}
+	edited, err := srv.normalizeAgentUpdatePolicy(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edited.LastFetch == nil || edited.LastFetch.ApprovalID != "approval_real" {
+		t.Fatalf("an edit must keep the stored last_fetch, got %+v", edited.LastFetch)
+	}
+}

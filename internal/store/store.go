@@ -5288,18 +5288,30 @@ func (s *Store) UpsertAgentUpdatePolicy(policy model.AgentUpdatePolicy) error {
 	return s.Save()
 }
 
-// MutateAgentUpdatePolicy changes one node's existing update policy under the
-// store lock, so a writer that owns one field cannot overwrite what another
-// writer set between a separate read and upsert. It reports whether the
-// policy existed and mutate asked for the write.
-func (s *Store) MutateAgentUpdatePolicy(nodeID string, mutate func(policy *model.AgentUpdatePolicy) bool) (bool, error) {
+// MutateAgentUpdatePolicy changes one node's update policy under the store
+// lock, so a writer that owns some fields cannot overwrite what another
+// writer set between a separate read and upsert. Without a policy for the
+// node, create decides whether mutate starts from one that holds only the
+// node id or nothing is written. It reports whether mutate asked for the
+// write and it was made.
+func (s *Store) MutateAgentUpdatePolicy(nodeID string, create bool, mutate func(policy *model.AgentUpdatePolicy) bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	policy, ok := s.state.AgentUpdates[nodeID]
-	if !ok || !mutate(&policy) {
+	if !ok {
+		if !create {
+			return false, nil
+		}
+		policy = model.AgentUpdatePolicy{NodeID: nodeID}
+	}
+	if !mutate(&policy) {
 		return false, nil
 	}
+	policy.NodeID = nodeID
 	policy.UpdatedAt = time.Now().UTC()
+	if policy.CreatedAt.IsZero() {
+		policy.CreatedAt = policy.UpdatedAt
+	}
 	s.state.AgentUpdates[nodeID] = policy
 	return true, s.Save()
 }

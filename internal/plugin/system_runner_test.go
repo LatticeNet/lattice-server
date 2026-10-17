@@ -1245,7 +1245,10 @@ func TestSystemRunnerV2ReplenishRefusesTamperedArtifact(t *testing.T) {
 	waitIdle()
 	canary := filepath.Join(t.TempDir(), "tampered-ran")
 	staged := filepath.Join(runtimeDir, id, "generation-1", "artifact")
-	if err := os.WriteFile(staged+".planted", []byte("#!/bin/sh\ntouch "+canary+"\n"), 0o700); err != nil {
+	if err := os.WriteFile(staged+".planted", []byte("#!/bin/sh\ntouch "+canary+"\n"), stagedArtifactMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(staged+".planted", stagedArtifactMode); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(staged+".planted", staged); err != nil {
@@ -1275,8 +1278,17 @@ func TestSystemRunnerV1RefusesTamperedStagedArtifact(t *testing.T) {
 	if rsp, err := startInvoke(t, r, loaded, "plan", nil); err != nil || !rsp.OK {
 		t.Fatalf("untouched artifact: response=%+v err=%v", rsp, err)
 	}
+	// The staged artifact is 0555, so the rewrite plants a file of the same
+	// mode and owner and renames it over, leaving only the SHA pin to refuse it.
 	canary := filepath.Join(t.TempDir(), "tampered-ran")
-	if err := os.WriteFile(filepath.Join(runtimeDir, "p.v1tamper", "artifact"), []byte("#!/bin/sh\ntouch "+canary+"\n"), 0o700); err != nil {
+	staged := filepath.Join(runtimeDir, "p.v1tamper", "artifact")
+	if err := os.WriteFile(staged+".planted", []byte("#!/bin/sh\ntouch "+canary+"\n"), stagedArtifactMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(staged+".planted", stagedArtifactMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(staged+".planted", staged); err != nil {
 		t.Fatal(err)
 	}
 	_, err := r.Invoke(t.Context(), InvokeRequest{PluginID: "p.v1tamper", Action: "plan"})
@@ -1299,38 +1311,49 @@ func TestStagedArtifactMatches(t *testing.T) {
 	dir := t.TempDir()
 	body := []byte("#!/bin/sh\nexit 0\n")
 	want := DigestSHA256(body)
+	owner := uint32(os.Geteuid())
 	good := filepath.Join(dir, "artifact")
-	if err := os.WriteFile(good, body, 0o700); err != nil {
+	if err := writeFileAtomic(good, body, stagedArtifactMode); err != nil {
 		t.Fatal(err)
 	}
-	if err := stagedArtifactMatches(good, want); err != nil {
+	if err := stagedArtifactMatches(good, want, owner); err != nil {
 		t.Fatalf("the staged file as written: %v", err)
 	}
 
-	loose := filepath.Join(dir, "loose")
-	if err := os.WriteFile(loose, body, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(loose, 0o755); err != nil {
-		t.Fatal(err)
+	withMode := func(name string, mode os.FileMode) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
 	}
 	link := filepath.Join(dir, "link")
 	if err := os.Symlink(good, link); err != nil {
 		t.Fatal(err)
 	}
 	fifo := filepath.Join(dir, "fifo")
-	if err := syscall.Mkfifo(fifo, 0o700); err != nil {
+	if err := syscall.Mkfifo(fifo, 0o555); err != nil {
 		t.Fatal(err)
 	}
-	for name, tc := range map[string]struct{ path, digest string }{
-		"other bytes":               {good, DigestSHA256([]byte("other"))},
-		"no recorded hash":          {good, ""},
-		"mode other than 0700":      {loose, want},
-		"symlink to the same bytes": {link, want},
-		"fifo":                      {fifo, want},
-		"missing":                   {filepath.Join(dir, "gone"), want},
+	for name, tc := range map[string]struct {
+		path, digest string
+		owner        uint32
+	}{
+		"other bytes":                  {good, DigestSHA256([]byte("other")), owner},
+		"no recorded hash":             {good, "", owner},
+		"the pre-design-30 mode 0700":  {withMode("strict", 0o700), want, owner},
+		"group or world writable 0775": {withMode("loose", 0o775), want, owner},
+		"owner writable 0755":          {withMode("writable", 0o755), want, owner},
+		"setuid 4555":                  {withMode("setuid", os.ModeSetuid|0o555), want, owner},
+		"owned by another uid":         {good, want, owner + 1},
+		"symlink to the same bytes":    {link, want, owner},
+		"fifo":                         {fifo, want, owner},
+		"missing":                      {filepath.Join(dir, "gone"), want, owner},
 	} {
-		if err := stagedArtifactMatches(tc.path, tc.digest); !errors.Is(err, errStagedArtifactChanged) {
+		if err := stagedArtifactMatches(tc.path, tc.digest, tc.owner); !errors.Is(err, errStagedArtifactChanged) {
 			t.Fatalf("%s: got %v, want a refusal", name, err)
 		}
 	}

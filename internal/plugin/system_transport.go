@@ -409,13 +409,20 @@ func startSystemWorker(ctx context.Context, path, dir string, env []string) (*sy
 // worker's process state and its own sampled peak resident set once it has
 // been reaped. A nil onExit is allowed and samples nothing.
 func startSystemWorkerObserved(ctx context.Context, path, dir string, env []string, onExit func(*os.ProcessState, int64)) (*systemWorkerTransport, error) {
+	return startSystemWorkerAs(ctx, path, dir, env, nil, onExit)
+}
+
+// startSystemWorkerAs is startSystemWorkerObserved with the worker started as
+// credential, the plugin's own uid when the runner drops plugins to one
+// (design 30). A nil credential keeps the worker on the server's uid.
+func startSystemWorkerAs(ctx context.Context, path, dir string, env []string, credential *syscall.Credential, onExit func(*os.ProcessState, int64)) (*systemWorkerTransport, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	cmd := exec.Command(path)
 	cmd.Dir = dir
 	cmd.Env = env
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = childSysProcAttr(credential)
 	stdinR, stdinW, err := os.Pipe()
 	if err != nil {
 		return nil, err

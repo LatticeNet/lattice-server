@@ -84,9 +84,12 @@ func ValidateSystemPoolConfig(cfg SystemPoolConfig) error {
 
 // SystemRunnerOptions configures the trusted-subprocess runner.
 type SystemRunnerOptions struct {
-	// RuntimeDir is the root under which each plugin gets a confined 0700 working
-	// directory (RuntimeDir/<pluginID>) holding a 0700 copy of its verified
-	// artifact. Required.
+	// RuntimeDir is the root under which each plugin gets a confined working
+	// directory (RuntimeDir/<pluginID>) holding a copy of its verified
+	// artifact. Every directory from RuntimeDir down is 0711 and the artifact
+	// 0555, all owned by the server's uid, so a child on its own uid can reach
+	// and exec its artifact but cannot list, create or replace anything
+	// (design 30). Required.
 	RuntimeDir string
 	// EnvAllowlist names the environment variables forwarded to the plugin. Every
 	// other variable is stripped; a fixed safe PATH is always provided.
@@ -121,6 +124,11 @@ type SystemRunnerOptions struct {
 	// retires, so its CPU lands in the minute it leaves. Nil observes nothing. It must be cheap and must not call back
 	// into the runner.
 	ProcessObserver func(pluginID string, cpu time.Duration, maxRSSBytes int64)
+	// PluginUIDs, when set, runs every plugin child as its own uid from this
+	// range, with that uid as its gid and no supplementary groups (design 30).
+	// NewSystemRunner refuses a range that overlaps the server's uid, its
+	// groups or 65532. Nil keeps children on the server's uid, as before.
+	PluginUIDs *PluginUIDRange
 }
 
 type systemPluginState struct {
@@ -151,6 +159,9 @@ type systemPluginState struct {
 	cleanupErr       error
 	cleanupResult    GenerationCleanupResult
 	poolFuture       *poolDrainFuture
+	// credential is the identity this plugin's children start with; nil
+	// keeps them on the server's uid.
+	credential *syscall.Credential
 }
 
 // GenerationCleanupResult is the stable, caller-bounded view of one physical
@@ -212,6 +223,11 @@ type SystemRunner struct {
 	closing         bool
 	beforeStartLock func()
 	removeAll       func(string) error
+	// uids assigns plugin uids when PluginUIDs is set; nil otherwise.
+	uids *pluginUIDMap
+	// serverUID owns every staged directory and artifact. A staged file
+	// owned by anyone else is refused, beside the SHA pin.
+	serverUID uint32
 }
 
 // NewSystemRunner returns a checked system runner with the given options and
@@ -243,15 +259,26 @@ func NewSystemRunner(opts SystemRunnerOptions) (*SystemRunner, error) {
 	if opts.MaxHostCalls <= 0 {
 		opts.MaxHostCalls = defaultMaxHostCalls
 	}
-	return &SystemRunner{opts: opts, poolConfig: poolConfig, st: map[string]map[uint64]*systemPluginState{}, budgetWarnings: map[string]bool{}, startLocks: map[string]*sync.Mutex{}, draining: map[*systemPool]string{}}, nil
+	var uids *pluginUIDMap
+	if opts.PluginUIDs != nil {
+		identity, err := currentProcessIdentity()
+		if err != nil {
+			return nil, err
+		}
+		if err := opts.PluginUIDs.validate(identity); err != nil {
+			return nil, err
+		}
+		uids = newPluginUIDMap(*opts.PluginUIDs)
+	}
+	return &SystemRunner{opts: opts, poolConfig: poolConfig, st: map[string]map[uint64]*systemPluginState{}, budgetWarnings: map[string]bool{}, startLocks: map[string]*sync.Mutex{}, draining: map[*systemPool]string{}, uids: uids, serverUID: uint32(os.Geteuid())}, nil
 }
 
 func (r *SystemRunner) Name() string { return "system" }
 
 // Start re-verifies the manifest-pinned digest of the artifact at the FIXED
 // bundle path (TOCTOU defense in case the bundle changed after load), copies the
-// bytes into a confined per-plugin 0700 working dir, and arms the runner. It
-// always executes the staged 0700 copy, never the (possibly read-only or
+// bytes into a confined per-plugin working dir, and arms the runner. It
+// always executes the staged 0555 copy, never the (possibly read-only or
 // swapped) bundle file, and never resolves a manifest-controlled path.
 func (r *SystemRunner) Start(ctx context.Context, req RunnerStartRequest) (RunnerStartResult, error) {
 	result, err := r.Prepare(ctx, req)
@@ -315,6 +342,10 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 	if err != nil {
 		return RunnerStartResult{}, err
 	}
+	credential, err := r.pluginCredential(pluginID)
+	if err != nil {
+		return RunnerStartResult{}, err
+	}
 
 	workDir := filepath.Join(r.opts.RuntimeDir, pluginID, fmt.Sprintf("generation-%d", req.Generation))
 	if req.Generation == 0 {
@@ -328,14 +359,14 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 			}
 		}()
 	}
-	if err := os.MkdirAll(workDir, 0o700); err != nil {
+	if err := os.MkdirAll(workDir, stagedDirMode); err != nil {
 		return RunnerStartResult{}, fmt.Errorf("create plugin runtime dir: %w", err)
 	}
-	if err := os.Chmod(workDir, 0o700); err != nil {
+	if err := setStagedChainMode(r.opts.RuntimeDir, workDir); err != nil {
 		return RunnerStartResult{}, fmt.Errorf("secure plugin runtime dir: %w", err)
 	}
 	execPath := filepath.Join(workDir, "artifact")
-	if err := writeFileAtomic(execPath, data, 0o700); err != nil {
+	if err := writeFileAtomic(execPath, data, stagedArtifactMode); err != nil {
 		return RunnerStartResult{}, fmt.Errorf("stage artifact: %w", err)
 	}
 	execSHA256 := DigestSHA256(data)
@@ -345,7 +376,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		if err := r.checkStagedArtifact(pluginID, gen, execPath, execSHA256); err != nil {
 			return nil, err
 		}
-		return startSystemWorkerObserved(ctx, execPath, workDir, r.v2ChildEnv(gen), r.processExitFor(pluginID))
+		return startSystemWorkerAs(ctx, execPath, workDir, r.v2ChildEnv(gen), credential, r.processExitFor(pluginID))
 	}
 
 	pool := newConfiguredSystemPool(r.poolConfig.Size, r.poolConfig.MaxOverflow, r.poolConfig.MaxUses, r.poolConfig.MaxAge, req.Generation)
@@ -419,7 +450,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	refsDone := make(chan struct{})
 	close(refsDone)
-	byGeneration[req.Generation] = &systemPluginState{pluginID: pluginID, execPath: execPath, execSHA256: execSHA256, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), refsDone: refsDone, v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel}
+	byGeneration[req.Generation] = &systemPluginState{pluginID: pluginID, execPath: execPath, execSHA256: execSHA256, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), refsDone: refsDone, v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel, credential: credential}
 	committed = true
 	r.mu.Unlock()
 	return RunnerStartResult{Message: "system runner armed (subprocess execution enabled)"}, nil
@@ -970,9 +1001,11 @@ func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *s
 	tripped := st != nil && st.tripped
 	execPath, execSHA256, workDir := "", "", ""
 	var broker *Broker
+	var credential *syscall.Credential
 	if st != nil {
 		execPath, execSHA256, workDir = st.execPath, st.execSHA256, st.workDir
 		broker = st.broker
+		credential = st.credential
 	}
 	r.mu.Unlock()
 	if st.isV2 && req.Generation == 0 {
@@ -1013,7 +1046,7 @@ func (r *SystemRunner) invokeState(ctx context.Context, req InvokeRequest, st *s
 	v1Ctx, v1Cancel := context.WithCancel(runCtx)
 	st.v1Active[v1ID] = v1Cancel
 	r.mu.Unlock()
-	reply, stderr, stderrTruncated, runErr := r.runInvocation(v1Ctx, req, execPath, execSHA256, workDir, broker, budget)
+	reply, stderr, stderrTruncated, runErr := r.runInvocation(v1Ctx, req, execPath, execSHA256, workDir, credential, broker, budget)
 	v1Cancel()
 	r.mu.Lock()
 	delete(st.v1Active, v1ID)
@@ -1159,14 +1192,14 @@ type systemHostResponse struct {
 	Error  string          `json:"error,omitempty"`
 }
 
-func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, execPath, execSHA256, workDir string, broker *Broker, budget ResolvedInvokeBudget) (systemRunnerReply, []byte, bool, error) {
+func (r *SystemRunner) runInvocation(ctx context.Context, req InvokeRequest, execPath, execSHA256, workDir string, credential *syscall.Credential, broker *Broker, budget ResolvedInvokeBudget) (systemRunnerReply, []byte, bool, error) {
 	if err := r.checkStagedArtifact(req.PluginID, req.Generation, execPath, execSHA256); err != nil {
 		return systemRunnerReply{}, nil, false, err
 	}
 	cmd := exec.Command(execPath)
 	cmd.Dir = workDir
 	cmd.Env = append(r.childEnv(), "LATTICE_HOST_RESPONSE_FD=3")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.SysProcAttr = childSysProcAttr(credential)
 
 	hostRespR, hostRespW, err := os.Pipe()
 	if err != nil {
@@ -1871,15 +1904,127 @@ func (c *cappedBuffer) Truncated() bool { return c.truncated }
 // the runner wrote from verified bytes.
 var errStagedArtifactChanged = errors.New("staged plugin artifact no longer matches the verified bytes")
 
+// Staged modes (design 30). A plugin child on its own uid matches "other" on
+// every staged path, so each directory from the runtime root down to the
+// generation directory is traversable but not listable by it, and the
+// artifact is executable and readable but not writable by anyone. The server
+// owns all of them, and nothing is group- or world-writable, so only the
+// server can create, rename or replace an entry. The artifact is a signed
+// public binary, already world-readable through the read-only plugin mount,
+// so 0555 discloses nothing. The modes are the same whether or not the uid
+// drop is on: one staged layout, one check.
+const (
+	stagedDirMode      os.FileMode = 0o711
+	stagedArtifactMode os.FileMode = 0o555
+)
+
+// pluginCredential returns the identity pluginID's children start with, or
+// nil when the uid drop is off. It assigns the plugin's uid on first use and
+// logs it, so an operator can map a uid in ps or /proc back to its plugin.
+func (r *SystemRunner) pluginCredential(pluginID string) (*syscall.Credential, error) {
+	if r.uids == nil {
+		return nil, nil
+	}
+	uid, assigned, err := r.uids.assign(pluginID)
+	if err != nil {
+		return nil, err
+	}
+	if assigned {
+		r.logf("plugin runtime: %s runs as uid %d gid %d with no supplementary groups", pluginID, uid, uid)
+	}
+	return pluginCredential(uid), nil
+}
+
+// stagedChain lists the directories from root down to dir, root first. dir
+// is root itself, root/<plugin> or root/<plugin>/generation-N.
+func stagedChain(root, dir string) ([]string, error) {
+	root, dir = filepath.Clean(root), filepath.Clean(dir)
+	rel, err := filepath.Rel(root, dir)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("staging directory %s is not under the runtime root %s", dir, root)
+	}
+	chain := []string{root}
+	if rel == "." {
+		return chain, nil
+	}
+	current := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		chain = append(chain, current)
+	}
+	return chain, nil
+}
+
+// setStagedChainMode sets every directory from root down to dir to
+// stagedDirMode. MkdirAll applies the umask to the directories it creates
+// and leaves existing ones alone, and a runtime root made before design 30
+// is 0700, which a child on its own uid could not traverse.
+func setStagedChainMode(root, dir string) error {
+	chain, err := stagedChain(root, dir)
+	if err != nil {
+		return err
+	}
+	for _, d := range chain {
+		if err := os.Chmod(d, stagedDirMode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fileOwner returns the uid that owns the file info describes.
+func fileOwner(info os.FileInfo) (uint32, bool) {
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return st.Uid, true
+}
+
+// stagedChainMatches reports whether every directory from root down to dir is
+// still a directory with mode 0711 owned by owner. The root may be a symlink
+// the operator configured, so it is followed; every directory below it was
+// made by the runner and must not be a symlink. A directory owned by someone
+// else, or writable by anyone but its owner, would let that someone swap the
+// artifact between the check and exec.
+func stagedChainMatches(root, dir string, owner uint32) error {
+	chain, err := stagedChain(root, dir)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errStagedArtifactChanged, err)
+	}
+	for i, d := range chain {
+		var info os.FileInfo
+		if i == 0 {
+			info, err = os.Stat(d)
+		} else {
+			info, err = os.Lstat(d)
+		}
+		if err != nil {
+			return fmt.Errorf("%w: %v", errStagedArtifactChanged, err)
+		}
+		if !info.IsDir() || info.Mode().Perm() != stagedDirMode || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
+			return fmt.Errorf("%w: %s is %s, want a directory with mode %04o", errStagedArtifactChanged, d, info.Mode(), stagedDirMode)
+		}
+		if uid, ok := fileOwner(info); !ok || uid != owner {
+			return fmt.Errorf("%w: %s is owned by uid %d, want the server's uid %d", errStagedArtifactChanged, d, uid, owner)
+		}
+	}
+	return nil
+}
+
 // checkStagedArtifact refuses to exec a staged artifact that is no longer the
-// file Prepare staged from the verified bytes, and logs the refusal. A plugin
-// process runs with the staging directory as its working directory, so a
-// plugin that finds a way to write files there (a script sandbox escape, for
-// one) could otherwise replace the artifact and have its own code run by the
-// next replenishment or invocation. This narrows that window to the gap
-// between the check and exec; it does not stand in for the sandbox.
+// file Prepare staged from the verified bytes, in the directory chain Prepare
+// made, and logs the refusal. A plugin process runs with the staging directory
+// as its working directory, so a plugin that finds a way to write files there
+// (a script sandbox escape, for one) could otherwise replace the artifact and
+// have its own code run by the next replenishment or invocation. This narrows
+// that window to the gap between the check and exec; it does not stand in for
+// the sandbox.
 func (r *SystemRunner) checkStagedArtifact(pluginID string, generation uint64, path, wantSHA256 string) error {
-	err := stagedArtifactMatches(path, wantSHA256)
+	err := stagedChainMatches(r.opts.RuntimeDir, filepath.Dir(path), r.serverUID)
+	if err == nil {
+		err = stagedArtifactMatches(path, wantSHA256, r.serverUID)
+	}
 	if err != nil {
 		r.logf("plugin runtime: refusing to start %s generation %d: %v", pluginID, generation, err)
 	}
@@ -1887,10 +2032,10 @@ func (r *SystemRunner) checkStagedArtifact(pluginID string, generation uint64, p
 }
 
 // stagedArtifactMatches reports whether path is still a regular file, not a
-// symlink, with mode 0700 and the SHA-256 wantSHA256. It opens without
-// following a symlink and without blocking on a FIFO, then judges the file it
-// opened rather than the path.
-func stagedArtifactMatches(path, wantSHA256 string) error {
+// symlink, with mode 0555, owned by owner, and with the SHA-256 wantSHA256.
+// It opens without following a symlink and without blocking on a FIFO, then
+// judges the file it opened rather than the path.
+func stagedArtifactMatches(path, wantSHA256 string, owner uint32) error {
 	if wantSHA256 == "" {
 		return fmt.Errorf("%w: no verified digest is recorded for %s", errStagedArtifactChanged, path)
 	}
@@ -1903,8 +2048,11 @@ func stagedArtifactMatches(path, wantSHA256 string) error {
 	if err != nil {
 		return fmt.Errorf("%w: %v", errStagedArtifactChanged, err)
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o700 {
-		return fmt.Errorf("%w: %s is %s, want a regular file with mode 0700", errStagedArtifactChanged, path, info.Mode())
+	if !info.Mode().IsRegular() || info.Mode().Perm() != stagedArtifactMode || info.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
+		return fmt.Errorf("%w: %s is %s, want a regular file with mode %04o", errStagedArtifactChanged, path, info.Mode(), stagedArtifactMode)
+	}
+	if uid, ok := fileOwner(info); !ok || uid != owner {
+		return fmt.Errorf("%w: %s is owned by uid %d, want the server's uid %d", errStagedArtifactChanged, path, uid, owner)
 	}
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {

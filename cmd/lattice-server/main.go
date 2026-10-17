@@ -117,6 +117,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	// Design 30: unset keeps plugin children on the server's uid. The system
+	// runner checks the range against this process's own uid and groups.
+	pluginUIDs, err := plugin.ParsePluginUIDRange(os.Getenv("LATTICE_PLUGIN_UID_BASE"), os.Getenv("LATTICE_PLUGIN_UID_RANGE"))
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	trustPolicy, err := loadPluginTrust(pluginTrust)
 	if err != nil {
@@ -262,6 +268,7 @@ func main() {
 		PluginRuntimeDir:     pluginRuntimeDir,
 		PluginRuntimeEnv:     pluginRuntimeEnvAllowlist,
 		PluginRuntimePool:    pluginRuntimePool,
+		PluginUIDs:           pluginUIDs,
 		PluginTrust:          trustPolicy,
 		PublicURL:            publicURL,
 		ProbeSocket:          os.Getenv("LATTICE_PROBE_SOCKET"),

@@ -22,6 +22,30 @@ import (
 // The rules shared with the agents (status sets, header rules, origins,
 // destination refusal) live in lattice-sdk model/monitor_checks.go.
 
+// monitorPacketKinds are the kinds that send several packets a run and take
+// packets (model.MonitorKindSendsPackets); monitorNodeTargetKinds are the
+// kinds whose target may be a node, which monitorTargets.resolve resolves.
+var (
+	monitorPacketKinds     = []string{model.MonitorTypeICMP, model.MonitorTypeBeacon}
+	monitorNodeTargetKinds = []string{model.MonitorTypeICMP, model.MonitorTypeTCP, model.MonitorTypeBeacon}
+)
+
+// The answers to a field on a kind that does not take it, naming the kinds
+// that do.
+var (
+	errMonitorPacketsKinds    = fmt.Errorf("packets applies to %s checks only", monitorKindList(monitorPacketKinds))
+	errMonitorTargetNodeKinds = fmt.Errorf("an http check takes a URL; target_node applies to %s checks", monitorKindList(monitorNodeTargetKinds))
+)
+
+// monitorKindList names kinds in prose: "icmp and beacon", "icmp, tcp and
+// beacon".
+func monitorKindList(kinds []string) string {
+	if len(kinds) < 2 {
+		return strings.Join(kinds, "")
+	}
+	return strings.Join(kinds[:len(kinds)-1], ", ") + " and " + kinds[len(kinds)-1]
+}
+
 // monitorTargets resolves the node a check names into what its kind dials,
 // against the fleet as the latency plan last saw it.
 type monitorTargets struct {
@@ -196,10 +220,10 @@ func monitorNumericLabel(label string) bool {
 // dial time).
 func normalizeHTTPMonitor(mon *model.Monitor, checkHost bool) error {
 	if mon.TargetNode != "" {
-		return errors.New("an http check takes a URL; target_node applies to icmp and tcp checks")
+		return errMonitorTargetNodeKinds
 	}
 	if mon.Packets != 0 {
-		return errors.New("packets applies to icmp checks only")
+		return errMonitorPacketsKinds
 	}
 	u, err := url.Parse(strings.TrimSpace(mon.Target))
 	if err != nil || !u.IsAbs() || u.Host == "" {
@@ -389,7 +413,7 @@ func (t monitorTargets) normalizeTCPMonitor(mon *model.Monitor) error {
 		return errors.New("expect_status and headers apply to http checks only")
 	}
 	if mon.Packets != 0 {
-		return errors.New("packets applies to icmp checks only")
+		return errMonitorPacketsKinds
 	}
 	if mon.TargetNode != "" {
 		target, reason := t.resolve(model.MonitorTypeTCP, mon.TargetNode, "")

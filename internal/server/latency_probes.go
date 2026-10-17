@@ -1148,8 +1148,8 @@ func (s *Server) normalizeLatencyProbeConfig(in model.LatencyProbeConfig) (model
 		return out, err
 	}
 	out.Degraded = degraded
-	if in.AlertAfter < 0 || in.AlertAfter > model.MonitorAlertAfterMax {
-		return out, fmt.Errorf("alert_after must be 1 to %d", model.MonitorAlertAfterMax)
+	if err := validMonitorAlertAfter(in.AlertAfter); err != nil {
+		return out, err
 	}
 	out.AlertAfter = in.AlertAfter
 	return out, nil

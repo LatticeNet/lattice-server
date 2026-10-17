@@ -106,7 +106,7 @@ func TestMonitorCreateValidation(t *testing.T) {
 		{"tcp to localhost", `{"name":"t","type":"tcp","target":"localhost:80","node_ids":["node-new"]}`, 400, "loopback"},
 		{"tcp to a mapped private address", `{"name":"t","type":"tcp","target":"[::ffff:10.0.0.1]:80","node_ids":["node-new"]}`, 400, "private"},
 		{"tcp without a port", `{"name":"t","type":"tcp","target":"example.com","node_ids":["node-new"]}`, 400, "host:port"},
-		{"tcp with packets", `{"name":"t","type":"tcp","target":"example.com:443","packets":3,"node_ids":["node-new"]}`, 400, "icmp checks only"},
+		{"tcp with packets", `{"name":"t","type":"tcp","target":"example.com:443","packets":3,"node_ids":["node-new"]}`, 400, "icmp and beacon checks only"},
 		{"http with a status set", `{"name":"h","type":"http","target":"https://example.com/health","expect_status":"301, 200-299","node_ids":["node-new"]}`, 200, `"expect_status":"200-299,301"`},
 		{"http with a bad status set", `{"name":"h","type":"http","target":"https://example.com/","expect_status":"2xx","node_ids":["node-new"]}`, 400, "three digits"},
 		{"http to the metadata service", `{"name":"h","type":"http","target":"http://169.254.169.254/latest/meta-data","node_ids":["node-new"]}`, 400, "metadata"},

@@ -310,12 +310,13 @@ func (s *Server) pendingIncidents(now time.Time) []store.Incident {
 			}
 			for _, pair := range pairs {
 				// A pair is pending between its first failure and the one
-				// that pages. Generated latency checks, disabled checks and
-				// checks whose alert policy is off never open an incident.
+				// that pages. Generated latency checks, disabled checks,
+				// checks whose alert policy is off and pairs that read
+				// filtered (icmp or beacon) never open an incident.
 				policy := s.monitorPolicy(mon)
 				after := policy.after
 				if pair.Success || pair.FailStreak < 1 || pair.FailStreak >= after || !mon.Enabled ||
-					!monitorPairAssigned(mon, pair.NodeID) || !policy.pagesDown() || icmpFiltered(mon.Type, pair) {
+					!monitorPairAssigned(mon, pair.NodeID) || !policy.pagesDown() || pathFiltered(mon.Type, pair) {
 					continue
 				}
 				name, where := s.monitorNames(mon, pair.NodeID)

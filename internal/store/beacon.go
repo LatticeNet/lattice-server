@@ -21,9 +21,10 @@ import (
 //
 // Like the latency configuration this is operator intent plus a few
 // low-frequency transitions (a rotation, the target's first pull of a new
-// epoch, a reachability verdict), so it lives in the JSON state and is
-// mirrored into the hot store's meta bucket. Nothing here is written per
-// heartbeat.
+// epoch, a reachability verdict, a node's egress address moving), so it
+// lives in the JSON state and is mirrored into the hot store's meta bucket.
+// Nothing here is written per heartbeat or per config pull: an egress
+// address is written only when it changes.
 
 // BeaconRegistry is State.Beacon.
 type BeaconRegistry struct {
@@ -33,6 +34,12 @@ type BeaconRegistry struct {
 	// Targets are keyed by node id. A node appears once a plan for it has
 	// been applied or a port has been suggested for it.
 	Targets map[string]BeaconTarget `json:"targets,omitempty"`
+	// Egress is the global IPv4 address each node's agent last pulled its
+	// config from, keyed by node id. A NetGuard companion admits a source
+	// from it when it is neither of the source's pinned addresses, so a
+	// node.beacon plan depends on it; it is kept here so a plan rendered
+	// again after a restart reads what the plan was made from.
+	Egress map[string]string `json:"egress,omitempty"`
 }
 
 // BeaconTarget is one node's beacon as the control plane holds it.
@@ -106,7 +113,7 @@ func cloneBeaconRegistry(r *BeaconRegistry) *BeaconRegistry {
 	if r == nil {
 		return nil
 	}
-	out := &BeaconRegistry{NextSourceID: r.NextSourceID, SourceIDs: maps.Clone(r.SourceIDs)}
+	out := &BeaconRegistry{NextSourceID: r.NextSourceID, SourceIDs: maps.Clone(r.SourceIDs), Egress: maps.Clone(r.Egress)}
 	if r.Targets != nil {
 		out.Targets = make(map[string]BeaconTarget, len(r.Targets))
 		for id, t := range r.Targets {
@@ -152,6 +159,46 @@ func (s *Store) BeaconSourceIDs() map[string]uint32 {
 		return map[string]uint32{}
 	}
 	return maps.Clone(s.state.Beacon.SourceIDs)
+}
+
+// BeaconEgress returns the egress address last recorded for a node, empty
+// when none is.
+func (s *Store) BeaconEgress(nodeID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.Beacon == nil {
+		return ""
+	}
+	return s.state.Beacon.Egress[nodeID]
+}
+
+// SetBeaconEgress records the address a node's agent pulled its config
+// from, writing the state only when it differs from the recorded one. The
+// caller validates the address. The node must exist.
+func (s *Store) SetBeaconEgress(nodeID, addr string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.state.Beacon != nil && s.state.Beacon.Egress[nodeID] == addr {
+		return nil
+	}
+	if _, ok := s.state.Nodes[nodeID]; !ok {
+		return fmt.Errorf("node %q not found", nodeID)
+	}
+	reg := cloneBeaconRegistry(s.state.Beacon)
+	if reg == nil {
+		reg = &BeaconRegistry{NextSourceID: 1}
+	}
+	if reg.Egress == nil {
+		reg.Egress = map[string]string{}
+	}
+	reg.Egress[nodeID] = addr
+	prior := s.state.Beacon
+	s.state.Beacon = reg
+	if err := s.Save(); err != nil {
+		s.state.Beacon = prior
+		return err
+	}
+	return nil
 }
 
 // EnsureBeaconSourceIDs gives every node in nodeIDs a source id it does not

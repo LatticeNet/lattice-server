@@ -77,7 +77,7 @@ func TestMonitorAlertAfterIsValidated(t *testing.T) {
 		}
 	}
 	for body, want := range map[string]int{
-		`{"id":"` + id + `","version":1,"alert_after":0}`:  http.StatusBadRequest,
+		`{"id":"` + id + `","version":1,"alert_after":-1}`: http.StatusBadRequest,
 		`{"id":"` + id + `","version":1,"alert_after":21}`: http.StatusBadRequest,
 		`{"id":"` + id + `","version":1,"alert_after":1}`:  http.StatusOK,
 	} {

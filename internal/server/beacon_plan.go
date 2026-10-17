@@ -249,7 +249,7 @@ func (s *Server) buildBeaconPlan(node model.Node, action string, settings model.
 // seen connecting from when that differs from both.
 func (s *Server) beaconSourceAllow(n model.Node) []string {
 	var out []string
-	for _, raw := range []string{n.PublicIP, n.WireGuardIP, s.beacon.egressOf(n.ID)} {
+	for _, raw := range []string{n.PublicIP, n.WireGuardIP, s.store.BeaconEgress(n.ID)} {
 		addr, err := beacon.ParseIPv4(strings.TrimSpace(raw))
 		if err != nil {
 			continue
@@ -846,5 +846,109 @@ func (s *Server) beaconView(p principal, node model.Node, now time.Time) model.B
 			view.PendingApprovalID = a.ID
 		}
 	}
+	if exists {
+		view.Replan = beaconReplanFor(node, t, current, view.PendingApprovalID, func(nodeID string) bool { return latencyNodeVisible(p, nodeID) })
+	}
 	return view
+}
+
+// beaconReplanFor is the change plan node's beacon needs, nil when it needs
+// none: a source that uses the beacon now (current) and that the applied
+// plan did not approve, or, when NetGuard manages the node, an approved
+// source that no longer uses it, whose addresses the allow set still
+// admits. Without NetGuard a source that left drops out of the table at the
+// target's next config pull, so it needs no plan. Whether a plan is needed
+// is judged on every source; visible narrows the ids listed to the ones the
+// caller may read. Nothing is filed or applied here: the request is for the
+// operator to send, and its approval decides.
+func beaconReplanFor(node model.Node, t store.BeaconTarget, current map[string]bool, pendingApprovalID string, visible func(string) bool) *model.BeaconReplan {
+	if !t.Settings.Enabled || t.Version == 0 {
+		return nil
+	}
+	approved := make(map[string]bool, len(t.Approved))
+	for _, src := range t.Approved {
+		approved[src.NodeID] = true
+	}
+	netguard := t.Exposure == model.BeaconExposureNetGuard
+	var added, removed []string
+	for sourceID := range current {
+		if !approved[sourceID] {
+			added = append(added, sourceID)
+		}
+	}
+	if netguard {
+		for sourceID := range approved {
+			if !current[sourceID] {
+				removed = append(removed, sourceID)
+			}
+		}
+	}
+	if len(added) == 0 && len(removed) == 0 {
+		return nil
+	}
+	listed := func(ids []string) []string {
+		out := []string{}
+		for _, nodeID := range ids {
+			if visible(nodeID) {
+				out = append(out, nodeID)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+	reason := model.PathReasonBeaconSourcePending
+	if netguard {
+		reason = model.PathReasonFirewallPending
+	}
+	return &model.BeaconReplan{
+		NodeID:            node.ID,
+		Name:              latencyNodeLabel(node),
+		Reason:            reason,
+		Added:             listed(added),
+		Removed:           listed(removed),
+		PendingApprovalID: pendingApprovalID,
+		// A change with no port, bind or endpoint keeps all three and
+		// re-plans the sources current when it is filed.
+		Request: model.BeaconPlanRequest{NodeID: node.ID, Action: model.BeaconActionChange},
+	}
+}
+
+// beaconReplans lists every node the principal may read whose beacon needs
+// a change plan (beaconReplanFor), by node id. The open approvals are read
+// only when some node needs one.
+func (s *Server) beaconReplans(p principal, nodes map[string]model.Node, now time.Time) []model.BeaconReplan {
+	out := []model.BeaconReplan{}
+	targets := s.store.BeaconTargets()
+	ids := make([]string, 0, len(targets))
+	for nodeID, t := range targets {
+		if _, ok := nodes[nodeID]; ok && t.Settings.Enabled && latencyNodeVisible(p, nodeID) {
+			ids = append(ids, nodeID)
+		}
+	}
+	if len(ids) == 0 {
+		return out
+	}
+	sort.Strings(ids)
+	planned := s.pathPlanned(now)
+	monitors := s.store.Monitors()
+	visible := func(nodeID string) bool { return latencyNodeVisible(p, nodeID) }
+	for _, nodeID := range ids {
+		current := s.beaconCurrentSources(nodeID, planned, monitors, nodes)
+		if r := beaconReplanFor(nodes[nodeID], targets[nodeID], current, "", visible); r != nil {
+			out = append(out, *r)
+		}
+	}
+	if len(out) == 0 {
+		return out
+	}
+	pending := map[string]string{}
+	for _, a := range s.store.Approvals() {
+		if isBeaconApproval(a) && a.Status == model.ApprovalPending {
+			pending[a.NodeID] = a.ID
+		}
+	}
+	for i := range out {
+		out[i].PendingApprovalID = pending[out[i].NodeID]
+	}
+	return out
 }

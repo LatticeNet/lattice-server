@@ -33,6 +33,14 @@ func beaconAdmin() principal {
 func beaconFleet(t *testing.T) (*Server, http.Handler, *store.Store) {
 	t.Helper()
 	srv, handler, st := newPathsServer(t)
+	seedBeaconFleet(t, srv, st)
+	return srv, handler, st
+}
+
+// seedBeaconFleet puts beaconFleet's nodes, inventory and path set into a
+// server's store.
+func seedBeaconFleet(t *testing.T, srv *Server, st *store.Store) {
+	t.Helper()
 	srv.now = func() time.Time { return beaconT0 }
 	all := []string{"beacon", "http", "icmp", "tcp"}
 	upsertNodes(t, st,
@@ -53,7 +61,6 @@ func beaconFleet(t *testing.T) (*Server, http.Handler, *store.Store) {
 	saveBeaconPathSet(t, srv, st, model.LatencyProbeConfig{
 		Enabled: true, Sources: []string{"node-a", "node-b", "node-c"}, IncludeTargets: []string{"node-t"}, Method: model.LatencyMethodAuto,
 	})
-	return srv, handler, st
 }
 
 func saveBeaconPathSet(t *testing.T, srv *Server, st *store.Store, cfg model.LatencyProbeConfig) {
@@ -431,9 +438,9 @@ func TestBeaconNetGuardCompanion(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv.replaceAgentCapabilities("node-t", []string{netGuardManagedSHACapability})
-	srv.beacon.noteEgress("node-a", "10.66.0.21")    // over WireGuard: says nothing about egress
-	srv.beacon.noteEgress("node-b", "203.0.113.122") // a NAT source's real egress
-	srv.beacon.noteEgress("node-b", "10.9.9.9")      // a private hop is never kept as egress
+	srv.noteBeaconEgress("node-a", "10.66.0.21")    // over WireGuard: says nothing about egress
+	srv.noteBeaconEgress("node-b", "203.0.113.122") // a NAT source's real egress
+	srv.noteBeaconEgress("node-b", "10.9.9.9")      // a private hop is never kept as egress
 	code, out, raw := planBeacon(t, handler, model.BeaconPlanRequest{NodeID: "node-t", Action: model.BeaconActionEnable})
 	if code != http.StatusOK {
 		t.Fatalf("plan = %d %s", code, raw)

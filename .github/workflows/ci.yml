@@ -49,6 +49,22 @@ jobs:
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
+  golden-drift:
+    # The console pinned in dashboard.ref keeps copies of
+    # internal/server/testdata/m3-golden/ and must carry these bytes. A job of
+    # its own, so a server change that moves a golden reports here while the
+    # console catches up, and vet, tests and scanners still run. It skips only
+    # for a console that predates the copies.
+    name: m3 golden drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout lattice-server
+        uses: actions/checkout@v6
+        with:
+          path: lattice-server
+      - name: compare with the console at dashboard.ref
+        working-directory: lattice-server
+        run: sh scripts/check-m3-golden-drift.sh
   plugin-uid:
     # Design 30's process-isolation tests start real plugin children under a
     # per-plugin uid, which needs a process that can drop them. The go job

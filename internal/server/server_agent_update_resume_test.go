@@ -450,12 +450,15 @@ func TestAgentUpdateResumableDownloadAgainstTheRealHandler(t *testing.T) {
 
 	var mu sync.Mutex
 	var cpSeen, fbSeen []http.Header
-	cutAfter := 0
+	cutAfter, ignoreRange := 0, false
 	cp := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		cpSeen = append(cpSeen, r.Header.Clone())
-		cut := cutAfter
+		cut, strip := cutAfter, ignoreRange
 		mu.Unlock()
+		if strip {
+			r.Header.Del("Range")
+		}
 		if cut > 0 {
 			w = &cutAfterWriter{ResponseWriter: w, left: cut}
 		}
@@ -473,16 +476,20 @@ func TestAgentUpdateResumableDownloadAgainstTheRealHandler(t *testing.T) {
 	if err := os.WriteFile(caFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cp.Certificate().Raw}), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	attempt := func(t *testing.T, script, fetcher string, cut int, kept []byte) fetchStubOutcome {
+	attemptWith := func(t *testing.T, script, fetcher string, cut int, strip bool, kept []byte) fetchStubOutcome {
 		t.Helper()
 		mu.Lock()
-		cpSeen, fbSeen, cutAfter = nil, nil, cut
+		cpSeen, fbSeen, cutAfter, ignoreRange = nil, nil, cut, strip
 		mu.Unlock()
 		return runAgentUpdateFetch(t, script, fetchStubRun{
 			fetcher: fetcher, real: true, caFile: caFile, date: "host", kept: kept,
 			cpURL: cp.URL + ref.urlPath(), fbURL: fb.URL + "/lattice-agent-linux-amd64",
 			env: []string{"LATTICE_TASK_ID=" + task.ID, "LATTICE_TASK_LEASE_ID=" + task.LeaseID},
 		})
+	}
+	attempt := func(t *testing.T, script, fetcher string, cut int, kept []byte) fetchStubOutcome {
+		t.Helper()
+		return attemptWith(t, script, fetcher, cut, false, kept)
 	}
 	leased := func(h http.Header) bool {
 		return h.Get(agentTaskIDHeader) == task.ID && h.Get(agentTaskLeaseHeader) == task.LeaseID
@@ -542,6 +549,34 @@ func TestAgentUpdateResumableDownloadAgainstTheRealHandler(t *testing.T) {
 			o = attempt(t, script, fetcher, 0, nil)
 			if o.exit != 0 || !bytes.Equal(o.received, data) {
 				t.Fatalf("exit %d, stderr:\n%s", o.exit, o.stderr)
+			}
+		})
+		// A hop in front of the control plane that strips Range answers a
+		// resume with the whole object. That must never wedge a node: wget -c
+		// starts the file over within the attempt, and curl refuses (33), so
+		// the script drops the partial and the next attempt starts over, as
+		// every attempt did before resume.
+		t.Run(fetcher+"/a hop that ignores ranges", func(t *testing.T) {
+			script := scripts["control plane"].script
+			o := attemptWith(t, script, fetcher, 0, true, data[:cut])
+			mu.Lock()
+			seen := append([]http.Header(nil), cpSeen...)
+			mu.Unlock()
+			if len(seen) == 0 || seen[0].Get("Range") != fmt.Sprintf("bytes=%d-", cut) {
+				t.Fatalf("the attempt must have asked to resume: %v", seen)
+			}
+			if fetcher == "wget" {
+				if o.exit != 0 || !bytes.Equal(o.received, data) {
+					t.Fatalf("wget must start over within the attempt: exit %d, %d bytes, stderr:\n%s", o.exit, len(o.received), o.stderr)
+				}
+				return
+			}
+			if o.exit != 33 || o.leftover {
+				t.Fatalf("curl must refuse and the partial must go: exit %d leftover %t, stderr:\n%s", o.exit, o.leftover, o.stderr)
+			}
+			o = attemptWith(t, script, fetcher, 0, true, nil)
+			if o.exit != 0 || !bytes.Equal(o.received, data) {
+				t.Fatalf("the next attempt must start over and finish: exit %d, stderr:\n%s", o.exit, o.stderr)
 			}
 		})
 	}

@@ -10462,6 +10462,12 @@ func (w *logResponseWriter) Flush() {
 	}
 }
 
+// Unwrap lets http.ResponseController reach the connection through this
+// wrapper, for a handler that needs a write deadline longer than the server's.
+func (w *logResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // Hijack forwards to the underlying ResponseWriter so WebSocket upgrades (the
 // terminal stream/attach routes) keep working. Without it this logging wrapper
 // would mask the connection's http.Hijacker and every upgrade would fail.

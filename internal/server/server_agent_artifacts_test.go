@@ -836,6 +836,50 @@ func TestAgentBinaryServesByteRanges(t *testing.T) {
 	if event, ok := servedRangeAudit(st, "bytes=4000-"); !ok || event.Metadata["bytes"] != strconv.Itoa(size) || event.Metadata["task_id"] != task.ID {
 		t.Fatalf("a served range must be audited with the range asked for: %+v", event)
 	}
+	if event, ok := servedRangeAudit(st, "bytes=0-9,0-9,0-9,0-9"); !ok || event.Metadata["range_ignored"] == "" {
+		t.Fatalf("a multi-range request must be audited with what it asked for and that it was served whole: %+v", event)
+	}
+}
+
+// deadlineRecorder is a response recorder that takes a write deadline, as the
+// server's own connection writer does.
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadline time.Time
+}
+
+func (w *deadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	w.deadline = deadline
+	return nil
+}
+
+// The server's 60 s write timeout would cut a direct connection to a slow
+// node about a megabyte in. The binary route lifts it to the update task's
+// own timeout, through every wrapper the handler chain puts in between, and
+// only for a caller that proved its lease.
+func TestAgentBinaryOutlastsTheServerWriteTimeout(t *testing.T) {
+	srv, handler, st := newAgentArtifactServer(t)
+	data, ref, task := seedControlPlaneUpdate(t, srv, st)
+	serve := func(lease string) *deadlineRecorder {
+		req := httptest.NewRequest(http.MethodGet, ref.urlPath(), nil)
+		req.Header.Set(agentTaskIDHeader, task.ID)
+		req.Header.Set(agentTaskLeaseHeader, lease)
+		rec := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	before := time.Now()
+	rec := serve(task.LeaseID)
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), data) {
+		t.Fatalf("download answered %d with %d bytes", rec.Code, rec.Body.Len())
+	}
+	budget := time.Duration(approvalApplyTaskTimeoutSec(agentUpdatePlugin)) * time.Second
+	if rec.deadline.Before(before.Add(budget)) || rec.deadline.After(time.Now().Add(budget)) {
+		t.Fatalf("write deadline %v, want about %v from now", rec.deadline, budget)
+	}
+	if denied := serve("not-a-lease"); denied.Code != http.StatusForbidden || !denied.deadline.IsZero() {
+		t.Fatalf("a refused caller must keep the server's deadline: %d, deadline %v", denied.Code, denied.deadline)
+	}
 }
 
 // servedRangeAudit finds the serve audit for one range request.

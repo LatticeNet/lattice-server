@@ -703,13 +703,6 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 			errors.New("the stored agent binary failed integrity verification and was not served"))
 		return
 	}
-	// One range per request. A multi-range request would be answered as
-	// multipart/byteranges, which no fetcher the apply script uses ever sends,
-	// so it is served as the whole object instead: the most a request can
-	// cost is one copy of the binary, ranged or not.
-	if strings.Contains(r.Header.Get("Range"), ",") {
-		r.Header.Del("Range")
-	}
 	meta := map[string]string{
 		"version": ref.Version,
 		"os":      ref.OS,
@@ -720,6 +713,15 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	}
 	if requested := strings.TrimSpace(r.Header.Get("Range")); requested != "" {
 		meta["range"] = auditTruncate(requested, 64)
+	}
+	// One range per request. A multi-range request would be answered as
+	// multipart/byteranges, which no fetcher the apply script uses ever sends,
+	// so it is served as the whole object instead, and the audit keeps the
+	// ranges it asked for: the most a request can cost is one copy of the
+	// binary, ranged or not.
+	if strings.Contains(r.Header.Get("Range"), ",") {
+		r.Header.Del("Range")
+		meta["range_ignored"] = "multiple ranges; served the whole object"
 	}
 	s.recordRequestAudit(r, model.AuditEvent{
 		ID:       id.New("audit"),
@@ -735,6 +737,18 @@ func (s *Server) handleAgentBinary(w http.ResponseWriter, r *http.Request) {
 	// one carrying anything else gets the whole object rather than a range of
 	// different bytes to splice onto what the caller already has.
 	w.Header().Set("ETag", agentBinaryETag(ref.SHA256))
+	// The server's write timeout (60 s in cmd/lattice-server) is sized for API
+	// answers. A node on a
+	// slow uplink spends minutes on this one response, and without a longer
+	// deadline a direct connection would be cut after about a megabyte. The
+	// deadline is the agent update task's own timeout: no download outlives
+	// the task that asked for it, and the caller has already proven its lease.
+	// A writer that cannot take a deadline (a test recorder) keeps the
+	// server's.
+	deadline := time.Now().Add(time.Duration(approvalApplyTaskTimeoutSec(agentUpdatePlugin)) * time.Second)
+	if err := http.NewResponseController(w).SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		s.logger.Printf("agent binary write deadline not extended: node_id=%s version=%s: %v", node.ID, ref.Version, err)
+	}
 	// ServeContent answers a single satisfiable range with 206, an
 	// unsatisfiable one with 416, and everything else, HEAD included, with the
 	// whole object. No modification time is given, so only the ETag decides

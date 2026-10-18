@@ -156,7 +156,9 @@ func (s *Server) clearTOTPChallengeCookie(w http.ResponseWriter) {
 
 // pendingSSOSecondFactorView is what GET /api/login/totp tells the browser
 // that holds a post-SSO second-factor challenge: the provider's display name
-// and whom it verified, the verified email or, without one, the subject.
+// and whom it verified, the verified email or, without one, the subject, both
+// masked. The page only has to confirm which account signed in; the whole
+// address is not needed for that and does not leave the server here.
 type pendingSSOSecondFactorView struct {
 	Provider string `json:"provider"`
 	Email    string `json:"email,omitempty"`
@@ -192,11 +194,73 @@ func (s *Server) handlePendingSSOSecondFactor(w http.ResponseWriter, r *http.Req
 		view.Provider = strings.TrimSpace(p.DisplayName)
 	}
 	if challenge.SSOEmail != "" {
-		view.Email = challenge.SSOEmail
+		view.Email = maskSSOEmail(challenge.SSOEmail)
 	} else {
-		view.Subject = challenge.SSOSubject
+		view.Subject = maskSSOSubject(challenge.SSOSubject)
 	}
 	writeJSON(w, http.StatusOK, view)
+}
+
+// maskSSOEmail keeps the first and last character of the local part and the
+// whole domain, with a fixed-width mask between so the length does not show:
+// lidongguinb@gmail.com reads l***b@gmail.com. A value that is not an address
+// is masked as a subject.
+func maskSSOEmail(email string) string {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return ""
+	}
+	at := strings.LastIndex(email, "@")
+	if at < 0 {
+		return maskSSOSubject(email)
+	}
+	local, domain := []rune(email[:at]), email[at+1:]
+	switch {
+	case len(local) == 0 || domain == "":
+		return "***"
+	case len(local) == 1:
+		return "***@" + domain
+	case len(local) == 2:
+		return string(local[0]) + "***@" + domain
+	default:
+		return string(local[0]) + "***" + string(local[len(local)-1]) + "@" + domain
+	}
+}
+
+// maskSSOSubject keeps the last four characters of a provider subject, enough
+// to tell two accounts apart, and nothing of a subject that short.
+func maskSSOSubject(subject string) string {
+	r := []rune(strings.TrimSpace(subject))
+	switch {
+	case len(r) == 0:
+		return ""
+	case len(r) <= 4:
+		return "***"
+	default:
+		return "***" + string(r[len(r)-4:])
+	}
+}
+
+// handleCancelPendingSSOSecondFactor answers DELETE /api/login/totp: the
+// operator left the second-factor step, so the challenge the SSO callback
+// issued to this browser is spent and its cookie cleared. Like the read, it
+// takes the challenge only from the HttpOnly cookie and only from the client
+// address it was issued to; it answers 204 whatever it found, so it is no
+// oracle for challenge ids.
+func (s *Server) handleCancelPendingSSOSecondFactor(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	c, err := r.Cookie(totpChallengeCookie)
+	if err == nil && c.Value != "" {
+		if challenge, ok := s.store.TOTPChallenge(c.Value); ok && challenge.SSOProviderID != "" && challenge.ClientIP == s.clientIP(r) {
+			if err := s.store.ConsumeTOTPChallenge(challenge.ID); err != nil {
+				writeError(w, http.StatusServiceUnavailable, err)
+				return
+			}
+			s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: challenge.UserID, Action: "login.oidc.second_factor_cancelled", Decision: "observe"})
+			s.clearTOTPChallengeCookie(w)
+		}
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleOIDCCallback completes the login: validates and consumes the state,

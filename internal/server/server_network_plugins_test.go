@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
@@ -268,5 +269,80 @@ func TestWireGuardPlanRefusesPeersTheSessionCannotRead(t *testing.T) {
 	fullCtx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, full)
 	if _, err := srv.wireGuardNetworksRPC(fullCtx, "plan", []byte(`{"node_id":"node-a","listen_port":51820}`)); err != nil {
 		t.Fatalf("an operator who can read every mesh member must still be able to plan: %v", err)
+	}
+}
+
+// The WireGuard page tells a node that never reported from one that went
+// silent. It used to do that by reading year 1 out of last_seen, the only
+// signal this view carried; now the view says it in status, by the node
+// status rule, and an unset last_seen is left off the wire like every other
+// optional time.
+func TestWireGuardOverviewSaysNeverReportedWithoutYearOne(t *testing.T) {
+	srv, st, ctx := newNetworkPluginRPCServer(t)
+	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	srv.now = func() time.Time { return now }
+	for _, n := range []model.Node{
+		{ID: "n-never", Name: "fresh-box", WireGuardIP: "10.9.0.1", WireGuardPublicKey: "k1"},
+		{ID: "n-online", Name: "beating", Online: true, LastSeen: now.Add(-10 * time.Second)},
+		{ID: "n-offline", Name: "flagged-off", Online: false, LastSeen: now.Add(-time.Hour)},
+		// The sweep flipped the flag on a beat still inside the threshold: the
+		// flag alone makes it offline.
+		{ID: "n-flagged", Name: "flag-only", Online: false, LastSeen: now.Add(-time.Second)},
+		// The liveness sweep has not flipped the flag yet, but the last beat is
+		// past the threshold: the node status rule already says offline.
+		{ID: "n-stale", Name: "stale-beat", Online: true, LastSeen: now.Add(-nodeOfflineThreshold - time.Second)},
+		// Disabled outranks never reported.
+		{ID: "n-disabled", Name: "switched-off", Disabled: true},
+	} {
+		if err := st.UpsertNode(n); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	raw, err := srv.wireGuardNetworksRPC(ctx, "overview", nil)
+	if err != nil {
+		t.Fatalf("overview: %v", err)
+	}
+	if strings.Contains(string(raw), "0001-01-01") {
+		t.Fatalf("overview carries year 1: %s", raw)
+	}
+	var out struct {
+		Nodes []map[string]any `json:"nodes"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode overview: %v", err)
+	}
+	rows := map[string]map[string]any{}
+	for _, row := range out.Nodes {
+		id, _ := row["node_id"].(string)
+		rows[id] = row
+	}
+	for id, want := range map[string]string{
+		"n-never":    NodeStatusNeverReported,
+		"n-online":   NodeStatusOnline,
+		"n-offline":  NodeStatusOffline,
+		"n-flagged":  NodeStatusOffline,
+		"n-stale":    NodeStatusOffline,
+		"n-disabled": NodeStatusDisabled,
+	} {
+		row, ok := rows[id]
+		if !ok {
+			t.Fatalf("%s is not listed: %s", id, raw)
+		}
+		if got := row["status"]; got != want {
+			t.Errorf("%s: status = %v, want %s", id, got, want)
+		}
+	}
+	for _, id := range []string{"n-never", "n-disabled"} {
+		if seen, ok := rows[id]["last_seen"]; ok {
+			t.Errorf("%s never reported, but last_seen is on the wire as %v", id, seen)
+		}
+	}
+	if _, ok := rows["n-online"]["last_seen"].(string); !ok {
+		t.Errorf("a node that reported lost last_seen: %v", rows["n-online"])
+	}
+	// online stays the stored flag for UIs that predate status.
+	if rows["n-stale"]["online"] != true {
+		t.Errorf("online must stay the stored flag: %v", rows["n-stale"])
 	}
 }

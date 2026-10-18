@@ -71,19 +71,26 @@ if [ "$(id -u)" -ne 0 ]; then
   if have sudo; then
     log "re-running with sudo ..."
     # The enrollment token never rides sudo's command line, which any local
-    # user can read in ps for as long as the install runs. It goes to the root
-    # child in a file only this user can read (mktemp makes it 0600), which
-    # the child checks, reads and removes; this shell removes it too when sudo
-    # returns or is interrupted. A file works whatever sudoers keeps or resets
-    # of the environment.
+    # user can read in ps (and sudo writes to its log) for as long as the
+    # install runs. It goes to the root child in a 0600 file inside a 0700
+    # directory of this user's, which the child checks, reads and removes;
+    # this shell removes the directory too when sudo returns or is
+    # interrupted. A file works whatever sudoers keeps or resets of the
+    # environment. The private directory means nobody else can swap the file
+    # between the child's checks and its read, even in a TMPDIR without the
+    # sticky bit.
+    token_dir=""
     token_file=""
     if [ -n "$token" ]; then
-      token_file="$(mktemp "${TMPDIR:-/tmp}/lattice-agent-token.XXXXXX")" || \
-        die "cannot create a private file to hand the enrollment token to sudo"
-      trap 'rm -f "$token_file"' EXIT
-      trap 'rm -f "$token_file"; exit 130' HUP INT TERM
-      chmod 0600 "$token_file" || die "cannot make $token_file private"
-      printf '%s' "$token" >"$token_file" || die "cannot write the enrollment token to $token_file"
+      token_dir="$(mktemp -d "${TMPDIR:-/tmp}/lattice-agent-token.XXXXXX")" || \
+        die "cannot create a private directory to hand the enrollment token to sudo"
+      trap 'rm -rf "$token_dir"' EXIT
+      trap 'rm -rf "$token_dir"; exit 129' HUP
+      trap 'rm -rf "$token_dir"; exit 130' INT
+      trap 'rm -rf "$token_dir"; exit 143' TERM
+      chmod 0700 "$token_dir" || die "cannot make $token_dir private"
+      token_file="$token_dir/token"
+      ( umask 077; printf '%s' "$token" >"$token_file" ) || die "cannot write the enrollment token to $token_file"
     fi
     sudo_rc=0
     sudo \
@@ -118,30 +125,42 @@ if [ "$(id -u)" -ne 0 ]; then
       LATTICE_PROXY_USAGE_XRAY_API="${LATTICE_PROXY_USAGE_XRAY_API:-}" LATTICE_PROXY_USAGE_XRAY_BIN="${LATTICE_PROXY_USAGE_XRAY_BIN:-}" \
       LATTICE_PROXY_USAGE_XRAY_PATTERN="${LATTICE_PROXY_USAGE_XRAY_PATTERN:-}" \
       sh "$0" "$@" || sudo_rc=$?
-    [ -z "$token_file" ] || rm -f "$token_file"
+    [ -z "$token_dir" ] || rm -rf "$token_dir"
     exit "$sudo_rc"
   fi
   die "please re-run as root (e.g. sudo sh $0)"
 fi
 
 # ---- the enrollment token handed over by the sudo re-exec ---------------------
-# Only a file the re-exec above could have made is read: a regular file, not
-# a link, owned by the user who ran sudo (or by root without sudo), and
-# readable by that owner alone. It is removed as soon as it is read.
+# Only a file the re-exec above could have made is read: in a directory only
+# the user who ran sudo (or root, without sudo) can enter, a regular file, not
+# a link, with one name, mode 0600 and the same owner. Nobody else can then
+# swap it between these checks and the read. The file is removed as soon as it
+# is read, and its directory only when that leaves it empty.
 if [ -n "${LATTICE_NODE_TOKEN_FILE:-}" ]; then
   token_file="$LATTICE_NODE_TOKEN_FILE"
   unset LATTICE_NODE_TOKEN_FILE
   token_owner="${SUDO_UID:-0}"
   case "$token_owner" in ""|*[!0-9]*) die "SUDO_UID is not a user id: $token_owner" ;; esac
+  token_dir="$(dirname -- "$token_file")"
+  # mode, link count and numeric owner, as ls -ln prints them everywhere
+  ls_mode_links_owner() { ls -ldn "$1" 2>/dev/null | awk '{ print $1 " " $2 " " $3 }'; }
+  [ -d "$token_dir" ] && [ ! -L "$token_dir" ] || \
+    die "LATTICE_NODE_TOKEN_FILE is not in a directory: $token_file"
+  case "$(ls_mode_links_owner "$token_dir")" in
+    "drwx------ "*" $token_owner"|"drwx------. "*" $token_owner"|"drwx------@ "*" $token_owner") ;;
+    *) die "LATTICE_NODE_TOKEN_FILE must be in a directory only uid $token_owner can enter (mode 0700): $token_dir" ;;
+  esac
   [ -f "$token_file" ] && [ ! -L "$token_file" ] || \
     die "LATTICE_NODE_TOKEN_FILE is not a regular file: $token_file"
-  token_mode_owner="$(ls -ln "$token_file" 2>/dev/null | awk '{ print $1 " " $3 }')"
-  case "$token_mode_owner" in
-    "-rw------- $token_owner"|"-rw-------. $token_owner"|"-rw-------@ $token_owner") ;;
-    *) die "LATTICE_NODE_TOKEN_FILE must be mode 0600 and owned by uid $token_owner: $token_file" ;;
+  case "$(ls_mode_links_owner "$token_file")" in
+    "-rw------- 1 $token_owner"|"-rw-------. 1 $token_owner"|"-rw-------@ 1 $token_owner") ;;
+    "-rw-------+ "*) die "LATTICE_NODE_TOKEN_FILE carries an ACL, likely a default ACL on TMPDIR; set TMPDIR to a directory without one: $token_file" ;;
+    *) die "LATTICE_NODE_TOKEN_FILE must be mode 0600, with one link, owned by uid $token_owner: $token_file" ;;
   esac
   token="$(cat "$token_file")" || die "cannot read LATTICE_NODE_TOKEN_FILE: $token_file"
   rm -f "$token_file"
+  rmdir "$token_dir" 2>/dev/null || true
 fi
 
 # ---- existing install adoption ---------------------------------------------

@@ -176,6 +176,7 @@ var notifyCatalogueTypes = []notifyCatalogueEntry{
 	notifyEntry(EventPathRecovered, notifyCategoryMonitors, notifySeverityInfo, true, "trending-up", "Path recovered"),
 	notifyEntry(EventAgentStalled, notifyCategoryAgents, notifySeverityWarning, false, "hourglass", "Agent loop stalled"),
 	notifyEntry(EventAgentRecovered, notifyCategoryAgents, notifySeverityInfo, true, "bot", "Agent loop recovered"),
+	notifyEntry(eventAgentMirrorFirstPlan, notifyCategoryAgents, notifySeverityNotice, false, "cloud-download", "Agent mirror in an update plan for the first time"),
 	notifyEntry(eventSSHLogin, notifyCategorySSH, notifySeverityNotice, false, "key-round", "SSH login"),
 	notifyEntry(EventSSHCompromiseSuspected, notifyCategorySSH, notifySeverityCritical, false, "shield-alert", "SSH login after repeated failures"),
 	notifyEntry(eventAuth2FALimit, notifyCategoryAuth, notifySeverityWarning, false, "lock-keyhole", "Two-factor attempt limit reached"),

@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -564,11 +565,12 @@ func (s *Server) handleAgentArtifactImport(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	view, err := s.storeCompressedAgentArtifact(ref, data)
+	imported, err := s.importAgentArtifact(ref, data)
 	if err != nil {
 		s.writeAgentArtifactStoreError(w, err)
 		return
 	}
+	view := imported.View
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:     id.New("audit"),
 		Action: "agent.artifact.import",
@@ -582,9 +584,20 @@ func (s *Server) handleAgentArtifactImport(w http.ResponseWriter, r *http.Reques
 			"compressed_sha256": view.CompressedSHA256,
 			"compressed_bytes":  strconv.Itoa(view.CompressedBytes),
 			"release":           tag,
+			"stored":            strconv.FormatBool(imported.Stored),
 		},
 	})
-	writeJSON(w, http.StatusOK, view)
+	// stored says whether the control plane serves the bytes; an import that
+	// did not fit still recorded their digest and manifest, which mirrors
+	// and plans use, and says so in note.
+	writeJSON(w, http.StatusOK, agentArtifactImportView{agentArtifactView: view, Stored: imported.Stored, Note: imported.Note})
+}
+
+// agentArtifactImportView answers an import.
+type agentArtifactImportView struct {
+	agentArtifactView
+	Stored bool   `json:"stored"`
+	Note   string `json:"note,omitempty"`
 }
 
 func (s *Server) handleDeleteAgentArtifact(w http.ResponseWriter, r *http.Request, p principal) {
@@ -650,7 +663,14 @@ func (s *Server) storeAgentArtifact(ref agentArtifactRef, data []byte) (agentArt
 	if err := verifyAgentArtifactBytes(ref, data); err != nil {
 		return agentArtifactView{}, err
 	}
-	return s.putAgentArtifact(ref, data, len(data))
+	view, err := s.putAgentArtifact(ref, data, len(data))
+	if err != nil {
+		return view, err
+	}
+	if err := s.recordAgentArtifactManifest(ref, data, "upload"); err != nil {
+		return view, err
+	}
+	return view, nil
 }
 
 // storeCompressedAgentArtifact is storeAgentArtifact for an import: it holds
@@ -1179,7 +1199,16 @@ func (s *Server) authorizeAgentBinaryRequest(r *http.Request, ref agentArtifactR
 	if err != nil || payload.NodeID != node.ID {
 		return node, task, errAgentBinaryDenied
 	}
-	if payload.BinarySource != agentBinarySourceControlPlane {
+	// A plan with a source list authorizes on its control-plane entry, the
+	// URL this server computed for exactly these bytes under its own base;
+	// an older plan on its binary_source.
+	if len(payload.Sources) > 0 {
+		base := s.agentBinaryBaseURL()
+		i := slices.IndexFunc(payload.Sources, func(src model.AgentUpdateSource) bool { return src.Kind == model.AgentSourceKindControlPlane })
+		if base == "" || i < 0 || payload.Sources[i].URL != base+ref.urlPath() {
+			return node, task, errAgentBinaryDenied
+		}
+	} else if payload.BinarySource != agentBinarySourceControlPlane {
 		return node, task, errAgentBinaryDenied
 	}
 	if payload.TargetVersion != ref.Version || !strings.EqualFold(payload.SHA256, ref.SHA256) {

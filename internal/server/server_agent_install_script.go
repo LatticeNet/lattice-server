@@ -21,6 +21,11 @@ import (
 // up by it. The client then verifies against bytes that arrived over the same
 // TLS connection that served the script, instead of trusting a second fetch, and
 // two runs a minute apart cannot land on different releases.
+//
+// So are its sources (design 31, S6): the registry's global mirrors, which
+// hold binaries at <base>/<version>/<os>/<arch>/<sha256>, then the release.
+// A mirror only ever delivers bytes; the digest it is held to is the one
+// rendered here.
 const agentInstallScriptPath = "/install.sh"
 
 func (s *Server) handleAgentInstallScript(w http.ResponseWriter, r *http.Request) {
@@ -39,7 +44,7 @@ func (s *Server) handleAgentInstallScript(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	script, err := renderAgentInstallScript(s.agentReleaseRepo, version, tag, sums)
+	script, err := renderAgentInstallScript(s.agentReleaseRepo, version, tag, sums, s.agentInstallMirrorBases())
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
 		return
@@ -62,7 +67,7 @@ var agentInstallScriptPlatforms = []struct{ OS, Arch string }{
 	{"darwin", "amd64"}, {"darwin", "arm64"},
 }
 
-func renderAgentInstallScript(repo, version, tag, sums string) (string, error) {
+func renderAgentInstallScript(repo, version, tag, sums string, mirrors []string) (string, error) {
 	type entry struct{ key, artifact, sha string }
 	var rows []entry
 	for _, p := range agentInstallScriptPlatforms {
@@ -87,7 +92,7 @@ func renderAgentInstallScript(repo, version, tag, sums string) (string, error) {
 	return strings.NewReplacer(
 		"@@VERSION@@", version,
 		"@@TAG@@", tag,
-		"@@BASE@@", base,
+		"@@SOURCES@@", agentInstallSources(mirrors, base, true),
 		"@@TABLE@@", strings.TrimRight(table.String(), "\n"),
 	).Replace(agentInstallScriptTemplate), nil
 }
@@ -103,7 +108,9 @@ const agentInstallScriptTemplate = `#!/bin/sh
 # enrolment needs a token, and a public script is the wrong place to take one.
 set -eu
 
-BASE='@@BASE@@'
+# Tried in order: m=<base> is a mirror holding <base>/<version>/<os>/<arch>/
+# <sha256>, never followed through a redirect; r=<base> is the release.
+SOURCES='@@SOURCES@@'
 VERSION='@@VERSION@@'
 AGENT=/opt/lattice/lattice-agent
 # Written only after the service has actually been restarted onto this version.
@@ -182,15 +189,57 @@ if [ "$(sha_of "$AGENT")" = "$EXPECTED" ]; then
 else
     TMP=$(mktemp -d)
     trap 'rm -rf "$TMP"' EXIT INT TERM
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 300 "$BASE/$ARTIFACT" -o "$TMP/agent" || die "download failed"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -q -T 300 -O "$TMP/agent" "$BASE/$ARTIFACT" || die "download failed"
-    else
-        die "neither curl nor wget is available"
-    fi
-    GOT=$(sha_of "$TMP/agent")
-    [ "$GOT" = "$EXPECTED" ] || die "checksum mismatch: got $GOT want $EXPECTED"
+    command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || die "neither curl nor wget is available"
+    # fetch URL MIRROR continues $TMP/agent from URL. No total time limit on
+    # the release: a slow line finishes, and a stalled one is left after a
+    # minute. A mirror is optional and the release follows it, so a mirror
+    # fetch stops after 600 s and at 131072 blocks (64 MiB where the shell
+    # counts 512-byte blocks; the binary is about 14 MiB): a bad one can
+    # neither hold the update nor fill the disk, and what it delivered is kept
+    # for the next source. wget has no total limit of its own, so without a
+    # working timeout command it skips the mirrors.
+    BOUND=0
+    if command -v timeout >/dev/null 2>&1 && timeout 5 true >/dev/null 2>&1; then BOUND=1; fi
+    fetch() {
+        if command -v curl >/dev/null 2>&1; then
+            if [ "$2" = 1 ]; then
+                ( ulimit -f 131072 || exit 1; trap '' XFSZ; curl -fsS --proto '=https' --tlsv1.2 --max-time 600 --connect-timeout 20 --speed-limit 1024 --speed-time 60 -C - -o "$TMP/agent" "$1" )
+            else
+                curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 20 --speed-limit 1024 --speed-time 60 -C - -o "$TMP/agent" "$1"
+            fi
+        elif [ "$2" = 1 ]; then
+            if [ "$BOUND" = 0 ]; then
+                echo "lattice: no working timeout command to bound a wget fetch, so it skips the mirror $1" >&2
+                return 1
+            fi
+            ( ulimit -f 131072 || exit 1; trap '' XFSZ; timeout 600 wget -q --max-redirect=0 -T 60 -c -O "$TMP/agent" "$1" )
+        else
+            wget -q -T 60 -c -O "$TMP/agent" "$1"
+        fi
+    }
+    # The first round continues one download across the sources. A source
+    # could splice wrong bytes onto right ones, so when the result fails its
+    # digest, the second round fetches each source from byte zero on its own.
+    GOT=''
+    for ROUND in continue fresh; do
+        for SRC in $SOURCES; do
+            case "$SRC" in
+                m=*) URL="${SRC#m=}/$VERSION/$OS/$ARCH/$EXPECTED"; MIRROR=1 ;;
+                r=*) URL="${SRC#r=}/$ARTIFACT"; MIRROR=0 ;;
+                *) continue ;;
+            esac
+            [ "$ROUND" = continue ] || rm -f "$TMP/agent"
+            if fetch "$URL" "$MIRROR"; then
+                GOT=$(sha_of "$TMP/agent")
+                [ "$GOT" = "$EXPECTED" ] && break 2
+                echo "lattice: $URL gave a binary with digest $GOT, not $EXPECTED; discarded it" >&2
+                rm -f "$TMP/agent"
+            else
+                echo "lattice: download from $URL failed; trying the next source" >&2
+            fi
+        done
+    done
+    [ "$GOT" = "$EXPECTED" ] || die "no source delivered the pinned binary $EXPECTED"
     cp -p "$AGENT" "$AGENT.bak-$CURRENT" 2>/dev/null || true
     # Overwrite in place and restart in one job. Never stop first: where this
     # runs as a child of the agent, stopping the agent kills this script too and

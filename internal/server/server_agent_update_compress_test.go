@@ -170,8 +170,8 @@ func TestAgentUpdatePlanWithAndWithoutACompressedArtifact(t *testing.T) {
 			"\ncompressed_size: " + strconv.Itoa(packedSize) + "\n",
 			"\nbinary_size: " + strconv.Itoa(len(data)) + "\n",
 			"holds the compressed file to compressed_sha256 before decompressing it, stops decompressing past binary_size bytes",
-			"fetches fallback_url, the uncompressed release binary, without the task lease",
-			"- a node without a working gzip or head -c skips the compressed download and fetches fallback_url\n",
+			"the other sources' as " + agentUpdatePartialPrefix + "<sha256>",
+			"- a node without a working gzip or head -c skips the compressed download and walks the other sources\n",
 			"\n" + agentUpdateCutoffPlanLine + "\n",
 		} {
 			if !strings.Contains(approval.Plan, want) {

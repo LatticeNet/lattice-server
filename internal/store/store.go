@@ -126,6 +126,11 @@ type State struct {
 	// Beacon is the measurement beacon's state (beacon.go): source ids,
 	// applied plans and target keys, nil until the first is written.
 	Beacon *BeaconRegistry `json:"beacon,omitempty"`
+	// AgentMirrors is the agent mirror registry (agent_mirrors.go), nil
+	// until the first approved change. AgentArtifactManifests holds the
+	// chunk manifest of every agent binary the control plane verified.
+	AgentMirrors           *AgentMirrorRegistry             `json:"agent_mirrors,omitempty"`
+	AgentArtifactManifests map[string]AgentArtifactManifest `json:"agent_artifact_manifests,omitempty"`
 	// EvidenceSettings are the operator's evidence budgets
 	// (evidence_settings.go), nil until saved. Written only on an edit.
 	EvidenceSettings *model.EvidenceSettings `json:"evidence_settings,omitempty"`
@@ -967,6 +972,7 @@ func emptyState() State {
 		GroupPolicies:           map[string]model.GroupNetPolicy{},
 		GeoRouting:              map[string]model.GeoRouting{},
 		AgentUpdates:            map[string]model.AgentUpdatePolicy{},
+		AgentArtifactManifests:  map[string]AgentArtifactManifest{},
 		ProxyInbounds:           map[string]model.ProxyInbound{},
 		ProxyUsers:              map[string]model.ProxyUser{},
 		ProxyProfiles:           map[string]model.ProxyNodeProfile{},
@@ -1192,6 +1198,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.Migrations == nil {
 		st.Migrations = map[string]time.Time{}
+	}
+	if st.AgentArtifactManifests == nil {
+		st.AgentArtifactManifests = map[string]AgentArtifactManifest{}
 	}
 }
 

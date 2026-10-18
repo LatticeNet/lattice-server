@@ -75,8 +75,9 @@ func parseApprovalAutoRules(raw string) ([]approvalAutoRule, error) {
 // identity holders receive across the fleet, so a rule written for some
 // other writer or action (a rule that leaves plugin empty matches every
 // plugin) must not approve one by accident. Every other plugin keeps the
-// wildcard, so existing rules behave as they did.
-var approvalPluginsNamedOnly = map[string]bool{subStorePlanApprovalPlugin: true}
+// wildcard, so existing rules behave as they did. An agent.mirrors plan
+// steers which host every node downloads its agent from, so it joins them.
+var approvalPluginsNamedOnly = map[string]bool{subStorePlanApprovalPlugin: true, model.AgentMirrorsApprovalPlugin: true}
 
 // matches reports whether the rule applies to a freshly submitted approval.
 func (r approvalAutoRule) matches(a model.Approval) bool {

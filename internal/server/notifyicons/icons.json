@@ -30,6 +30,11 @@
     "tone": "notice"
   },
   {
+    "file": "cloud-download-notice.png",
+    "icon": "cloud-download",
+    "tone": "notice"
+  },
+  {
     "file": "flask-conical-quiet.png",
     "icon": "flask-conical",
     "tone": "quiet"

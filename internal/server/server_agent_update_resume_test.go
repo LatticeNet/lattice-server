@@ -92,7 +92,7 @@ func TestAgentUpdatePlanStatesTheResumableDownload(t *testing.T) {
 		"\n" + agentUpdateResumePlanLine + "\n",
 		"as " + agentUpdatePartialPrefix + "<sha256>",
 		"inside one " + agentFetchBudgetSec + " s budget",
-		"continuing from what the control plane already sent",
+		"each continuing what the sources before it kept of the same file",
 	} {
 		if !strings.Contains(approval.Plan, want) {
 			t.Fatalf("plan is missing %q:\n%s", want, approval.Plan)
@@ -200,6 +200,7 @@ func TestAgentUpdatePreResumeApprovalIsReplannedBeforeItRunsAgain(t *testing.T) 
 		t.Fatal(err)
 	}
 	payload.ResumeDownload = false
+	payload.Sources, payload.ChunkManifest = nil, nil
 	approval.Action = agentUpdateApprovalAction(payload)
 	approval.Plan = strings.Replace(approval.Plan, "resume_download: true\n", "", 1)
 	if err := st.UpsertApproval(approval); err != nil {
@@ -288,6 +289,9 @@ func resumableScripts(t *testing.T, approval model.Approval, walk bool) map[stri
 		p := base
 		p.ResumeDownload = true
 		mutate(&p)
+		// Without mirrors a source list renders the walk an approval planned
+		// before it renders; the shapes built here take none.
+		p.Sources, p.ChunkManifest = nil, nil
 		approval.Action = agentUpdateApprovalAction(p)
 		script, err := agentUpdateApplyScript(approval, artifactTestPublicURL)
 		if err != nil {

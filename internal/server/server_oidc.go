@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -349,6 +350,22 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A provider the operator marked as the whole first and second factor
+	// (SkipLocalTOTP) opens the console without the local code, but only
+	// through a subject this account already confirmed with that code in its
+	// current security epoch; see ssoVouchesForSecondFactor.
+	if user.TOTPEnabled && s.ssoVouchesForSecondFactor(provider, claims.Subject, user) {
+		if _, err := s.startSessionAudited(w, r, user, model.AuditEvent{
+			Action:   "login.oidc.totp_skipped",
+			Reason:   "local second factor skipped by provider policy",
+			Metadata: map[string]string{"provider": provider.ID, "policy": "skip_local_totp"},
+		}); err != nil {
+			s.oidcFail(w, r, st.RedirectAfter, "session_failed", "")
+			return
+		}
+		http.Redirect(w, r, oidc.SanitizeRedirect(st.RedirectAfter), http.StatusFound)
+		return
+	}
 	// Honor a Lattice-local second factor: SSO proves the IdP identity, but if
 	// the account also has TOTP enabled we still require it (no silent 2FA
 	// bypass). Carry the challenge to the dashboard, which completes it exactly
@@ -387,6 +404,45 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, oidc.SanitizeRedirect(st.RedirectAfter), http.StatusFound)
 }
 
+// ssoVouchesForSecondFactor reports whether a sign-in through provider as
+// subject may stand in for user's local TOTP. All of these must hold: the
+// provider is enabled and carries SkipLocalTOTP; the subject is linked to this
+// user; and the link was confirmed by completing the local second factor in a
+// sign-in from this subject (confirmSSOSecondFactor) while the user's security
+// epoch was what it is now. The confirmation keeps the trust on the provider
+// account the operator proved once, not on whatever account the provider says
+// has the same verified email: a first sign-in links by email match, and that
+// link is written before the TOTP step, so a link alone proves nothing. A
+// password change, 2FA disable or session revoke bumps the epoch and with it
+// withdraws the trust until the next confirmed sign-in.
+func (s *Server) ssoVouchesForSecondFactor(provider model.OIDCProvider, subject string, user model.User) bool {
+	if !provider.Enabled || !provider.SkipLocalTOTP {
+		return false
+	}
+	link, ok := s.store.OIDCIdentity(provider.ID, subject)
+	return ok && link.UserID == user.ID && !link.SecondFactorAt.IsZero() && link.SecondFactorEpoch == user.SecurityEpoch
+}
+
+// confirmSSOSecondFactor records on the identity link that the user completed
+// the local second factor for a challenge the SSO callback issued, so a
+// provider with SkipLocalTOTP may later stand in for it. Only the browser that
+// completed SSO can get here (handleLoginTOTP requires the challenge cookie).
+// A failure is logged and does not fail the sign-in; the next one asks again.
+func (s *Server) confirmSSOSecondFactor(r *http.Request, challenge auth.TOTPChallenge, user model.User) {
+	if challenge.SSOProviderID == "" || challenge.SSOSubject == "" {
+		return
+	}
+	ok, err := s.store.ConfirmOIDCIdentitySecondFactor(challenge.SSOProviderID, challenge.SSOSubject, user.ID, s.now(), user.SecurityEpoch)
+	if err != nil {
+		s.logger.Printf("oidc second-factor confirmation (%s): %v", challenge.SSOProviderID, err)
+		return
+	}
+	if ok {
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.oidc.second_factor_confirmed", Decision: "observe",
+			Metadata: map[string]string{"provider": challenge.SSOProviderID}})
+	}
+}
+
 // oidcRedirect redirects to a sanitized landing path carrying a single query
 // parameter (key=value). Used for both success continuations (e.g. a pending
 // totp_challenge) and failures.
@@ -417,6 +473,7 @@ type oidcProviderView struct {
 	Scopes         []string `json:"scopes,omitempty"`
 	AllowedDomains []string `json:"allowed_domains,omitempty"`
 	Enabled        bool     `json:"enabled"`
+	SkipLocalTOTP  bool     `json:"skip_local_totp"`
 }
 
 func toOIDCProviderView(p model.OIDCProvider) oidcProviderView {
@@ -429,6 +486,7 @@ func toOIDCProviderView(p model.OIDCProvider) oidcProviderView {
 		Scopes:         p.Scopes,
 		AllowedDomains: p.AllowedDomains,
 		Enabled:        p.Enabled,
+		SkipLocalTOTP:  p.SkipLocalTOTP,
 	}
 }
 
@@ -478,11 +536,16 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 			req.DisplayName = req.Issuer
 		}
 		now := time.Now().UTC()
+		// The provider-trusted second factor is never inherited from the
+		// stored record: a request that leaves skip_local_totp out turns it
+		// off, the value that keeps the local TOTP step.
+		oldSkipLocalTOTP := false
 		if req.ID == "" {
 			req.ID = id.New("oidc")
 			req.CreatedAt = now
 		} else if existing, ok := s.store.OIDCProvider(req.ID); ok {
 			req.CreatedAt = existing.CreatedAt
+			oldSkipLocalTOTP = existing.SkipLocalTOTP
 			if req.ClientSecret == "" {
 				req.ClientSecret = existing.ClientSecret // preserve write-only secret
 			}
@@ -494,7 +557,12 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Metadata: map[string]string{"provider": req.ID, "issuer": req.Issuer}})
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Metadata: map[string]string{
+			"provider":            req.ID,
+			"issuer":              req.Issuer,
+			"old_skip_local_totp": strconv.FormatBool(oldSkipLocalTOTP),
+			"new_skip_local_totp": strconv.FormatBool(req.SkipLocalTOTP),
+		}})
 		writeJSON(w, http.StatusOK, toOIDCProviderView(req))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

@@ -86,6 +86,30 @@ func (s *Store) PutOIDCIdentity(idn model.OIDCIdentity) error {
 	return s.Save()
 }
 
+// ConfirmOIDCIdentitySecondFactor records that userID completed its local
+// second factor in a sign-in that started at this provider subject, in the
+// given security epoch. It changes only an existing link that still names
+// userID, so it can neither create a link nor resurrect one deleted with its
+// user; it reports whether it changed one.
+func (s *Store) ConfirmOIDCIdentitySecondFactor(providerID, subject, userID string, at time.Time, epoch uint64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := oidcIdentityKey(providerID, subject)
+	idn, ok := s.state.OIDCIdentities[key]
+	if !ok || idn.UserID != userID {
+		return false, nil
+	}
+	prior := idn
+	idn.SecondFactorAt = at.UTC()
+	idn.SecondFactorEpoch = epoch
+	s.state.OIDCIdentities[key] = idn
+	if err := s.Save(); err != nil {
+		s.state.OIDCIdentities[key] = prior
+		return false, err
+	}
+	return true, nil
+}
+
 // DeleteOIDCIdentitiesByUser removes every durable subject→user link bound to
 // userID. The map is keyed by provider+subject (not user id), so it is scanned.
 // Used when deleting a user so a stale link can never re-resolve to a removed

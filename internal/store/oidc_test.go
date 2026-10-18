@@ -113,3 +113,46 @@ func TestOIDCAuthStateSingleUseAndExpiry(t *testing.T) {
 		t.Fatal("expired state should not consume")
 	}
 }
+
+// A link's second-factor confirmation changes only a link that exists and
+// still names the account, and survives a restart together with the
+// provider's skip_local_totp policy.
+func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	c := testCipher(t)
+	s, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 18, 7, 0, 0, 0, time.UTC)
+	if ok, err := s.ConfirmOIDCIdentitySecondFactor("g", "sub-1", "u1", at, 2); err != nil || ok {
+		t.Fatalf("confirming a missing link must change nothing: ok=%v err=%v", ok, err)
+	}
+	if _, ok := s.OIDCIdentity("g", "sub-1"); ok {
+		t.Fatal("confirmation must not create a link")
+	}
+	if err := s.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: "https://accounts.google.com", ClientID: "cid", Enabled: true, SkipLocalTOTP: true, CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Subject: "sub-1", UserID: "u1", CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.ConfirmOIDCIdentitySecondFactor("g", "sub-1", "u2", at, 2); err != nil || ok {
+		t.Fatalf("confirming for another account must change nothing: ok=%v err=%v", ok, err)
+	}
+	if ok, err := s.ConfirmOIDCIdentitySecondFactor("g", "sub-1", "u1", at, 2); err != nil || !ok {
+		t.Fatalf("confirm: ok=%v err=%v", ok, err)
+	}
+
+	s2, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s2.OIDCIdentity("g", "sub-1")
+	if !ok || !got.SecondFactorAt.Equal(at) || got.SecondFactorEpoch != 2 || got.UserID != "u1" {
+		t.Fatalf("confirmation lost across a restart: %+v ok=%v", got, ok)
+	}
+	if p, ok := s2.OIDCProvider("g"); !ok || !p.SkipLocalTOTP {
+		t.Fatalf("skip_local_totp lost across a restart: %+v ok=%v", p, ok)
+	}
+}

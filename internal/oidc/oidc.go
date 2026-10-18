@@ -140,7 +140,11 @@ func (m *Manager) oauthConfig(ctx context.Context, p model.OIDCProvider, redirec
 }
 
 // AuthCodeURL builds the provider authorization URL for an auth-code + PKCE
-// (S256) login carrying the given state and nonce.
+// (S256) login carrying the given state and nonce. It asks for the provider's
+// account chooser (prompt=select_account, OIDC Core 3.1.2.1): without it a
+// provider with one signed-in account and a prior grant redirects straight
+// back, and the operator never sees which account is signing in to the
+// control plane.
 func (m *Manager) AuthCodeURL(ctx context.Context, p model.OIDCProvider, redirectURL, state, nonce, codeVerifier string) (string, error) {
 	cfg, _, err := m.oauthConfig(ctx, p, redirectURL)
 	if err != nil {
@@ -149,6 +153,7 @@ func (m *Manager) AuthCodeURL(ctx context.Context, p model.OIDCProvider, redirec
 	return cfg.AuthCodeURL(state,
 		oidc.Nonce(nonce),
 		oauth2.S256ChallengeOption(codeVerifier),
+		oauth2.SetAuthURLParam("prompt", "select_account"),
 	), nil
 }
 

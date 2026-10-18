@@ -2506,6 +2506,10 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		s.handlePendingSSOSecondFactor(w, r)
 		return
 	}
+	if r.Method == http.MethodDelete {
+		s.handleCancelPendingSSOSecondFactor(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 		return

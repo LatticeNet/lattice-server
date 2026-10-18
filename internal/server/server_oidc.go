@@ -659,10 +659,12 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 		// stored record: a request that leaves skip_local_totp out turns it
 		// off, the value that keeps the local TOTP step.
 		oldSkipLocalTOTP, oldIssuer := false, ""
+		var prior *model.OIDCProvider
 		if req.ID == "" {
 			req.ID = id.New("oidc")
 			req.CreatedAt = now
 		} else if existing, ok := s.store.OIDCProvider(req.ID); ok {
+			prior = &existing
 			req.CreatedAt = existing.CreatedAt
 			oldSkipLocalTOTP, oldIssuer = existing.SkipLocalTOTP, existing.Issuer
 			if req.ClientSecret == "" {
@@ -672,6 +674,14 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 			req.CreatedAt = now
 		}
 		enablingSkip := req.SkipLocalTOTP && !oldSkipLocalTOTP
+		signInChange := oidcSignInChange(prior, req)
+		stepUp := ""
+		if signInChange != "" && !enablingSkip {
+			var ok bool
+			if stepUp, ok = s.requireOIDCSignInChangeAuthority(w, p, req.ID, signInChange, strings.TrimSpace(body.StepUpGrant)); !ok {
+				return
+			}
+		}
 		// Turning the local second factor off for everyone who signs in through
 		// this provider is a relaxation of sign-in, so it takes what revealing a
 		// secret takes: an interactive session with a fresh step-up. A token
@@ -714,12 +724,103 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 		}
 		if enablingSkip {
 			meta["confirmations_cleared"] = strconv.Itoa(changes.ConfirmationsCleared)
+			stepUp = "true"
+		}
+		if signInChange != "" {
+			meta["sign_in_change"] = signInChange
+			meta["step_up"] = stepUp
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Decision: "allow", Metadata: meta})
+		if signInChange == "created" || signInChange == "repointed" || signInChange == "client_changed" {
+			// A new way to assert identities: said beyond the audit log.
+			name := strings.TrimSpace(req.DisplayName)
+			if name == "" {
+				name = req.ID
+			}
+			title := map[string]string{"created": "Identity provider added", "repointed": "Identity provider repointed", "client_changed": "Identity provider client changed"}[signInChange]
+			s.emitNotify(title, fmt.Sprintf("%s now signs operators in through %s (client %s), changed by %s", name, req.Issuer, req.ClientID, principalLabel(p)))
+		}
 		writeJSON(w, http.StatusOK, toOIDCProviderView(req))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+// oidcSignInChange names how saving next over prior changes who can sign
+// in, or returns "" when it changes nothing about that: "created" for a new
+// provider, "repointed" for another issuer, "client_changed" for another
+// client, "domains_widened" when the email domains admit more (a domain
+// added, or the list cleared, which admits any domain). Renaming, narrowing
+// the domains, disabling or turning skip_local_totp off grant nothing new.
+func oidcSignInChange(prior *model.OIDCProvider, next model.OIDCProvider) string {
+	switch {
+	case prior == nil:
+		return "created"
+	case prior.Issuer != next.Issuer:
+		return "repointed"
+	case prior.ClientID != next.ClientID:
+		return "client_changed"
+	case oidcDomainsWidened(prior.AllowedDomains, next.AllowedDomains):
+		return "domains_widened"
+	default:
+		return ""
+	}
+}
+
+// oidcDomainsWidened reports whether next admits an email domain that prior
+// did not: an empty list admits any domain.
+func oidcDomainsWidened(prior, next []string) bool {
+	if len(next) == 0 {
+		return len(prior) > 0
+	}
+	if len(prior) == 0 {
+		return false
+	}
+	had := make(map[string]bool, len(prior))
+	for _, d := range prior {
+		had[strings.ToLower(strings.TrimSpace(d))] = true
+	}
+	for _, d := range next {
+		if !had[strings.ToLower(strings.TrimSpace(d))] {
+			return true
+		}
+	}
+	return false
+}
+
+// requireOIDCSignInChangeAuthority is the gate in front of a change that
+// decides who can sign in (oidcSignInChange). Whoever controls a provider's
+// configuration controls what it asserts: an IdP that says a victim's email
+// is verified binds that account on its first sign-in. So such a change is
+// never a token's to make, and an operator who has a second factor (TOTP or
+// a passkey) gives it fresh, as for revealing a secret. An operator with
+// none yet (a fresh install setting up single sign-on) proceeds, and the
+// audit says no step-up was possible. It returns how the change was
+// authorised ("true" or "no_second_factor") and whether it may go ahead;
+// when not, it has audited and answered.
+func (s *Server) requireOIDCSignInChangeAuthority(w http.ResponseWriter, p principal, providerID, change, grant string) (string, bool) {
+	refuse := func(reason, message string) (string, bool) {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Decision: "deny",
+			Reason: reason, Metadata: map[string]string{"provider": providerID, "sign_in_change": change}})
+		writeError(w, http.StatusForbidden, apiError(apiErrorStepUpRequired, message))
+		return "", false
+	}
+	if p.viaBearer || p.ActorID == "" || p.sessionID == "" {
+		return refuse("sign-in change from a non-session principal",
+			"adding an identity provider, or changing its issuer, client or email domains, is done from an interactive session, never by a token")
+	}
+	user, ok := s.store.User(p.ActorID)
+	if !ok {
+		return refuse("sign-in change by an unknown user", "unknown user")
+	}
+	if !user.TOTPEnabled && s.store.CountWebAuthnCredentialsByUser(user.ID) == 0 {
+		return "no_second_factor", true
+	}
+	if !s.stepUpGrantHeld(p, grant) {
+		return refuse("sign-in change without a fresh second-factor step-up",
+			"adding an identity provider, or changing its issuer, client or email domains, requires a fresh second-factor step-up")
+	}
+	return "true", true
 }
 
 // handleDeleteOIDCProvider removes a provider by id.

@@ -76,12 +76,18 @@ if [ "$(id -u)" -ne 0 ]; then
     # directory of this user's, which the child checks, reads and removes;
     # this shell removes the directory too when sudo returns or is
     # interrupted. A file works whatever sudoers keeps or resets of the
-    # environment. The private directory means nobody else can swap the file
-    # between the child's checks and its read, even in a TMPDIR without the
-    # sticky bit.
+    # environment. The private directory means nobody else can replace or
+    # link the file between the child's checks and its read. Its own name is
+    # safe only in a TMPDIR other users cannot write to, or one with the
+    # sticky bit, so any other TMPDIR is refused.
     token_dir=""
     token_file=""
     if [ -n "$token" ]; then
+      # The trailing slash makes ls describe the directory a symlink points at.
+      case "$(ls -ldn "${TMPDIR:-/tmp}/" 2>/dev/null | awk '{ print $1 }')" in
+        d???????w[tT]*) ;;
+        d???????w*) die "TMPDIR ${TMPDIR:-/tmp} is writable by every user without the sticky bit; set TMPDIR to a private directory" ;;
+      esac
       token_dir="$(mktemp -d "${TMPDIR:-/tmp}/lattice-agent-token.XXXXXX")" || \
         die "cannot create a private directory to hand the enrollment token to sudo"
       trap 'rm -rf "$token_dir"' EXIT
@@ -149,6 +155,7 @@ if [ -n "${LATTICE_NODE_TOKEN_FILE:-}" ]; then
     die "LATTICE_NODE_TOKEN_FILE is not in a directory: $token_file"
   case "$(ls_mode_links_owner "$token_dir")" in
     "drwx------ "*" $token_owner"|"drwx------. "*" $token_owner"|"drwx------@ "*" $token_owner") ;;
+    "drwx------+ "*) die "LATTICE_NODE_TOKEN_FILE is in a directory that carries an ACL, likely a default ACL on TMPDIR; set TMPDIR to a directory without one: $token_dir" ;;
     *) die "LATTICE_NODE_TOKEN_FILE must be in a directory only uid $token_owner can enter (mode 0700): $token_dir" ;;
   esac
   [ -f "$token_file" ] && [ ! -L "$token_file" ] || \

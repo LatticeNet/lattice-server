@@ -16,10 +16,10 @@ import (
 )
 
 // Ref is the lattice-node-agent commit install.sh was copied from.
-const Ref = "LatticeNet/lattice-node-agent@d5d79c839342d9f3b0f3816a0c33a3cd06d45b5c"
+const Ref = "LatticeNet/lattice-node-agent@f7deddc7acc44cf0071ae00fef93ac2d78f1b528"
 
 // SHA256 is the digest of the copy.
-const SHA256 = "de8807b967bea79523eb1490d53a4b8123f56457fbcbc6ab63d11604a4820c02"
+const SHA256 = "89d7c4d2bf1f588c4e5319e391970d9e907fd327a17a6238f293bc679dc4856b"
 
 //go:embed install.sh
 var installScript []byte

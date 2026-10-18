@@ -113,3 +113,110 @@ func TestOIDCAuthStateSingleUseAndExpiry(t *testing.T) {
 		t.Fatal("expired state should not consume")
 	}
 }
+
+// A link's second-factor confirmation changes only a link that exists and
+// still names the account, takes the issuer the sign-in saw, survives a
+// restart together with the provider's skip_local_totp policy, and is
+// cleared per provider without touching the link.
+func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	c := testCipher(t)
+	s, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 18, 7, 0, 0, 0, time.UTC)
+	const issuer = "https://accounts.google.com"
+	if _, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u1", at, 2); err != nil || ok {
+		t.Fatalf("confirming a missing link must change nothing: ok=%v err=%v", ok, err)
+	}
+	if _, ok := s.OIDCIdentity("g", "sub-1"); ok {
+		t.Fatal("confirmation must not create a link")
+	}
+	if err := s.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: issuer, ClientID: "cid", Enabled: true, SkipLocalTOTP: true, CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: "https://old.example", Subject: "sub-1", UserID: "u1", CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "other", Issuer: "https://other.example", Subject: "sub-1", UserID: "u1", CreatedAt: at, SecondFactorAt: at, SecondFactorEpoch: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u2", at, 2); err != nil || ok {
+		t.Fatalf("confirming for another account must change nothing: ok=%v err=%v", ok, err)
+	}
+	prior, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u1", at, 2)
+	if err != nil || !ok || !prior.SecondFactorAt.IsZero() || prior.Issuer != "https://old.example" {
+		t.Fatalf("confirm: prior=%+v ok=%v err=%v", prior, ok, err)
+	}
+
+	s2, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s2.OIDCIdentity("g", "sub-1")
+	if !ok || !got.SecondFactorAt.Equal(at) || got.SecondFactorEpoch != 2 || got.UserID != "u1" || got.Issuer != issuer {
+		t.Fatalf("confirmation lost across a restart: %+v ok=%v", got, ok)
+	}
+	if p, ok := s2.OIDCProvider("g"); !ok || !p.SkipLocalTOTP {
+		t.Fatalf("skip_local_totp lost across a restart: %+v ok=%v", p, ok)
+	}
+
+	if n, err := s2.ClearOIDCIdentityConfirmations("g"); err != nil || n != 1 {
+		t.Fatalf("clear: n=%d err=%v", n, err)
+	}
+	if got, ok := s2.OIDCIdentity("g", "sub-1"); !ok || !got.SecondFactorAt.IsZero() || got.SecondFactorEpoch != 0 || got.UserID != "u1" {
+		t.Fatalf("clearing must keep the link and drop only its confirmation: %+v ok=%v", got, ok)
+	}
+	if got, _ := s2.OIDCIdentity("other", "sub-1"); got.SecondFactorAt.IsZero() {
+		t.Fatal("clearing one provider must not touch another's confirmations")
+	}
+	if n, err := s2.ClearOIDCIdentityConfirmations("g"); err != nil || n != 0 {
+		t.Fatalf("a second clear has nothing to do: n=%d err=%v", n, err)
+	}
+}
+
+// Turning the policy on stores the provider and clears its links'
+// confirmations in one write, and the provider's client secret stays
+// encrypted at rest on that path too.
+func TestUpsertOIDCProviderClearingConfirmations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	c := testCipher(t)
+	s, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 18, 7, 0, 0, 0, time.UTC)
+	const secret = "super-secret-oauth-client-value"
+	p := model.OIDCProvider{ID: "g", Issuer: "https://accounts.google.com", ClientID: "cid", ClientSecret: secret, Enabled: true, CreatedAt: at}
+	if err := s.UpsertOIDCProvider(p); err != nil {
+		t.Fatal(err)
+	}
+	for _, sub := range []string{"sub-1", "sub-2"} {
+		if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: p.Issuer, Subject: sub, UserID: "u1", CreatedAt: at, SecondFactorAt: at, SecondFactorEpoch: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.SkipLocalTOTP = true
+	n, committed, err := s.UpsertOIDCProviderClearingConfirmations(p)
+	if err != nil || !committed || n != 2 {
+		t.Fatalf("upsert clearing: n=%d committed=%v err=%v", n, committed, err)
+	}
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), secret) {
+		t.Fatal("oidc client secret leaked to disk in plaintext")
+	}
+	s2, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s2.OIDCProvider("g")
+	if !ok || !got.SkipLocalTOTP || got.ClientSecret != secret {
+		t.Fatalf("provider after restart: skip=%v secret recovered=%v ok=%v", got.SkipLocalTOTP, got.ClientSecret == secret, ok)
+	}
+	for _, sub := range []string{"sub-1", "sub-2"} {
+		if idn, _ := s2.OIDCIdentity("g", sub); !idn.SecondFactorAt.IsZero() || idn.SecondFactorEpoch != 0 {
+			t.Fatalf("%s kept its confirmation: %+v", sub, idn)
+		}
+	}
+}

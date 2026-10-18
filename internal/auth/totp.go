@@ -165,11 +165,19 @@ type TOTPChallenge struct {
 	// SSOProviderID, SSOEmail and SSOSubject record which identity provider
 	// proved the first factor and whom it verified, so the second-factor page
 	// can say the provider step succeeded. SSOEmail is set only when the
-	// provider marked the email verified. All three are empty on the password
-	// path.
+	// provider marked the email verified. SSOIssuer is the provider's issuer
+	// when the callback ran, which the identity link is confirmed under once
+	// the second factor succeeds. All four are empty on the password path.
 	SSOProviderID string
 	SSOEmail      string
 	SSOSubject    string
+	SSOIssuer     string
+	// SSOBindingHash is the hex SHA-256 of the browser-binding secret the
+	// callback put in the challenge cookie beside the id. The id also travels
+	// in the redirect URL; the secret never does, so only the browser that
+	// completed SSO can read, cancel or answer the challenge. Empty on the
+	// password path.
+	SSOBindingHash string
 }
 
 // NewTOTPChallenge mints a challenge bound to a user and the requesting client.

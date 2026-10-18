@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/subtle"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -125,15 +127,46 @@ func (s *Server) clearOIDCBindingCookie(w http.ResponseWriter) {
 }
 
 // totpChallengeCookie binds a post-SSO TOTP challenge to the initiating browser.
-// handleLoginTOTP requires it to match the submitted challenge id when present,
-// and handlePendingSSOSecondFactor reads it to name the provider that verified
-// the first factor.
+// Its value is the challenge id and a browser-binding secret ("<id>.<secret>",
+// see ssoChallengeFromCookie). handleLoginTOTP requires it for every
+// SSO-issued challenge, and handlePendingSSOSecondFactor reads it to name the
+// provider that verified the first factor.
 const totpChallengeCookie = "lattice_totp_challenge"
 
-func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, challengeID string) {
+// ssoChallengeCookieValue joins a challenge id and its browser-binding secret.
+// Challenge ids are base64url and never contain a dot.
+func ssoChallengeCookieValue(challengeID, secret string) string {
+	return challengeID + "." + secret
+}
+
+// ssoChallengeFromCookie returns the SSO-issued challenge this browser holds:
+// the cookie must name an active SSO challenge, carry the secret whose hash
+// the challenge stores, and arrive from the address the challenge was issued
+// to. The challenge id alone, which an observer of the redirect URL has, is
+// not enough.
+func (s *Server) ssoChallengeFromCookie(r *http.Request) (auth.TOTPChallenge, bool) {
+	c, err := r.Cookie(totpChallengeCookie)
+	if err != nil || c.Value == "" {
+		return auth.TOTPChallenge{}, false
+	}
+	challengeID, secret, ok := strings.Cut(c.Value, ".")
+	if !ok || challengeID == "" || secret == "" {
+		return auth.TOTPChallenge{}, false
+	}
+	challenge, ok := s.store.TOTPChallenge(challengeID)
+	if !ok || challenge.SSOProviderID == "" || challenge.SSOBindingHash == "" || challenge.ClientIP != s.clientIP(r) {
+		return auth.TOTPChallenge{}, false
+	}
+	if subtle.ConstantTimeCompare([]byte(auth.HashBindingToken(secret)), []byte(challenge.SSOBindingHash)) != 1 {
+		return auth.TOTPChallenge{}, false
+	}
+	return challenge, true
+}
+
+func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, value string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     totpChallengeCookie,
-		Value:    challengeID,
+		Value:    value,
 		Path:     "/api/login/totp",
 		HttpOnly: true,
 		Secure:   s.secureCookies,
@@ -168,20 +201,17 @@ type pendingSSOSecondFactorView struct {
 // handlePendingSSOSecondFactor answers GET /api/login/totp so the second-factor
 // page can say which provider already verified the operator. It reads the
 // challenge only from the HttpOnly cookie the SSO callback set for this
-// browser, never from the URL, and requires the client IP the challenge was
-// issued to. Anything else (no cookie, an expired, spent or unknown challenge,
-// or a password-path challenge) gets a 404 that names nobody. It is read-only:
-// it neither counts against the login limiter nor touches the challenge.
+// browser, never from the URL, and requires the cookie's binding secret and
+// the client IP the challenge was issued to (ssoChallengeFromCookie).
+// Anything else (no cookie, a wrong secret, an expired, spent or unknown
+// challenge, or a password-path challenge) gets a 404 that names nobody. It is
+// read-only: it neither counts against the login limiter nor touches the
+// challenge.
 func (s *Server) handlePendingSSOSecondFactor(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	none := func() { writeError(w, http.StatusNotFound, errors.New("no pending sso sign-in")) }
-	c, err := r.Cookie(totpChallengeCookie)
-	if err != nil || c.Value == "" {
-		none()
-		return
-	}
-	challenge, ok := s.store.TOTPChallenge(c.Value)
-	if !ok || challenge.SSOProviderID == "" || challenge.ClientIP != s.clientIP(r) {
+	challenge, ok := s.ssoChallengeFromCookie(r)
+	if !ok {
 		none()
 		return
 	}
@@ -244,21 +274,18 @@ func maskSSOSubject(subject string) string {
 // handleCancelPendingSSOSecondFactor answers DELETE /api/login/totp: the
 // operator left the second-factor step, so the challenge the SSO callback
 // issued to this browser is spent and its cookie cleared. Like the read, it
-// takes the challenge only from the HttpOnly cookie and only from the client
-// address it was issued to; it answers 204 whatever it found, so it is no
-// oracle for challenge ids.
+// takes the challenge only from the HttpOnly cookie, with its binding secret,
+// and only from the client address it was issued to; it answers 204 whatever
+// it found, so it is no oracle for challenge ids.
 func (s *Server) handleCancelPendingSSOSecondFactor(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	c, err := r.Cookie(totpChallengeCookie)
-	if err == nil && c.Value != "" {
-		if challenge, ok := s.store.TOTPChallenge(c.Value); ok && challenge.SSOProviderID != "" && challenge.ClientIP == s.clientIP(r) {
-			if err := s.store.ConsumeTOTPChallenge(challenge.ID); err != nil {
-				writeError(w, http.StatusServiceUnavailable, err)
-				return
-			}
-			s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: challenge.UserID, Action: "login.oidc.second_factor_cancelled", Decision: "observe"})
-			s.clearTOTPChallengeCookie(w)
+	if challenge, ok := s.ssoChallengeFromCookie(r); ok {
+		if err := s.store.ConsumeTOTPChallenge(challenge.ID); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
 		}
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: challenge.UserID, Action: "login.oidc.second_factor_cancelled", Decision: "observe"})
+		s.clearTOTPChallengeCookie(w)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -349,6 +376,29 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A provider the operator marked as the whole first and second factor
+	// (SkipLocalTOTP) opens the console without the local code, but only
+	// through a subject this account already confirmed with that code in its
+	// current security epoch; see ssoVouchesForSecondFactor. The policy is
+	// read again here, after the code exchange's round trip to the provider,
+	// so a flag turned off or a provider disabled meanwhile is honoured.
+	if current, ok := s.store.OIDCProvider(provider.ID); ok && user.TOTPEnabled && s.ssoVouchesForSecondFactor(provider, current, claims.Subject, user) {
+		if _, err := s.startSessionAudited(w, r, user, model.AuditEvent{
+			Action: "login.oidc.totp_skipped",
+			Reason: "local second factor skipped by provider policy",
+			Metadata: map[string]string{
+				"provider": provider.ID,
+				"policy":   "skip_local_totp",
+				"subject":  maskSSOSubject(claims.Subject),
+				"epoch":    strconv.FormatUint(user.SecurityEpoch, 10),
+			},
+		}); err != nil {
+			s.oidcFail(w, r, st.RedirectAfter, "session_failed", "")
+			return
+		}
+		http.Redirect(w, r, oidc.SanitizeRedirect(st.RedirectAfter), http.StatusFound)
+		return
+	}
 	// Honor a Lattice-local second factor: SSO proves the IdP identity, but if
 	// the account also has TOTP enabled we still require it (no silent 2FA
 	// bypass). Carry the challenge to the dashboard, which completes it exactly
@@ -359,10 +409,17 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 			s.oidcFail(w, r, st.RedirectAfter, "session_failed", "")
 			return
 		}
+		bindingSecret, err := auth.NewRandomToken(32)
+		if err != nil {
+			s.oidcFail(w, r, st.RedirectAfter, "session_failed", "")
+			return
+		}
+		challenge.SSOBindingHash = auth.HashBindingToken(bindingSecret)
 		// Remember who the provider verified, so the second-factor page can
 		// tell the operator the provider step already succeeded.
 		challenge.SSOProviderID = provider.ID
 		challenge.SSOSubject = claims.Subject
+		challenge.SSOIssuer = provider.Issuer
 		if claims.EmailVerified {
 			challenge.SSOEmail = strings.TrimSpace(claims.Email)
 		}
@@ -373,10 +430,11 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.oidc.totp_required", Decision: "observe"})
 		// Bind the post-SSO TOTP challenge to THIS browser: the challenge id also
 		// travels in the front-channel redirect (?totp_challenge=), which an
-		// attacker who only sees the URL could replay. The cookie is the secret
-		// the attacker does not have; handleLoginTOTP requires it to match when
-		// present, so only the browser that completed SSO can finish 2FA. [C14]
-		s.setTOTPChallengeCookie(w, challenge.ID)
+		// attacker who only sees the URL could replay. The cookie carries the
+		// binding secret the attacker does not have; handleLoginTOTP requires it
+		// for every SSO-issued challenge, so only the browser that completed SSO
+		// can finish 2FA. [C14]
+		s.setTOTPChallengeCookie(w, ssoChallengeCookieValue(challenge.ID, bindingSecret))
 		s.oidcRedirect(w, r, st.RedirectAfter, "totp_challenge", challenge.ID)
 		return
 	}
@@ -385,6 +443,82 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, oidc.SanitizeRedirect(st.RedirectAfter), http.StatusFound)
+}
+
+// ssoVouchesForSecondFactor reports whether a sign-in through a provider as
+// subject may stand in for user's local TOTP. verified is the provider record
+// the claims were verified against (read before the code exchange); current
+// is the same record read again after it. All of these must hold: the current
+// record is enabled and carries SkipLocalTOTP; it still names the issuer and
+// client the claims were verified with, so a provider repointed and pointed
+// back while the exchange was in flight does not lend one issuer's claims the
+// other's trust; the subject is linked to this user under that issuer; and
+// the link was confirmed by completing the local TOTP code in a sign-in from
+// this subject (confirmSSOSecondFactor) while the user's security epoch was
+// what it is now.
+//
+// The confirmation keeps the trust on the provider account the operator
+// proved once, not on whatever account the provider says has the same
+// verified email: a first sign-in links by email match, and that link is
+// written before the TOTP step, so a link alone proves nothing. Subjects are
+// unique only per issuer, so repointing the provider at another issuer
+// withdraws the trust. A password change, 2FA disable or session revoke bumps
+// the epoch and with it withdraws the trust until the next confirmed sign-in.
+func (s *Server) ssoVouchesForSecondFactor(verified, current model.OIDCProvider, subject string, user model.User) bool {
+	if !current.Enabled || !current.SkipLocalTOTP {
+		return false
+	}
+	if current.ID != verified.ID || current.Issuer != verified.Issuer || current.ClientID != verified.ClientID {
+		return false
+	}
+	link, ok := s.store.OIDCIdentity(verified.ID, subject)
+	return ok && link.UserID == user.ID && link.Issuer == verified.Issuer &&
+		!link.SecondFactorAt.IsZero() && link.SecondFactorEpoch == user.SecurityEpoch
+}
+
+// confirmSSOSecondFactor records on the identity link that the user completed
+// the local TOTP code for a challenge the SSO callback issued, so a provider
+// with SkipLocalTOTP may later stand in for it. handleLoginTOTP calls it only
+// for the browser that holds the challenge cookie and only after a TOTP code,
+// never a recovery code. The link is confirmed under the issuer the callback
+// saw; a challenge without one (issued before this field existed) confirms
+// nothing. A failure is logged and does not fail the sign-in; the next one
+// asks again.
+func (s *Server) confirmSSOSecondFactor(r *http.Request, challenge auth.TOTPChallenge, user model.User) {
+	if challenge.SSOProviderID == "" || challenge.SSOSubject == "" || challenge.SSOIssuer == "" {
+		return
+	}
+	prior, ok, err := s.store.ConfirmOIDCIdentitySecondFactor(challenge.SSOProviderID, challenge.SSOIssuer, challenge.SSOSubject, user.ID, s.now(), user.SecurityEpoch)
+	if err != nil {
+		s.logger.Printf("oidc second-factor confirmation (%s): %v", challenge.SSOProviderID, err)
+	}
+	// ok means the confirmation is live, even when persisting it reported an
+	// error after the write landed; it is audited either way.
+	if !ok {
+		return
+	}
+	// A confirmation that lets a provider account open the console from now
+	// on, where it could not a moment ago, is a new way in: say so beyond the
+	// audit log. A routine re-confirmation of an account already trusted is
+	// only audited.
+	provider, _ := s.store.OIDCProvider(challenge.SSOProviderID)
+	wasTrusted := !prior.SecondFactorAt.IsZero() && prior.SecondFactorEpoch == user.SecurityEpoch && prior.Issuer == challenge.SSOIssuer
+	newlyTrusted := provider.Enabled && provider.SkipLocalTOTP && provider.Issuer == challenge.SSOIssuer && !wasTrusted
+	s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.oidc.second_factor_confirmed", Decision: "observe",
+		Metadata: map[string]string{
+			"provider":      challenge.SSOProviderID,
+			"subject":       maskSSOSubject(challenge.SSOSubject),
+			"epoch":         strconv.FormatUint(user.SecurityEpoch, 10),
+			"newly_trusted": strconv.FormatBool(newlyTrusted),
+		}})
+	if newlyTrusted {
+		name := strings.TrimSpace(provider.DisplayName)
+		if name == "" {
+			name = provider.ID
+		}
+		s.emitNotify("Single sign-on account trusted for sign-in",
+			fmt.Sprintf("user %s confirmed a %s account (subject %s) with the authenticator code; from now on signing in through %s opens the console without the code", user.Username, name, maskSSOSubject(challenge.SSOSubject), name))
+	}
 }
 
 // oidcRedirect redirects to a sanitized landing path carrying a single query
@@ -417,6 +551,7 @@ type oidcProviderView struct {
 	Scopes         []string `json:"scopes,omitempty"`
 	AllowedDomains []string `json:"allowed_domains,omitempty"`
 	Enabled        bool     `json:"enabled"`
+	SkipLocalTOTP  bool     `json:"skip_local_totp"`
 }
 
 func toOIDCProviderView(p model.OIDCProvider) oidcProviderView {
@@ -429,6 +564,7 @@ func toOIDCProviderView(p model.OIDCProvider) oidcProviderView {
 		Scopes:         p.Scopes,
 		AllowedDomains: p.AllowedDomains,
 		Enabled:        p.Enabled,
+		SkipLocalTOTP:  p.SkipLocalTOTP,
 	}
 }
 
@@ -450,10 +586,15 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 		if s.refuseConfinedFleetWrite(w, p, "oidc.provider.upsert", "oidc:admin") {
 			return
 		}
-		var req model.OIDCProvider
-		if !decodeClientJSON(w, r, &req) {
+		var body struct {
+			model.OIDCProvider
+			// StepUpGrant is required only to turn skip_local_totp on.
+			StepUpGrant string `json:"step_up_grant,omitempty"`
+		}
+		if !decodeClientJSON(w, r, &body) {
 			return
 		}
+		req := body.OIDCProvider
 		req.Issuer = strings.TrimRight(strings.TrimSpace(req.Issuer), "/")
 		req.ClientID = strings.TrimSpace(req.ClientID)
 		req.DisplayName = strings.TrimSpace(req.DisplayName)
@@ -478,23 +619,67 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 			req.DisplayName = req.Issuer
 		}
 		now := time.Now().UTC()
+		// The provider-trusted second factor is never inherited from the
+		// stored record: a request that leaves skip_local_totp out turns it
+		// off, the value that keeps the local TOTP step.
+		oldSkipLocalTOTP, oldIssuer := false, ""
 		if req.ID == "" {
 			req.ID = id.New("oidc")
 			req.CreatedAt = now
 		} else if existing, ok := s.store.OIDCProvider(req.ID); ok {
 			req.CreatedAt = existing.CreatedAt
+			oldSkipLocalTOTP, oldIssuer = existing.SkipLocalTOTP, existing.Issuer
 			if req.ClientSecret == "" {
 				req.ClientSecret = existing.ClientSecret // preserve write-only secret
 			}
 		} else {
 			req.CreatedAt = now
 		}
+		enablingSkip := req.SkipLocalTOTP && !oldSkipLocalTOTP
+		// Turning the local second factor off for everyone who signs in through
+		// this provider is a relaxation of sign-in, so it takes what revealing a
+		// secret takes: an interactive session with a fresh step-up. A token
+		// cannot do it; turning it off needs nothing extra.
+		if enablingSkip && !s.stepUpGrantHeld(p, strings.TrimSpace(body.StepUpGrant)) {
+			s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Decision: "deny",
+				Reason: "skip_local_totp turned on without a fresh second-factor step-up", Metadata: map[string]string{"provider": req.ID}})
+			writeError(w, http.StatusForbidden, apiError(apiErrorStepUpRequired,
+				"turning on skip_local_totp requires an interactive session with a fresh second-factor step-up"))
+			return
+		}
+		// Confirmations made before the policy was on do not carry over: each
+		// account confirms its provider account again, under the policy, before
+		// the provider stands in for its code. The store clears them in the same
+		// write that turns the policy on.
 		req.UpdatedAt = now
-		if err := s.store.UpsertOIDCProvider(req); err != nil {
+		cleared := 0
+		if enablingSkip {
+			n, committed, err := s.store.UpsertOIDCProviderClearingConfirmations(req)
+			if !committed {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			if err != nil {
+				s.logger.Printf("oidc provider upsert (%s): %v", req.ID, err)
+			}
+			cleared = n
+		} else if err := s.store.UpsertOIDCProvider(req); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Metadata: map[string]string{"provider": req.ID, "issuer": req.Issuer}})
+		meta := map[string]string{
+			"provider":            req.ID,
+			"issuer":              req.Issuer,
+			"old_skip_local_totp": strconv.FormatBool(oldSkipLocalTOTP),
+			"new_skip_local_totp": strconv.FormatBool(req.SkipLocalTOTP),
+		}
+		if oldIssuer != "" && oldIssuer != req.Issuer {
+			meta["old_issuer"] = oldIssuer
+		}
+		if enablingSkip {
+			meta["confirmations_cleared"] = strconv.Itoa(cleared)
+		}
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Decision: "allow", Metadata: meta})
 		writeJSON(w, http.StatusOK, toOIDCProviderView(req))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -516,11 +701,23 @@ func (s *Server) handleDeleteOIDCProvider(w http.ResponseWriter, r *http.Request
 	if !decodeClientJSON(w, r, &req) {
 		return
 	}
+	prior, _ := s.store.OIDCProvider(req.ID)
 	if err := s.store.DeleteOIDCProvider(req.ID); err != nil {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.delete", Scope: "oidc:admin", Metadata: map[string]string{"provider": req.ID}})
+	// The links outlive the provider record, so a provider created again
+	// under this id would find them. Their confirmations do not outlive it.
+	meta := map[string]string{"provider": req.ID, "skip_local_totp": strconv.FormatBool(prior.SkipLocalTOTP)}
+	cleared, err := s.store.ClearOIDCIdentityConfirmations(req.ID)
+	meta["confirmations_cleared"] = strconv.Itoa(cleared)
+	if err != nil {
+		// The provider is gone either way; the leftover confirmations stay inert
+		// because turning the policy on for a re-created id clears them again.
+		s.logger.Printf("oidc provider delete (%s): clearing confirmations: %v", req.ID, err)
+		meta["clear_failed"] = "true"
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.delete", Scope: "oidc:admin", Metadata: meta})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 

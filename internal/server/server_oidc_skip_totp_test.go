@@ -756,3 +756,43 @@ func TestOIDCDeleteProviderClearsConfirmations(t *testing.T) {
 		t.Fatalf("a deleted provider's links keep no confirmation: %+v ok=%v", link, ok)
 	}
 }
+
+func TestOIDCSkipLocalTOTPPasswordPathNeverConfirmsTheLink(t *testing.T) {
+	f := newSkipTOTPFixture(t, true)
+	user, _ := f.st.User(skipTOTPUserID)
+	hash, err := auth.HashSecret("password-path-only")
+	if err != nil {
+		t.Fatal(err)
+	}
+	user.PasswordHash = hash
+	if err := f.st.UpsertUser(user); err != nil {
+		t.Fatal(err)
+	}
+	// The first SSO sign-in links the subject, unconfirmed, and is abandoned.
+	addr := "198.51.100.29:1000"
+	_, ssoCookie := assertChallenged(t, f.sso(t, addr))
+
+	// The same account then signs in with its password and its code, from the
+	// same browser, still holding the SSO challenge cookie.
+	res := doLoginFrom(t, f.h, "/api/login", `{"username":"`+skipTOTPEmail+`","password":"password-path-only"}`, addr)
+	var login struct {
+		TOTPRequired bool   `json:"totp_required"`
+		ChallengeID  string `json:"challenge_id"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&login); err != nil || !login.TOTPRequired {
+		t.Fatalf("password login must ask for TOTP: %+v %v", login, err)
+	}
+	res.Body.Close()
+	code, _ := auth.TOTPCodeAt(skipTOTPSecret, time.Now().UTC())
+	if rec := f.answerChallenge(t, addr, login.ChallengeID, "code", code, ssoCookie); rec.Code != http.StatusOK {
+		t.Fatalf("password-path second factor: %d %s", rec.Code, rec.Body.String())
+	}
+	if link, _ := f.st.OIDCIdentity(skipTOTPProvider, skipTOTPSubject); !link.SecondFactorAt.IsZero() {
+		t.Fatal("a password-path second factor must not confirm a provider link")
+	}
+	if auditCount(f.st, "login.oidc.second_factor_confirmed") != 0 {
+		t.Fatal("no confirmation may be audited for the password path")
+	}
+	// The link is still unconfirmed, so the provider sign-in still asks.
+	assertChallenged(t, f.sso(t, "198.51.100.30:1000"))
+}

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -207,7 +208,7 @@ func TestUpsertOIDCProviderSettlingLinksClearsConfirmations(t *testing.T) {
 		}
 	}
 	p.SkipLocalTOTP = true
-	changes, committed, err := s.UpsertOIDCProviderSettlingLinks(p, true)
+	changes, committed, err := s.UpsertOIDCProviderSettlingLinks(p, true, nil)
 	if err != nil || !committed || changes.ConfirmationsCleared != 2 || changes.LinksRemoved != 0 {
 		t.Fatalf("upsert clearing: changes=%+v committed=%v err=%v", changes, committed, err)
 	}
@@ -252,7 +253,7 @@ func TestUpsertOIDCProviderSettlingLinksRemovesOtherIssuers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	changes, committed, err := s.UpsertOIDCProviderSettlingLinks(model.OIDCProvider{ID: "g", Issuer: "https://new.example", ClientID: "cid", Enabled: true, CreatedAt: at}, false)
+	changes, committed, err := s.UpsertOIDCProviderSettlingLinks(model.OIDCProvider{ID: "g", Issuer: "https://new.example", ClientID: "cid", Enabled: true, CreatedAt: at}, false, nil)
 	if err != nil || !committed || changes.LinksRemoved != 2 || changes.ConfirmationsCleared != 0 {
 		t.Fatalf("settle: changes=%+v committed=%v err=%v", changes, committed, err)
 	}
@@ -273,5 +274,39 @@ func TestUpsertOIDCProviderSettlingLinksRemovesOtherIssuers(t *testing.T) {
 	}
 	if p, ok := s2.OIDCProvider("g"); !ok || p.Issuer != "https://new.example" {
 		t.Fatalf("provider after restart: %+v ok=%v", p, ok)
+	}
+}
+
+// A guard sees the record about to be replaced under the store lock, and its
+// refusal leaves the provider and its links as they were.
+func TestUpsertOIDCProviderSettlingLinksGuard(t *testing.T) {
+	s, _ := OpenWithCipher("", nil)
+	at := time.Date(2026, 10, 18, 7, 0, 0, 0, time.UTC)
+	if err := s.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: "https://old.example", ClientID: "cid", Enabled: true, CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: "https://old.example", Subject: "s1", UserID: "u1", CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	refused := errors.New("changed meanwhile")
+	var seen *model.OIDCProvider
+	_, committed, err := s.UpsertOIDCProviderSettlingLinks(model.OIDCProvider{ID: "g", Issuer: "https://new.example", ClientID: "cid", Enabled: true, CreatedAt: at}, false,
+		func(current *model.OIDCProvider) error { seen = current; return refused })
+	if !errors.Is(err, refused) || committed {
+		t.Fatalf("a guard refusal must refuse the write: committed=%v err=%v", committed, err)
+	}
+	if seen == nil || seen.Issuer != "https://old.example" {
+		t.Fatalf("the guard must see the record about to be replaced: %+v", seen)
+	}
+	if p, _ := s.OIDCProvider("g"); p.Issuer != "https://old.example" {
+		t.Fatalf("a refused write must leave the provider: %+v", p)
+	}
+	if _, ok := s.OIDCIdentity("g", "s1"); !ok {
+		t.Fatal("a refused write must leave the links")
+	}
+	var created *model.OIDCProvider = &model.OIDCProvider{}
+	if _, committed, err := s.UpsertOIDCProviderSettlingLinks(model.OIDCProvider{ID: "new", Issuer: "https://x.example", ClientID: "c", CreatedAt: at}, false,
+		func(current *model.OIDCProvider) error { created = current; return nil }); err != nil || !committed || created != nil {
+		t.Fatalf("a new provider's guard sees nil and the write goes through: committed=%v err=%v current=%+v", committed, err, created)
 	}
 }

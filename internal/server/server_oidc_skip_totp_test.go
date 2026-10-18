@@ -424,15 +424,23 @@ func TestOIDCSkipLocalTOTPNotifiesWhenAnAccountBecomesTrusted(t *testing.T) {
 		if rec := f.answerChallenge(t, addr, challengeID, "code", code, cookie); rec.Code != http.StatusOK {
 			t.Fatalf("skip=%v: second factor: %d", skip, rec.Code)
 		}
+		// The first sign-in also linked the subject by email, which is
+		// notified on its own; count the trust notifications.
+		var trusted []string
+		for _, n := range sent {
+			if strings.HasPrefix(n, "Single sign-on account trusted for sign-in") {
+				trusted = append(trusted, n)
+			}
+		}
 		want := 0
 		if skip {
 			want = 1
 		}
-		if len(sent) != want {
-			t.Fatalf("skip=%v: notifications = %q, want %d", skip, sent, want)
+		if len(trusted) != want {
+			t.Fatalf("skip=%v: trust notifications = %q, want %d", skip, trusted, want)
 		}
-		if skip && (!strings.Contains(sent[0], skipTOTPEmail) || strings.Contains(sent[0], skipTOTPSubject)) {
-			t.Fatalf("the notification names the account and masks the subject: %q", sent[0])
+		if skip && (!strings.Contains(trusted[0], skipTOTPEmail) || strings.Contains(trusted[0], skipTOTPSubject)) {
+			t.Fatalf("the notification names the account and masks the subject: %q", trusted[0])
 		}
 		var confirmed *model.AuditEvent
 		for _, ev := range f.st.AuditEvents() {

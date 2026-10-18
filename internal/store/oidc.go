@@ -27,7 +27,7 @@ func oidcIdentityKey(providerID, subject string) string {
 // does (UpsertOIDCProviderSettlingLinks without clearing confirmations), so
 // no caller can store a provider that its links from another issuer outlive.
 func (s *Store) UpsertOIDCProvider(p model.OIDCProvider) error {
-	_, _, err := s.UpsertOIDCProviderSettlingLinks(p, false)
+	_, _, err := s.UpsertOIDCProviderSettlingLinks(p, false, nil)
 	return err
 }
 
@@ -156,10 +156,21 @@ type OIDCLinkChanges struct {
 // links that stay is forgotten (the write that turns skip_local_totp on). One
 // write, so nothing can land between the provider change and the links it
 // invalidates. It returns what changed and whether the write is live; a live
-// write may still report a persistence error.
-func (s *Store) UpsertOIDCProviderSettlingLinks(p model.OIDCProvider, clearConfirmations bool) (OIDCLinkChanges, bool, error) {
+// write may still report a persistence error. guard, when set, sees the
+// record about to be replaced (nil for a new provider) under the store lock;
+// an error from it refuses the write and is returned as is.
+func (s *Store) UpsertOIDCProviderSettlingLinks(p model.OIDCProvider, clearConfirmations bool, guard func(current *model.OIDCProvider) error) (OIDCLinkChanges, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if guard != nil {
+		var current *model.OIDCProvider
+		if existing, ok := s.state.OIDCProviders[p.ID]; ok {
+			current = &existing
+		}
+		if err := guard(current); err != nil {
+			return OIDCLinkChanges{}, false, err
+		}
+	}
 	var changes OIDCLinkChanges
 	identities := maps.Clone(s.state.OIDCIdentities)
 	for k, idn := range identities {

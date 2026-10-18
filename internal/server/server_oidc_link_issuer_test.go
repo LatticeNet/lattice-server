@@ -129,7 +129,7 @@ func TestOIDCIssuerChangeRemovesTheOldIssuersLinks(t *testing.T) {
 		}
 	}
 	cookie, csrf := adminLogin(t, h)
-	if rec := adminPOST(t, h, "/api/auth/oidc/providers", `{"id":"g","issuer":"`+newIssuer+`","client_id":"cid","enabled":true}`, cookie, csrf); rec.Code != http.StatusOK {
+	if rec := adminPOST(t, h, "/api/auth/oidc/providers", `{"id":"g","issuer":"`+newIssuer+`","client_id":"cid","enabled":true,"step_up_grant":"`+adminStepUp(t, srv, st, cookie)+`"}`, cookie, csrf); rec.Code != http.StatusOK {
 		t.Fatalf("repoint: %d %s", rec.Code, rec.Body.String())
 	}
 	for _, sub := range []string{"s1", "s2"} {
@@ -272,7 +272,7 @@ func TestOIDCProviderRecreatedUnderAnotherIssuerFindsNoLinks(t *testing.T) {
 	if _, ok := st.OIDCIdentity("g", "s1"); !ok {
 		t.Fatal("deleting a provider keeps its links (a re-created provider under the same issuer finds them)")
 	}
-	if rec := adminPOST(t, h, "/api/auth/oidc/providers", `{"id":"g","issuer":"https://idp.new.example","client_id":"cid","enabled":true}`, cookie, csrf); rec.Code != http.StatusOK {
+	if rec := adminPOST(t, h, "/api/auth/oidc/providers", `{"id":"g","issuer":"https://idp.new.example","client_id":"cid","enabled":true,"step_up_grant":"`+adminStepUp(t, srv, st, cookie)+`"}`, cookie, csrf); rec.Code != http.StatusOK {
 		t.Fatalf("re-create: %d %s", rec.Code, rec.Body.String())
 	}
 	if _, ok := st.OIDCIdentity("g", "s1"); ok {

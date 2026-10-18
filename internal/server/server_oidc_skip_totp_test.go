@@ -334,12 +334,36 @@ func TestOIDCSkipLocalTOTPReadsThePolicyAfterTheExchange(t *testing.T) {
 	assertChallenged(t, f.sso(t, "198.51.100.24:1000"))
 }
 
+func TestOIDCSkipLocalTOTPIssuerFlippedDuringTheExchangeLendsNoTrust(t *testing.T) {
+	f := newSkipTOTPFixture(t, true)
+	// The account confirmed its subject at the real issuer G. Someone holding
+	// oidc:admin pointed the provider at their own IdP (the mock), started a
+	// sign-in presenting that subject, and points the provider back at G
+	// while their IdP holds the token response.
+	const realIssuer = "https://accounts.google.com"
+	if err := f.st.PutOIDCIdentity(model.OIDCIdentity{ProviderID: skipTOTPProvider, Issuer: realIssuer, Subject: skipTOTPSubject, UserID: skipTOTPUserID,
+		CreatedAt: time.Now().UTC(), SecondFactorAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	f.idp.onToken = func() {
+		p, _ := f.st.OIDCProvider(skipTOTPProvider)
+		p.Issuer = realIssuer
+		if err := f.st.UpsertOIDCProvider(p); err != nil {
+			t.Error(err)
+		}
+	}
+	assertChallenged(t, f.sso(t, "198.51.100.28:1000"))
+	if auditCount(f.st, "login.oidc.totp_skipped") != 0 {
+		t.Fatal("claims verified against one issuer must not borrow another's trust")
+	}
+}
+
 func TestSSOVouchesForSecondFactorNeedsEveryCondition(t *testing.T) {
 	f := newSkipTOTPFixture(t, true)
 	f.confirmLink(t, skipTOTPSubject, 0)
 	provider, _ := f.st.OIDCProvider(skipTOTPProvider)
 	user, _ := f.st.User(skipTOTPUserID)
-	if !f.srv.ssoVouchesForSecondFactor(provider, skipTOTPSubject, user) {
+	if !f.srv.ssoVouchesForSecondFactor(provider, provider, skipTOTPSubject, user) {
 		t.Fatal("the fixture should vouch, or the cases below prove nothing")
 	}
 	disabled := provider
@@ -348,32 +372,38 @@ func TestSSOVouchesForSecondFactorNeedsEveryCondition(t *testing.T) {
 	flagOff.SkipLocalTOTP = false
 	repointed := provider
 	repointed.Issuer = "https://idp.attacker.example"
+	otherClient := provider
+	otherClient.ClientID = "another-client"
 	otherUser := user
 	otherUser.ID = "u-other"
 	laterEpoch := user
 	laterEpoch.SecurityEpoch = 1
 	cases := []struct {
-		name     string
-		provider model.OIDCProvider
-		subject  string
-		user     model.User
+		name              string
+		verified, current model.OIDCProvider
+		subject           string
+		user              model.User
 	}{
-		{"disabled provider", disabled, skipTOTPSubject, user},
-		{"policy off", flagOff, skipTOTPSubject, user},
-		{"provider repointed at another issuer", repointed, skipTOTPSubject, user},
-		{"unknown subject", provider, "sub-unknown", user},
-		{"link names another user", provider, skipTOTPSubject, otherUser},
-		{"security epoch moved on", provider, skipTOTPSubject, laterEpoch},
+		{"disabled provider", disabled, disabled, skipTOTPSubject, user},
+		{"policy off", flagOff, flagOff, skipTOTPSubject, user},
+		{"disabled after the exchange", provider, disabled, skipTOTPSubject, user},
+		{"policy off after the exchange", provider, flagOff, skipTOTPSubject, user},
+		{"provider repointed at another issuer", repointed, repointed, skipTOTPSubject, user},
+		{"claims from another issuer, record pointed back", repointed, provider, skipTOTPSubject, user},
+		{"client changed during the exchange", otherClient, provider, skipTOTPSubject, user},
+		{"unknown subject", provider, provider, "sub-unknown", user},
+		{"link names another user", provider, provider, skipTOTPSubject, otherUser},
+		{"security epoch moved on", provider, provider, skipTOTPSubject, laterEpoch},
 	}
 	for _, tc := range cases {
-		if f.srv.ssoVouchesForSecondFactor(tc.provider, tc.subject, tc.user) {
+		if f.srv.ssoVouchesForSecondFactor(tc.verified, tc.current, tc.subject, tc.user) {
 			t.Errorf("%s: must not vouch", tc.name)
 		}
 	}
 	if err := f.st.PutOIDCIdentity(model.OIDCIdentity{ProviderID: skipTOTPProvider, Issuer: f.idp.server.URL, Subject: skipTOTPSubject, UserID: skipTOTPUserID, CreatedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
-	if f.srv.ssoVouchesForSecondFactor(provider, skipTOTPSubject, user) {
+	if f.srv.ssoVouchesForSecondFactor(provider, provider, skipTOTPSubject, user) {
 		t.Error("an unconfirmed link must not vouch")
 	}
 }

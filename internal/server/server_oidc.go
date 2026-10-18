@@ -382,7 +382,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	// current security epoch; see ssoVouchesForSecondFactor. The policy is
 	// read again here, after the code exchange's round trip to the provider,
 	// so a flag turned off or a provider disabled meanwhile is honoured.
-	if current, ok := s.store.OIDCProvider(provider.ID); ok && user.TOTPEnabled && s.ssoVouchesForSecondFactor(current, claims.Subject, user) {
+	if current, ok := s.store.OIDCProvider(provider.ID); ok && user.TOTPEnabled && s.ssoVouchesForSecondFactor(provider, current, claims.Subject, user) {
 		if _, err := s.startSessionAudited(w, r, user, model.AuditEvent{
 			Action: "login.oidc.totp_skipped",
 			Reason: "local second factor skipped by provider policy",
@@ -445,25 +445,34 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, oidc.SanitizeRedirect(st.RedirectAfter), http.StatusFound)
 }
 
-// ssoVouchesForSecondFactor reports whether a sign-in through provider as
-// subject may stand in for user's local TOTP. All of these must hold: the
-// provider is enabled and carries SkipLocalTOTP; the subject is linked to this
-// user under the provider's current issuer; and the link was confirmed by
-// completing the local TOTP code in a sign-in from this subject
-// (confirmSSOSecondFactor) while the user's security epoch was what it is now.
-// The confirmation keeps the trust on the provider account the operator proved
-// once, not on whatever account the provider says has the same verified email:
-// a first sign-in links by email match, and that link is written before the
-// TOTP step, so a link alone proves nothing. Subjects are unique only per
-// issuer, so repointing the provider at another issuer withdraws the trust. A
-// password change, 2FA disable or session revoke bumps the epoch and with it
-// withdraws the trust until the next confirmed sign-in.
-func (s *Server) ssoVouchesForSecondFactor(provider model.OIDCProvider, subject string, user model.User) bool {
-	if !provider.Enabled || !provider.SkipLocalTOTP {
+// ssoVouchesForSecondFactor reports whether a sign-in through a provider as
+// subject may stand in for user's local TOTP. verified is the provider record
+// the claims were verified against (read before the code exchange); current
+// is the same record read again after it. All of these must hold: the current
+// record is enabled and carries SkipLocalTOTP; it still names the issuer and
+// client the claims were verified with, so a provider repointed and pointed
+// back while the exchange was in flight does not lend one issuer's claims the
+// other's trust; the subject is linked to this user under that issuer; and
+// the link was confirmed by completing the local TOTP code in a sign-in from
+// this subject (confirmSSOSecondFactor) while the user's security epoch was
+// what it is now.
+//
+// The confirmation keeps the trust on the provider account the operator
+// proved once, not on whatever account the provider says has the same
+// verified email: a first sign-in links by email match, and that link is
+// written before the TOTP step, so a link alone proves nothing. Subjects are
+// unique only per issuer, so repointing the provider at another issuer
+// withdraws the trust. A password change, 2FA disable or session revoke bumps
+// the epoch and with it withdraws the trust until the next confirmed sign-in.
+func (s *Server) ssoVouchesForSecondFactor(verified, current model.OIDCProvider, subject string, user model.User) bool {
+	if !current.Enabled || !current.SkipLocalTOTP {
 		return false
 	}
-	link, ok := s.store.OIDCIdentity(provider.ID, subject)
-	return ok && link.UserID == user.ID && link.Issuer == provider.Issuer &&
+	if current.ID != verified.ID || current.Issuer != verified.Issuer || current.ClientID != verified.ClientID {
+		return false
+	}
+	link, ok := s.store.OIDCIdentity(verified.ID, subject)
+	return ok && link.UserID == user.ID && link.Issuer == verified.Issuer &&
 		!link.SecondFactorAt.IsZero() && link.SecondFactorEpoch == user.SecurityEpoch
 }
 
@@ -482,8 +491,9 @@ func (s *Server) confirmSSOSecondFactor(r *http.Request, challenge auth.TOTPChal
 	prior, ok, err := s.store.ConfirmOIDCIdentitySecondFactor(challenge.SSOProviderID, challenge.SSOIssuer, challenge.SSOSubject, user.ID, s.now(), user.SecurityEpoch)
 	if err != nil {
 		s.logger.Printf("oidc second-factor confirmation (%s): %v", challenge.SSOProviderID, err)
-		return
 	}
+	// ok means the confirmation is live, even when persisting it reported an
+	// error after the write landed; it is audited either way.
 	if !ok {
 		return
 	}
@@ -639,19 +649,21 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 		}
 		// Confirmations made before the policy was on do not carry over: each
 		// account confirms its provider account again, under the policy, before
-		// the provider stands in for its code. Cleared before the policy is
-		// stored, so no earlier confirmation is honoured in between.
+		// the provider stands in for its code. The store clears them in the same
+		// write that turns the policy on.
+		req.UpdatedAt = now
 		cleared := 0
 		if enablingSkip {
-			n, err := s.store.ClearOIDCIdentityConfirmations(req.ID)
-			if err != nil {
+			n, committed, err := s.store.UpsertOIDCProviderClearingConfirmations(req)
+			if !committed {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
+			if err != nil {
+				s.logger.Printf("oidc provider upsert (%s): %v", req.ID, err)
+			}
 			cleared = n
-		}
-		req.UpdatedAt = now
-		if err := s.store.UpsertOIDCProvider(req); err != nil {
+		} else if err := s.store.UpsertOIDCProvider(req); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -696,15 +708,16 @@ func (s *Server) handleDeleteOIDCProvider(w http.ResponseWriter, r *http.Request
 	}
 	// The links outlive the provider record, so a provider created again
 	// under this id would find them. Their confirmations do not outlive it.
+	meta := map[string]string{"provider": req.ID, "skip_local_totp": strconv.FormatBool(prior.SkipLocalTOTP)}
 	cleared, err := s.store.ClearOIDCIdentityConfirmations(req.ID)
+	meta["confirmations_cleared"] = strconv.Itoa(cleared)
 	if err != nil {
+		// The provider is gone either way; the leftover confirmations stay inert
+		// because turning the policy on for a re-created id clears them again.
 		s.logger.Printf("oidc provider delete (%s): clearing confirmations: %v", req.ID, err)
+		meta["clear_failed"] = "true"
 	}
-	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.delete", Scope: "oidc:admin", Metadata: map[string]string{
-		"provider":              req.ID,
-		"skip_local_totp":       strconv.FormatBool(prior.SkipLocalTOTP),
-		"confirmations_cleared": strconv.Itoa(cleared),
-	}})
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.delete", Scope: "oidc:admin", Metadata: meta})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 }
 

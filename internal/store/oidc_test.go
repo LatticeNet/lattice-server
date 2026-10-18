@@ -175,3 +175,48 @@ func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 		t.Fatalf("a second clear has nothing to do: n=%d err=%v", n, err)
 	}
 }
+
+// Turning the policy on stores the provider and clears its links'
+// confirmations in one write, and the provider's client secret stays
+// encrypted at rest on that path too.
+func TestUpsertOIDCProviderClearingConfirmations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	c := testCipher(t)
+	s, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 18, 7, 0, 0, 0, time.UTC)
+	const secret = "super-secret-oauth-client-value"
+	p := model.OIDCProvider{ID: "g", Issuer: "https://accounts.google.com", ClientID: "cid", ClientSecret: secret, Enabled: true, CreatedAt: at}
+	if err := s.UpsertOIDCProvider(p); err != nil {
+		t.Fatal(err)
+	}
+	for _, sub := range []string{"sub-1", "sub-2"} {
+		if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: p.Issuer, Subject: sub, UserID: "u1", CreatedAt: at, SecondFactorAt: at, SecondFactorEpoch: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.SkipLocalTOTP = true
+	n, committed, err := s.UpsertOIDCProviderClearingConfirmations(p)
+	if err != nil || !committed || n != 2 {
+		t.Fatalf("upsert clearing: n=%d committed=%v err=%v", n, committed, err)
+	}
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), secret) {
+		t.Fatal("oidc client secret leaked to disk in plaintext")
+	}
+	s2, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := s2.OIDCProvider("g")
+	if !ok || !got.SkipLocalTOTP || got.ClientSecret != secret {
+		t.Fatalf("provider after restart: skip=%v secret recovered=%v ok=%v", got.SkipLocalTOTP, got.ClientSecret == secret, ok)
+	}
+	for _, sub := range []string{"sub-1", "sub-2"} {
+		if idn, _ := s2.OIDCIdentity("g", sub); !idn.SecondFactorAt.IsZero() || idn.SecondFactorEpoch != 0 {
+			t.Fatalf("%s kept its confirmation: %+v", sub, idn)
+		}
+	}
+}

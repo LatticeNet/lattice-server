@@ -123,7 +123,47 @@ func (s *Store) ConfirmOIDCIdentitySecondFactor(providerID, issuer, subject, use
 func (s *Store) ClearOIDCIdentityConfirmations(providerID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := maps.Clone(s.state.OIDCIdentities)
+	next, n := clearedOIDCConfirmations(s.state.OIDCIdentities, providerID)
+	if n == 0 {
+		return 0, nil
+	}
+	staged := s.state
+	staged.OIDCIdentities = next
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if !committed {
+		return 0, err
+	}
+	s.state = staged
+	return n, err
+}
+
+// UpsertOIDCProviderClearingConfirmations stores p and, in the same write,
+// forgets every second-factor confirmation on its links: the write that turns
+// skip_local_totp on, so no confirmation made before the policy can be
+// honoured under it, not even one landing between two writes. It returns how
+// many confirmations it cleared and whether the write is live; a live write
+// may still report a persistence error.
+func (s *Store) UpsertOIDCProviderClearingConfirmations(p model.OIDCProvider) (int, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	identities, n := clearedOIDCConfirmations(s.state.OIDCIdentities, p.ID)
+	providers := maps.Clone(s.state.OIDCProviders)
+	providers[p.ID] = p
+	staged := s.state
+	staged.OIDCIdentities = identities
+	staged.OIDCProviders = providers
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if !committed {
+		return 0, false, err
+	}
+	s.state = staged
+	return n, true, err
+}
+
+// clearedOIDCConfirmations returns a copy of identities with the confirmations
+// of providerID's links cleared, and how many it cleared.
+func clearedOIDCConfirmations(identities map[string]model.OIDCIdentity, providerID string) (map[string]model.OIDCIdentity, int) {
+	next := maps.Clone(identities)
 	n := 0
 	for k, idn := range next {
 		if idn.ProviderID != providerID || (idn.SecondFactorAt.IsZero() && idn.SecondFactorEpoch == 0) {
@@ -133,19 +173,7 @@ func (s *Store) ClearOIDCIdentityConfirmations(providerID string) (int, error) {
 		next[k] = idn
 		n++
 	}
-	if n == 0 {
-		return 0, nil
-	}
-	staged := s.state
-	staged.OIDCIdentities = next
-	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
-	if committed {
-		s.state = staged
-	}
-	if !committed {
-		return 0, err
-	}
-	return n, err
+	return next, n
 }
 
 // DeleteOIDCIdentitiesByUser removes every durable subject→user link bound to

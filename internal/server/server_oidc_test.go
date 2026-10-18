@@ -36,6 +36,9 @@ type mockIDP struct {
 	emailVerified bool
 	nonce         string // set by the test after /start
 	clientID      string
+	// onToken, when set, runs as the token endpoint answers: the moment
+	// between the provider round trip and the callback's next step.
+	onToken func()
 }
 
 func newMockIDP(t *testing.T) *mockIDP {
@@ -67,6 +70,9 @@ func newMockIDP(t *testing.T) *mockIDP {
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		idp.mu.Lock()
 		defer idp.mu.Unlock()
+		if idp.onToken != nil {
+			idp.onToken()
+		}
 		now := time.Now().Unix()
 		claims := map[string]any{
 			"iss":            idp.server.URL,
@@ -414,6 +420,7 @@ func TestPendingSecondFactorNamesNobodyWithoutAValidSSOChallenge(t *testing.T) {
 	st.UpsertUser(model.User{ID: "u-plain", Username: "plain@example.com"})
 	ip := srv.clientIP(httptest.NewRequest(http.MethodGet, "/", nil))
 
+	const secret = "binding-secret"
 	put := func(userID string, ttl time.Duration, sso bool) string {
 		t.Helper()
 		c, err := auth.NewTOTPChallenge(userID, ip, ttl)
@@ -422,15 +429,19 @@ func TestPendingSecondFactorNamesNobodyWithoutAValidSSOChallenge(t *testing.T) {
 		}
 		if sso {
 			c.SSOProviderID, c.SSOEmail, c.SSOSubject = "g", "twofa@example.com", "sub-2fa"
+			c.SSOBindingHash = auth.HashBindingToken(secret)
 		}
 		if err := st.PutTOTPChallenge(c); err != nil {
 			t.Fatal(err)
 		}
-		return totpChallengeCookie + "=" + c.ID
+		return totpChallengeCookie + "=" + ssoChallengeCookieValue(c.ID, secret)
 	}
 	valid := put("u-2fa", 5*time.Minute, true)
 	passwordPath := put("u-2fa", 5*time.Minute, false)
 	without2FA := put("u-plain", 5*time.Minute, true)
+	// The id alone is what an observer of the redirect URL has.
+	idOnly, _, _ := strings.Cut(valid, ".")
+	wrongSecret := idOnly + ".another-secret"
 	// Last, because every put sweeps the challenges that are no longer active.
 	expired := put("u-2fa", -time.Minute, true)
 
@@ -443,6 +454,8 @@ func TestPendingSecondFactorNamesNobodyWithoutAValidSSOChallenge(t *testing.T) {
 		{"password-path challenge", passwordPath, ""},
 		{"user without 2fa", without2FA, ""},
 		{"another network", valid, "203.0.113.9:4000"},
+		{"challenge id without its secret", idOnly, ""},
+		{"wrong secret", wrongSecret, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

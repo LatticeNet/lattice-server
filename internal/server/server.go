@@ -2543,13 +2543,15 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, errors.New("invalid or expired challenge"))
 		return
 	}
-	// If this challenge was issued by the SSO→2FA continuation it carries a
-	// browser-binding cookie; require it to match the submitted challenge id so
-	// only the browser that completed SSO can finish the second factor. Absent
-	// cookie = the password→2FA path, which is unaffected. [C14]
+	// A challenge the SSO→2FA continuation issued is answered only by the
+	// browser that completed SSO: its cookie must carry this challenge id and
+	// the binding secret the callback set (ssoChallengeFromCookie). The id
+	// alone travels in the redirect URL and is not enough. A password-path
+	// challenge has no cookie and ignores a stale one. [C14]
 	ssoBrowser := false
-	if c, err := r.Cookie(totpChallengeCookie); err == nil && c.Value != "" {
-		if subtle.ConstantTimeCompare([]byte(c.Value), []byte(req.ChallengeID)) != 1 {
+	if challenge.SSOProviderID != "" {
+		held, ok := s.ssoChallengeFromCookie(r)
+		if !ok || subtle.ConstantTimeCompare([]byte(held.ID), []byte(challenge.ID)) != 1 {
 			writeError(w, http.StatusUnauthorized, errors.New("invalid or expired challenge"))
 			return
 		}
@@ -2613,7 +2615,10 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 	if usedRecovery {
 		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.totp.recovery_used", Decision: "allow"})
 	}
-	if ssoBrowser {
+	// A recovery code finishes the sign-in but confirms no provider link: it
+	// is a static, single-use fallback, and the trust a provider may later
+	// stand in for is the authenticator itself.
+	if ssoBrowser && !usedRecovery {
 		s.confirmSSOSecondFactor(r, challenge, user)
 	}
 	s.clearTOTPChallengeCookie(w)

@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"maps"
 	"sort"
 	"time"
 
@@ -87,27 +88,64 @@ func (s *Store) PutOIDCIdentity(idn model.OIDCIdentity) error {
 }
 
 // ConfirmOIDCIdentitySecondFactor records that userID completed its local
-// second factor in a sign-in that started at this provider subject, in the
-// given security epoch. It changes only an existing link that still names
-// userID, so it can neither create a link nor resurrect one deleted with its
-// user; it reports whether it changed one.
-func (s *Store) ConfirmOIDCIdentitySecondFactor(providerID, subject, userID string, at time.Time, epoch uint64) (bool, error) {
+// second factor in a sign-in that started at this provider subject, under the
+// given issuer and security epoch. It changes only an existing link that still
+// names userID, so it can neither create a link nor resurrect one deleted with
+// its user. It returns the link as it was before and whether it changed one.
+// The link takes the issuer the sign-in saw, which is what a later skip
+// compares with the provider's.
+func (s *Store) ConfirmOIDCIdentitySecondFactor(providerID, issuer, subject, userID string, at time.Time, epoch uint64) (model.OIDCIdentity, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := oidcIdentityKey(providerID, subject)
-	idn, ok := s.state.OIDCIdentities[key]
-	if !ok || idn.UserID != userID {
-		return false, nil
+	prior, ok := s.state.OIDCIdentities[key]
+	if !ok || prior.UserID != userID {
+		return model.OIDCIdentity{}, false, nil
 	}
-	prior := idn
+	idn := prior
+	idn.Issuer = issuer
 	idn.SecondFactorAt = at.UTC()
 	idn.SecondFactorEpoch = epoch
-	s.state.OIDCIdentities[key] = idn
-	if err := s.Save(); err != nil {
-		s.state.OIDCIdentities[key] = prior
-		return false, err
+	staged := s.state
+	staged.OIDCIdentities = maps.Clone(s.state.OIDCIdentities)
+	staged.OIDCIdentities[key] = idn
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
 	}
-	return true, nil
+	return prior, committed, err
+}
+
+// ClearOIDCIdentityConfirmations forgets every second-factor confirmation on
+// the links of one provider, so none of them may stand in for the local TOTP
+// step until it is confirmed again. The links themselves stay. It returns how
+// many confirmations it cleared.
+func (s *Store) ClearOIDCIdentityConfirmations(providerID string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := maps.Clone(s.state.OIDCIdentities)
+	n := 0
+	for k, idn := range next {
+		if idn.ProviderID != providerID || (idn.SecondFactorAt.IsZero() && idn.SecondFactorEpoch == 0) {
+			continue
+		}
+		idn.SecondFactorAt, idn.SecondFactorEpoch = time.Time{}, 0
+		next[k] = idn
+		n++
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	staged := s.state
+	staged.OIDCIdentities = next
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	if !committed {
+		return 0, err
+	}
+	return n, err
 }
 
 // DeleteOIDCIdentitiesByUser removes every durable subject→user link bound to

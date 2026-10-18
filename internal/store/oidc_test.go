@@ -115,8 +115,9 @@ func TestOIDCAuthStateSingleUseAndExpiry(t *testing.T) {
 }
 
 // A link's second-factor confirmation changes only a link that exists and
-// still names the account, and survives a restart together with the
-// provider's skip_local_totp policy.
+// still names the account, takes the issuer the sign-in saw, survives a
+// restart together with the provider's skip_local_totp policy, and is
+// cleared per provider without touching the link.
 func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	c := testCipher(t)
@@ -125,23 +126,28 @@ func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	at := time.Date(2026, 10, 18, 7, 0, 0, 0, time.UTC)
-	if ok, err := s.ConfirmOIDCIdentitySecondFactor("g", "sub-1", "u1", at, 2); err != nil || ok {
+	const issuer = "https://accounts.google.com"
+	if _, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u1", at, 2); err != nil || ok {
 		t.Fatalf("confirming a missing link must change nothing: ok=%v err=%v", ok, err)
 	}
 	if _, ok := s.OIDCIdentity("g", "sub-1"); ok {
 		t.Fatal("confirmation must not create a link")
 	}
-	if err := s.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: "https://accounts.google.com", ClientID: "cid", Enabled: true, SkipLocalTOTP: true, CreatedAt: at}); err != nil {
+	if err := s.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: issuer, ClientID: "cid", Enabled: true, SkipLocalTOTP: true, CreatedAt: at}); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Subject: "sub-1", UserID: "u1", CreatedAt: at}); err != nil {
+	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: "https://old.example", Subject: "sub-1", UserID: "u1", CreatedAt: at}); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := s.ConfirmOIDCIdentitySecondFactor("g", "sub-1", "u2", at, 2); err != nil || ok {
+	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "other", Issuer: "https://other.example", Subject: "sub-1", UserID: "u1", CreatedAt: at, SecondFactorAt: at, SecondFactorEpoch: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u2", at, 2); err != nil || ok {
 		t.Fatalf("confirming for another account must change nothing: ok=%v err=%v", ok, err)
 	}
-	if ok, err := s.ConfirmOIDCIdentitySecondFactor("g", "sub-1", "u1", at, 2); err != nil || !ok {
-		t.Fatalf("confirm: ok=%v err=%v", ok, err)
+	prior, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u1", at, 2)
+	if err != nil || !ok || !prior.SecondFactorAt.IsZero() || prior.Issuer != "https://old.example" {
+		t.Fatalf("confirm: prior=%+v ok=%v err=%v", prior, ok, err)
 	}
 
 	s2, err := OpenWithCipher(path, c)
@@ -149,10 +155,23 @@ func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, ok := s2.OIDCIdentity("g", "sub-1")
-	if !ok || !got.SecondFactorAt.Equal(at) || got.SecondFactorEpoch != 2 || got.UserID != "u1" {
+	if !ok || !got.SecondFactorAt.Equal(at) || got.SecondFactorEpoch != 2 || got.UserID != "u1" || got.Issuer != issuer {
 		t.Fatalf("confirmation lost across a restart: %+v ok=%v", got, ok)
 	}
 	if p, ok := s2.OIDCProvider("g"); !ok || !p.SkipLocalTOTP {
 		t.Fatalf("skip_local_totp lost across a restart: %+v ok=%v", p, ok)
+	}
+
+	if n, err := s2.ClearOIDCIdentityConfirmations("g"); err != nil || n != 1 {
+		t.Fatalf("clear: n=%d err=%v", n, err)
+	}
+	if got, ok := s2.OIDCIdentity("g", "sub-1"); !ok || !got.SecondFactorAt.IsZero() || got.SecondFactorEpoch != 0 || got.UserID != "u1" {
+		t.Fatalf("clearing must keep the link and drop only its confirmation: %+v ok=%v", got, ok)
+	}
+	if got, _ := s2.OIDCIdentity("other", "sub-1"); got.SecondFactorAt.IsZero() {
+		t.Fatal("clearing one provider must not touch another's confirmations")
+	}
+	if n, err := s2.ClearOIDCIdentityConfirmations("g"); err != nil || n != 0 {
+		t.Fatalf("a second clear has nothing to do: n=%d err=%v", n, err)
 	}
 }

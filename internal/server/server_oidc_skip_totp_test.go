@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -262,20 +263,174 @@ func TestOIDCSkipLocalTOTPConfirmsFirstLinkWithTheLocalFactorOnce(t *testing.T) 
 	assertSkipped(t, f.sso(t, "198.51.100.13:1000"))
 }
 
+// answerChallenge posts a code (or, with recovery, a recovery code) for an
+// SSO-issued challenge from addr, with the given cookie when not nil.
+func (f *skipTOTPFixture) answerChallenge(t *testing.T, addr, challengeID, field, value string, cookie *http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/login/totp", strings.NewReader(`{"challenge_id":"`+challengeID+`","`+field+`":"`+value+`"}`))
+	req.RemoteAddr = addr
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
+	rec := httptest.NewRecorder()
+	f.h.ServeHTTP(rec, req)
+	return rec
+}
+
 func TestOIDCSkipLocalTOTPConfirmationOnlyFromTheSSOBrowser(t *testing.T) {
 	f := newSkipTOTPFixture(t, true)
 	addr := "198.51.100.14:1000"
-	challengeID, _ := assertChallenged(t, f.sso(t, addr))
-
-	// The challenge id travels in the redirect URL; answering it without the
-	// browser-binding cookie must not confirm the link.
+	challengeID, cookie := assertChallenged(t, f.sso(t, addr))
 	code, _ := auth.TOTPCodeAt(skipTOTPSecret, time.Now().UTC())
-	req := httptest.NewRequest(http.MethodPost, "/api/login/totp", strings.NewReader(`{"challenge_id":"`+challengeID+`","code":"`+code+`"}`))
-	req.RemoteAddr = addr
-	rec := httptest.NewRecorder()
-	f.h.ServeHTTP(rec, req)
-	if link, ok := f.st.OIDCIdentity(skipTOTPProvider, skipTOTPSubject); ok && !link.SecondFactorAt.IsZero() {
-		t.Fatalf("a challenge answered without its cookie confirmed the link (status %d)", rec.Code)
+
+	// The challenge id travels in the redirect URL. Neither leaving the cookie
+	// out nor forging one from the id answers the challenge.
+	if rec := f.answerChallenge(t, addr, challengeID, "code", code, nil); rec.Code != http.StatusUnauthorized || cookieNamed(rec, "lattice_session") != nil {
+		t.Fatalf("an SSO challenge answered without its cookie: got %d, want 401 and no session", rec.Code)
+	}
+	forged := &http.Cookie{Name: totpChallengeCookie, Value: challengeID}
+	if rec := f.answerChallenge(t, addr, challengeID, "code", code, forged); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("an SSO challenge answered with a cookie forged from its id: got %d, want 401", rec.Code)
+	}
+	if link, _ := f.st.OIDCIdentity(skipTOTPProvider, skipTOTPSubject); !link.SecondFactorAt.IsZero() {
+		t.Fatal("a refused answer confirmed the link")
+	}
+	// The real cookie still works, so the refusals above were for their stated reason.
+	if rec := f.answerChallenge(t, addr, challengeID, "code", code, cookie); rec.Code != http.StatusOK {
+		t.Fatalf("the SSO browser's answer: got %d, want 200", rec.Code)
+	}
+}
+
+func TestOIDCSkipLocalTOTPRecoveryCodeDoesNotConfirm(t *testing.T) {
+	f := newSkipTOTPFixture(t, true)
+	user, _ := f.st.User(skipTOTPUserID)
+	user.RecoveryCodeHashes = []string{auth.HashRecoveryCode("recovery-one")}
+	if err := f.st.UpsertUser(user); err != nil {
+		t.Fatal(err)
+	}
+	addr := "198.51.100.22:1000"
+	challengeID, cookie := assertChallenged(t, f.sso(t, addr))
+	if rec := f.answerChallenge(t, addr, challengeID, "recovery_code", "recovery-one", cookie); rec.Code != http.StatusOK || cookieNamed(rec, "lattice_session") == nil {
+		t.Fatalf("a recovery code still finishes the sign-in: got %d", rec.Code)
+	}
+	if link, _ := f.st.OIDCIdentity(skipTOTPProvider, skipTOTPSubject); !link.SecondFactorAt.IsZero() {
+		t.Fatal("a recovery code must not confirm the provider link")
+	}
+	assertChallenged(t, f.sso(t, "198.51.100.23:1000"))
+}
+
+func TestOIDCSkipLocalTOTPReadsThePolicyAfterTheExchange(t *testing.T) {
+	f := newSkipTOTPFixture(t, true)
+	f.confirmLink(t, skipTOTPSubject, 0)
+	// The operator turns the policy off while the callback is talking to the
+	// provider.
+	f.idp.onToken = func() {
+		p, _ := f.st.OIDCProvider(skipTOTPProvider)
+		p.SkipLocalTOTP = false
+		if err := f.st.UpsertOIDCProvider(p); err != nil {
+			t.Error(err)
+		}
+	}
+	assertChallenged(t, f.sso(t, "198.51.100.24:1000"))
+}
+
+func TestSSOVouchesForSecondFactorNeedsEveryCondition(t *testing.T) {
+	f := newSkipTOTPFixture(t, true)
+	f.confirmLink(t, skipTOTPSubject, 0)
+	provider, _ := f.st.OIDCProvider(skipTOTPProvider)
+	user, _ := f.st.User(skipTOTPUserID)
+	if !f.srv.ssoVouchesForSecondFactor(provider, skipTOTPSubject, user) {
+		t.Fatal("the fixture should vouch, or the cases below prove nothing")
+	}
+	disabled := provider
+	disabled.Enabled = false
+	flagOff := provider
+	flagOff.SkipLocalTOTP = false
+	repointed := provider
+	repointed.Issuer = "https://idp.attacker.example"
+	otherUser := user
+	otherUser.ID = "u-other"
+	laterEpoch := user
+	laterEpoch.SecurityEpoch = 1
+	cases := []struct {
+		name     string
+		provider model.OIDCProvider
+		subject  string
+		user     model.User
+	}{
+		{"disabled provider", disabled, skipTOTPSubject, user},
+		{"policy off", flagOff, skipTOTPSubject, user},
+		{"provider repointed at another issuer", repointed, skipTOTPSubject, user},
+		{"unknown subject", provider, "sub-unknown", user},
+		{"link names another user", provider, skipTOTPSubject, otherUser},
+		{"security epoch moved on", provider, skipTOTPSubject, laterEpoch},
+	}
+	for _, tc := range cases {
+		if f.srv.ssoVouchesForSecondFactor(tc.provider, tc.subject, tc.user) {
+			t.Errorf("%s: must not vouch", tc.name)
+		}
+	}
+	if err := f.st.PutOIDCIdentity(model.OIDCIdentity{ProviderID: skipTOTPProvider, Issuer: f.idp.server.URL, Subject: skipTOTPSubject, UserID: skipTOTPUserID, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if f.srv.ssoVouchesForSecondFactor(provider, skipTOTPSubject, user) {
+		t.Error("an unconfirmed link must not vouch")
+	}
+}
+
+func TestOIDCSkipLocalTOTPNotifiesWhenAnAccountBecomesTrusted(t *testing.T) {
+	for _, skip := range []bool{true, false} {
+		f := newSkipTOTPFixture(t, skip)
+		var sent []string
+		f.srv.emitNotify = func(title, body string) { sent = append(sent, title+": "+body) }
+		addr := "198.51.100.25:1000"
+		challengeID, cookie := assertChallenged(t, f.sso(t, addr))
+		code, _ := auth.TOTPCodeAt(skipTOTPSecret, time.Now().UTC())
+		if rec := f.answerChallenge(t, addr, challengeID, "code", code, cookie); rec.Code != http.StatusOK {
+			t.Fatalf("skip=%v: second factor: %d", skip, rec.Code)
+		}
+		want := 0
+		if skip {
+			want = 1
+		}
+		if len(sent) != want {
+			t.Fatalf("skip=%v: notifications = %q, want %d", skip, sent, want)
+		}
+		if skip && (!strings.Contains(sent[0], skipTOTPEmail) || strings.Contains(sent[0], skipTOTPSubject)) {
+			t.Fatalf("the notification names the account and masks the subject: %q", sent[0])
+		}
+		var confirmed *model.AuditEvent
+		for _, ev := range f.st.AuditEvents() {
+			if ev.Action == "login.oidc.second_factor_confirmed" {
+				ev := ev
+				confirmed = &ev
+			}
+		}
+		if confirmed == nil || confirmed.Metadata["newly_trusted"] != strconv.FormatBool(skip) || confirmed.Metadata["subject"] != maskSSOSubject(skipTOTPSubject) {
+			t.Fatalf("skip=%v: confirmation audit: %+v", skip, confirmed)
+		}
+	}
+}
+
+func TestPasswordTOTPIgnoresAStaleSSOChallengeCookie(t *testing.T) {
+	f := newSkipTOTPFixture(t, false)
+	addr := "198.51.100.26:1000"
+	_, ssoCookie := assertChallenged(t, f.sso(t, addr))
+
+	// The operator abandons the SSO step and signs in with the password.
+	admin, _ := f.st.UserByUsername("admin")
+	admin.TOTPEnabled, admin.TOTPSecret = true, skipTOTPSecret
+	if err := f.st.UpsertUser(admin); err != nil {
+		t.Fatal(err)
+	}
+	required, challengeID, _ := passwordLogin(t, f.h, addr)
+	if !required {
+		t.Fatal("password login must ask for TOTP")
+	}
+	code, _ := auth.TOTPCodeAt(skipTOTPSecret, time.Now().UTC())
+	rec := f.answerChallenge(t, addr, challengeID, "code", code, ssoCookie)
+	if rec.Code != http.StatusOK || cookieNamed(rec, "lattice_session") == nil {
+		t.Fatalf("a leftover SSO cookie must not block the password path's second factor: %d %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -437,13 +592,38 @@ func TestRequireTOTPPolicyStillForcesEnrollmentAfterSkipProvider(t *testing.T) {
 	}
 }
 
+// adminStepUp mints a step-up grant for the admin session in cookie, as the
+// TOTP or passkey step-up endpoint would after a fresh second factor.
+func adminStepUp(t *testing.T, srv *Server, st *store.Store, cookie string) string {
+	t.Helper()
+	admin, ok := st.UserByUsername("admin")
+	if !ok {
+		t.Fatal("admin missing")
+	}
+	sessionID := strings.TrimPrefix(cookie, "lattice_session=")
+	grant, _, err := srv.issueStepUpGrant(principal{Principal: rbac.Principal{ActorID: admin.ID}, sessionID: sessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return grant
+}
+
 func TestOIDCAdminProviderSkipLocalTOTPRoundTripAndAudit(t *testing.T) {
 	srv, st := newOIDCServer(t)
 	h := srv.Handler()
 	cookie, csrf := adminLogin(t, h)
 
-	rec := adminPOST(t, h, "/api/auth/oidc/providers",
-		`{"display_name":"G","issuer":"https://accounts.google.com","client_id":"cid","enabled":true,"skip_local_totp":true}`, cookie, csrf)
+	const create = `{"display_name":"G","issuer":"https://accounts.google.com","client_id":"cid","enabled":true,"skip_local_totp":true`
+	// Turning it on asks for a fresh step-up.
+	rec := adminPOST(t, h, "/api/auth/oidc/providers", create+`}`, cookie, csrf)
+	var refused model.APIErrorResponse
+	if rec.Code != http.StatusForbidden || json.Unmarshal(rec.Body.Bytes(), &refused) != nil || refused.Error.Code != apiErrorStepUpRequired {
+		t.Fatalf("turning skip_local_totp on without step-up: %d %s", rec.Code, rec.Body.String())
+	}
+	if len(st.OIDCProviders()) != 0 {
+		t.Fatal("a refused create must store nothing")
+	}
+	rec = adminPOST(t, h, "/api/auth/oidc/providers", create+`,"step_up_grant":"`+adminStepUp(t, srv, st, cookie)+`"}`, cookie, csrf)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
 	}
@@ -458,7 +638,8 @@ func TestOIDCAdminProviderSkipLocalTOTPRoundTripAndAudit(t *testing.T) {
 		t.Fatal("skip_local_totp was not stored")
 	}
 
-	// An update that leaves the field out turns it off: the safe value.
+	// An update that leaves the field out turns it off, the safe value, and
+	// needs no step-up.
 	rec = adminPOST(t, h, "/api/auth/oidc/providers",
 		`{"id":"`+created.ID+`","issuer":"https://accounts.google.com","client_id":"cid","enabled":true}`, cookie, csrf)
 	if rec.Code != http.StatusOK {
@@ -479,12 +660,69 @@ func TestOIDCAdminProviderSkipLocalTOTPRoundTripAndAudit(t *testing.T) {
 	// AuditEvents lists newest first; compare as a set of (old, new) pairs.
 	changes := map[[2]string]int{}
 	for _, ev := range st.AuditEvents() {
-		if ev.Action == "oidc.provider.upsert" && ev.Metadata["provider"] == created.ID {
+		if ev.Action == "oidc.provider.upsert" && ev.Decision == "allow" && ev.Metadata["provider"] == created.ID {
 			changes[[2]string{ev.Metadata["old_skip_local_totp"], ev.Metadata["new_skip_local_totp"]}]++
 		}
 	}
 	want := map[[2]string]int{{"false", "true"}: 1, {"true", "false"}: 1}
 	if len(changes) != len(want) || changes[[2]string{"false", "true"}] != 1 || changes[[2]string{"true", "false"}] != 1 {
 		t.Fatalf("upsert audits must carry old and new skip_local_totp, got %v want %v", changes, want)
+	}
+}
+
+func TestOIDCSkipLocalTOTPTurningOnClearsEarlierConfirmations(t *testing.T) {
+	srv, st := newOIDCServer(t)
+	h := srv.Handler()
+	const issuer = "https://accounts.google.com"
+	if err := st.UpsertOIDCProvider(model.OIDCProvider{ID: skipTOTPProvider, Issuer: issuer, ClientID: "cid", Enabled: true, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	// Confirmed while the policy was off, for example months before.
+	if err := st.PutOIDCIdentity(model.OIDCIdentity{ProviderID: skipTOTPProvider, Issuer: issuer, Subject: skipTOTPSubject, UserID: skipTOTPUserID,
+		CreatedAt: time.Now().UTC(), SecondFactorAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	cookie, csrf := adminLogin(t, h)
+	body := `{"id":"` + skipTOTPProvider + `","issuer":"` + issuer + `","client_id":"cid","enabled":true,"skip_local_totp":true,"step_up_grant":"` +
+		adminStepUp(t, srv, st, cookie) + `"}`
+	if rec := adminPOST(t, h, "/api/auth/oidc/providers", body, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("turn on: %d %s", rec.Code, rec.Body.String())
+	}
+	if link, ok := st.OIDCIdentity(skipTOTPProvider, skipTOTPSubject); !ok || !link.SecondFactorAt.IsZero() {
+		t.Fatalf("turning the policy on must clear confirmations made before it and keep the link: %+v ok=%v", link, ok)
+	}
+	cleared := ""
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "oidc.provider.upsert" && ev.Decision == "allow" {
+			cleared = ev.Metadata["confirmations_cleared"]
+		}
+	}
+	if cleared != "1" {
+		t.Fatalf("the upsert audit must say how many confirmations it cleared, got %q", cleared)
+	}
+}
+
+func TestOIDCSkipLocalTOTPBearerTokenCannotTurnItOn(t *testing.T) {
+	srv, st := newOIDCServer(t)
+	h := srv.Handler()
+	cookies, csrf := loginSession(t, h)
+	token := createPAT(t, h, cookies, csrf, []string{"oidc:admin"}, nil)
+	res := doBearerJSON(t, h, http.MethodPost, "/api/auth/oidc/providers",
+		`{"issuer":"https://accounts.google.com","client_id":"cid","enabled":true,"skip_local_totp":true,"step_up_grant":"anything"}`, token)
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusForbidden || len(st.OIDCProviders()) != 0 {
+		t.Fatalf("a token turning skip_local_totp on: got %d, providers=%d", res.StatusCode, len(st.OIDCProviders()))
+	}
+}
+
+func TestOIDCDeleteProviderClearsConfirmations(t *testing.T) {
+	f := newSkipTOTPFixture(t, true)
+	f.confirmLink(t, skipTOTPSubject, 0)
+	cookie, csrf := adminLogin(t, f.h)
+	if rec := adminPOST(t, f.h, "/api/auth/oidc/providers/delete", `{"id":"`+skipTOTPProvider+`"}`, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+	if link, ok := f.st.OIDCIdentity(skipTOTPProvider, skipTOTPSubject); !ok || !link.SecondFactorAt.IsZero() {
+		t.Fatalf("a deleted provider's links keep no confirmation: %+v ok=%v", link, ok)
 	}
 }

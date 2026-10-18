@@ -432,6 +432,16 @@ fi
 # only; nothing in them is evaluated.
 artifact="lattice-agent-${os}-${arch}"
 platform="$os/$arch"
+# Both go into the release URL, which is split on spaces with the sources, so
+# a space or another character a URL path does not need would add a source.
+case "$repo" in
+  */*/*|/*|*/|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/-]*) die "LATTICE_AGENT_REPO must be owner/repo: $repo" ;;
+  */*) ;;
+  *) die "LATTICE_AGENT_REPO must be owner/repo: $repo" ;;
+esac
+case "$version" in
+  ""|.*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-]*) die "LATTICE_AGENT_VERSION must be latest or a release tag: $version" ;;
+esac
 if [ "$version" = "latest" ]; then
   base="https://github.com/${repo}/releases/latest/download"
 else
@@ -564,7 +574,16 @@ else die "need curl or wget to download the agent"; fi
 # binary is about 14 MiB. XFSZ is ignored so the overrun is a write error, not
 # a core dump.
 # yagni: a fixed cap; raise it if the agent binary ever nears 64 MiB.
-fetch_capped() { ( trap '' XFSZ; ulimit -f 131072 2>/dev/null || true; fetch "$@" ); }
+# A shell that cannot set the cap fetches a release anyway, as before, but
+# skips a mirror, which is optional and the one source the cap is for.
+fetch_capped() {
+  ( trap '' XFSZ
+    if ! ulimit -f 131072 2>/dev/null && [ "$1" = m ]; then
+      log "skipping mirror $3: this shell cannot cap the download's size"
+      exit 1
+    fi
+    fetch "$@" )
+}
 
 # checksum tool (sha256sum on Linux, shasum on macOS/BSD, sha256 on FreeBSD)
 if have sha256sum; then sha256_file() { sha256sum "$1" | awk '{ print $1 }'; }

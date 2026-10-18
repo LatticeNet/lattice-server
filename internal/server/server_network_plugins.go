@@ -240,16 +240,24 @@ func (s *Server) netGuardFirewallRPC(ctx context.Context, method string, request
 }
 
 type wireGuardNetworkView struct {
-	NodeID        string    `json:"node_id"`
-	Name          string    `json:"name"`
-	Address       string    `json:"address,omitempty"`
-	PublicKey     string    `json:"public_key,omitempty"`
-	Endpoint      string    `json:"endpoint,omitempty"`
-	ListenPort    int       `json:"listen_port,omitempty"`
-	PublicIP      string    `json:"public_ip,omitempty"`
+	NodeID     string `json:"node_id"`
+	Name       string `json:"name"`
+	Address    string `json:"address,omitempty"`
+	PublicKey  string `json:"public_key,omitempty"`
+	Endpoint   string `json:"endpoint,omitempty"`
+	ListenPort int    `json:"listen_port,omitempty"`
+	PublicIP   string `json:"public_ip,omitempty"`
+	// Status is the agent's liveness in the node status words: disabled,
+	// never_reported, offline or online, by deriveNodeStatus's precedence and
+	// offline threshold, so a never-reported node is told from an offline one
+	// without reading a time. It never says degraded: that evidence (sing-box
+	// liveness, guard reality, agent loop health) is not about the mesh and
+	// this view carries no reason to explain it, so a node in contact reads
+	// online. Online stays for plugin UIs that predate Status.
+	Status        string    `json:"status"`
 	Online        bool      `json:"online"`
 	Disabled      bool      `json:"disabled,omitempty"`
-	LastSeen      time.Time `json:"last_seen,omitempty"`
+	LastSeen      time.Time `json:"last_seen,omitzero"`
 	Configuration string    `json:"configuration"`
 }
 
@@ -261,6 +269,7 @@ func (s *Server) wireGuardNetworksRPC(ctx context.Context, method string, reques
 			return nil, err
 		}
 		rows := make([]wireGuardNetworkView, 0)
+		now := s.now()
 		for _, node := range s.store.Nodes() {
 			if !rbac.Allows(p.Principal, "wireguard:read", node.ID) {
 				continue
@@ -276,6 +285,7 @@ func (s *Server) wireGuardNetworksRPC(ctx context.Context, method string, reques
 				NodeID: node.ID, Name: node.Name, Address: node.WireGuardIP,
 				PublicKey: node.WireGuardPublicKey, Endpoint: node.WireGuardEndpoint,
 				ListenPort: node.WireGuardPort, PublicIP: node.PublicIP,
+				Status: deriveNodeStatus(node, now, s.store.NodeLastSeenSlack(node.ID), nil).Status,
 				Online: node.Online, Disabled: node.Disabled, LastSeen: node.LastSeen,
 				Configuration: configuration,
 			})

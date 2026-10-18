@@ -203,22 +203,14 @@ func TestCreateAndUpdateAnswerWithTheStoredTimes(t *testing.T) {
 	assertAbsentKeys(t, "a policy nothing has planned or applied", policy, "last_planned_at", "last_applied_at")
 }
 
-// zeroTimeOmitemptyAllowed are the value time.Time members of the API views
-// that keep omitempty on purpose. omitempty never omits a time.Time, so on
-// any other member it is a bug that ships year 1.
-var zeroTimeOmitemptyAllowed = map[string]string{
-	// The wireguard plugin UI tells a never-reported node from an offline one
-	// only by this view's year 1, and the view carries no status to read
-	// instead. It moves when the view gains one and that UI reads it.
-	"wireGuardNetworkView.LastSeen": "wireguard plugin UI reads the zero time as never reported",
-}
-
 // TestNoViewTimeIsOmitempty reads the source of the packages whose types the
 // API serves and fails on any value time.Time tagged omitempty without
-// omitzero, so the next optional instant cannot reintroduce the leak.
+// omitzero, so the next optional instant cannot reintroduce the leak. It has
+// no exceptions: omitempty never omits a time.Time, so on any member it is a
+// bug that ships year 1. A reader that needs to tell "never" from "not
+// recently" gets a status word for it, as wireGuardNetworkView.Status does.
 func TestNoViewTimeIsOmitempty(t *testing.T) {
 	fset := token.NewFileSet()
-	seen := map[string]bool{}
 	for _, dir := range []string{".", "../plugin", "../metricsdb"} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -256,21 +248,12 @@ func TestNoViewTimeIsOmitempty(t *testing.T) {
 						continue
 					}
 					for _, fieldName := range field.Names {
-						member := spec.Name.Name + "." + fieldName.Name
-						seen[member] = true
-						if zeroTimeOmitemptyAllowed[member] == "" {
-							t.Errorf("%s (%s): omitempty never omits a time.Time, so an unset value ships as year 1; tag it omitzero",
-								member, fset.Position(field.Pos()))
-						}
+						t.Errorf("%s.%s (%s): omitempty never omits a time.Time, so an unset value ships as year 1; tag it omitzero",
+							spec.Name.Name, fieldName.Name, fset.Position(field.Pos()))
 					}
 				}
 				return true
 			})
-		}
-	}
-	for member := range zeroTimeOmitemptyAllowed {
-		if !seen[member] {
-			t.Errorf("zeroTimeOmitemptyAllowed names %s, which is no longer an omitempty time.Time; drop the entry", member)
 		}
 	}
 }

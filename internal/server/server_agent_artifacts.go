@@ -421,11 +421,11 @@ func (s *Server) requireFleetAgentAdmin(w http.ResponseWriter, p principal) bool
 		Action:        "agent.artifact.authorize",
 		Scope:         "node:admin",
 		Decision:      "deny",
-		Reason:        "agent release artifacts are fleet-wide; a node-restricted principal may not publish them",
+		Reason:        "agent releases and download mirrors are fleet-wide; a node-restricted principal may not change them",
 		CorrelationID: p.CorrelationID,
 	})
 	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied,
-		"agent release artifacts are fleet-wide; this token is restricted to specific nodes"))
+		"agent releases and download mirrors are fleet-wide; this token is restricted to specific nodes"))
 	return false
 }
 

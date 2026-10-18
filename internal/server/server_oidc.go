@@ -342,17 +342,31 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existingUserID := ""
+	// The link is judged against provider, the record the claims were just
+	// verified with, so it answers only for the issuer it was created under.
+	var existing *model.OIDCIdentity
 	if link, ok := s.store.OIDCIdentity(provider.ID, claims.Subject); ok {
-		existingUserID = link.UserID
+		existing = &link
 	}
-	res, err := oidc.ResolveIdentity(provider, claims, existingUserID, func(email string) (string, bool) {
+	res, err := oidc.ResolveIdentity(provider, claims, existing, func(email string) (string, bool) {
 		u, ok := s.store.UserByUsername(email)
 		if !ok {
 			return "", false
 		}
 		return u.ID, true
 	})
+	if existing != nil && existing.Issuer != provider.Issuer {
+		// A subject linked under another issuer was presented by this one:
+		// what a provider repointed at someone else's IdP looks like.
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: existing.UserID, Action: "login.oidc.stale_link_ignored", Decision: "observe",
+			Reason: "identity link recorded under another issuer",
+			Metadata: map[string]string{
+				"provider":        provider.ID,
+				"link_issuer":     existing.Issuer,
+				"provider_issuer": provider.Issuer,
+				"subject":         maskSSOSubject(claims.Subject),
+			}})
+	}
 	if err != nil {
 		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), Action: "login.oidc", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"provider": provider.ID, "sub": claims.Subject}})
 		s.oidcFail(w, r, st.RedirectAfter, "denied", "")
@@ -647,25 +661,21 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 				"turning on skip_local_totp requires an interactive session with a fresh second-factor step-up"))
 			return
 		}
-		// Confirmations made before the policy was on do not carry over: each
-		// account confirms its provider account again, under the policy, before
-		// the provider stands in for its code. The store clears them in the same
-		// write that turns the policy on.
+		// One store write stores the provider and settles its links. Links
+		// recorded under any other issuer are removed: they could never answer
+		// for this one (oidc.ResolveIdentity), and a provider pointed back
+		// later must not find them waiting. And confirmations made before the
+		// policy was on do not carry over: each account confirms its provider
+		// account again, under the policy, before the provider stands in for
+		// its code.
 		req.UpdatedAt = now
-		cleared := 0
-		if enablingSkip {
-			n, committed, err := s.store.UpsertOIDCProviderClearingConfirmations(req)
-			if !committed {
-				writeError(w, http.StatusInternalServerError, err)
-				return
-			}
-			if err != nil {
-				s.logger.Printf("oidc provider upsert (%s): %v", req.ID, err)
-			}
-			cleared = n
-		} else if err := s.store.UpsertOIDCProvider(req); err != nil {
+		changes, committed, err := s.store.UpsertOIDCProviderSettlingLinks(req, enablingSkip)
+		if !committed {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if err != nil {
+			s.logger.Printf("oidc provider upsert (%s): %v", req.ID, err)
 		}
 		meta := map[string]string{
 			"provider":            req.ID,
@@ -673,11 +683,15 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 			"old_skip_local_totp": strconv.FormatBool(oldSkipLocalTOTP),
 			"new_skip_local_totp": strconv.FormatBool(req.SkipLocalTOTP),
 		}
-		if oldIssuer != "" && oldIssuer != req.Issuer {
+		issuerChanged := oldIssuer != "" && oldIssuer != req.Issuer
+		if issuerChanged {
 			meta["old_issuer"] = oldIssuer
 		}
+		if issuerChanged || changes.LinksRemoved > 0 {
+			meta["links_removed"] = strconv.Itoa(changes.LinksRemoved)
+		}
 		if enablingSkip {
-			meta["confirmations_cleared"] = strconv.Itoa(cleared)
+			meta["confirmations_cleared"] = strconv.Itoa(changes.ConfirmationsCleared)
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Decision: "allow", Metadata: meta})
 		writeJSON(w, http.StatusOK, toOIDCProviderView(req))

@@ -11,13 +11,13 @@ bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222  lattice-agent-
 `
 
 func TestRenderAgentInstallScript(t *testing.T) {
-	out, err := renderAgentInstallScript("LatticeNet/lattice-node-agent", "0.3.8", "v0.3.8", testSums)
+	out, err := renderAgentInstallScript("LatticeNet/lattice-node-agent", "0.3.8", "v0.3.8", testSums, []string{"https://dl.example.org/agents"})
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
 	for _, want := range []string{
 		"VERSION='0.3.8'",
-		"https://github.com/LatticeNet/lattice-node-agent/releases/download/v0.3.8",
+		"SOURCES='m=https://dl.example.org/agents r=https://github.com/LatticeNet/lattice-node-agent/releases/download/v0.3.8'",
 		"linux/amd64 lattice-agent-linux-amd64 aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111",
 		"darwin/arm64 lattice-agent-darwin-arm64 bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
 	} {
@@ -64,7 +64,7 @@ func TestAgentInstallScriptIsValidPOSIXShell(t *testing.T) {
 	if err != nil {
 		t.Skip("no sh available")
 	}
-	out, err := renderAgentInstallScript("LatticeNet/lattice-node-agent", "0.3.8", "v0.3.8", testSums)
+	out, err := renderAgentInstallScript("LatticeNet/lattice-node-agent", "0.3.8", "v0.3.8", testSums, []string{"https://dl.example.org"})
 	if err != nil {
 		t.Fatalf("render: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestAgentInstallScriptIsValidPOSIXShell(t *testing.T) {
 }
 
 func TestRenderAgentInstallScriptRefusesAReleaseWithNoChecksums(t *testing.T) {
-	if _, err := renderAgentInstallScript("r", "0.3.8", "v0.3.8", "unrelated content\n"); err == nil {
+	if _, err := renderAgentInstallScript("r", "0.3.8", "v0.3.8", "unrelated content\n", nil); err == nil {
 		t.Fatalf("a release with no usable checksum must be an error, not an unverified script")
 	}
 }

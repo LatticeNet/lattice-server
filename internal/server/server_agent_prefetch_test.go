@@ -524,6 +524,9 @@ func TestAgentPrefetchFetchesThePlanThatRunsNext(t *testing.T) {
 	}
 	other := sha256.Sum256([]byte("a newer binary"))
 	payload.SHA256 = hex.EncodeToString(other[:])
+	// A hand-built plan for other bytes, in the shape plans had before
+	// source lists, which name the pinned bytes.
+	payload.Sources, payload.ChunkManifest = nil, nil
 	newer := f.approval
 	newer.ID, newer.Status, newer.CreatedAt = id.New("approval"), model.ApprovalPending, f.approval.CreatedAt.Add(time.Minute)
 	newer.Action = agentUpdateApprovalAction(payload)

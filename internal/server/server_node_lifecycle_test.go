@@ -94,9 +94,12 @@ func TestNodeEnrollResponseUsesPublicURL(t *testing.T) {
 	if out.AgentVersion != agentInstallerRef {
 		t.Fatalf("agent_version = %q, want the pinned release %s", out.AgentVersion, agentInstallerRef)
 	}
+	// A server with a public HTTPS URL hands out the installer it carries,
+	// and the release as the binary's source.
 	for _, want := range []string{
-		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/" + agentInstallerRef + "/scripts/install.sh'",
+		"curl -fsSL --proto '=https' --tlsv1.2 'https://lattice.example.com" + agentInstallerPath + "'",
 		"LATTICE_AGENT_VERSION='" + agentInstallerRef + "'",
+		"LATTICE_AGENT_SOURCES='r=https://github.com/LatticeNet/lattice-node-agent/releases/download/" + agentInstallerRef + "'",
 		"LATTICE_SERVER='https://lattice.example.com'",
 		"LATTICE_NODE_ID='node-a'",
 		"LATTICE_NODE_TOKEN='" + out.Token + "'",
@@ -138,7 +141,7 @@ func TestNodeReconfigureCommandSourcesCanonicalAndLegacyEnv(t *testing.T) {
 		t.Fatalf("agent_version = %q, want the pinned release %s", out.AgentVersion, agentInstallerRef)
 	}
 	for _, want := range []string{
-		"curl -fsSL --proto '=https' --tlsv1.2 'https://raw.githubusercontent.com/LatticeNet/lattice-node-agent/" + agentInstallerRef + "/scripts/install.sh'",
+		"curl -fsSL --proto '=https' --tlsv1.2 'https://lattice.example.com" + agentInstallerPath + "'",
 		"LATTICE_AGENT_VERSION='" + agentInstallerRef + "'",
 		"for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env",
 		"LATTICE_NODE_ID='node-a'",

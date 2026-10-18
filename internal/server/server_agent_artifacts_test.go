@@ -430,6 +430,7 @@ func TestAgentUpdateApplyScriptSendsTheLeaseOnlyToTheControlPlane(t *testing.T) 
 	payload.BinarySource = agentBinarySourceUpstream
 	payload.BinaryURL = "https://downloads.example.com/lattice-agent-linux-amd64"
 	payload.FallbackURL = ""
+	payload.Sources = []model.AgentUpdateSource{{Kind: model.AgentSourceKindUpstream, URL: payload.BinaryURL, Reason: "the URL the update policy pins"}}
 	approval.Action = agentUpdateApprovalAction(payload)
 	upstreamScript, err := agentUpdateApplyScript(approval, artifactTestPublicURL)
 	if err != nil {

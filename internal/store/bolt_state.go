@@ -267,6 +267,60 @@ func readBoltBeacon(tx *bolt.Tx) (*BeaconRegistry, error) {
 	return &reg, nil
 }
 
+// boltKeyAgentMirrors and boltKeyAgentArtifactManifests hold the agent
+// mirror registry and the chunk manifests in the meta bucket, so the offline
+// migrate round trip keeps both.
+var (
+	boltKeyAgentMirrors           = []byte("agent_mirrors")
+	boltKeyAgentArtifactManifests = []byte("agent_artifact_manifests")
+)
+
+func putBoltAgentMirrors(tx *bolt.Tx, reg *AgentMirrorRegistry, manifests map[string]AgentArtifactManifest) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if reg == nil {
+		if err := meta.Delete(boltKeyAgentMirrors); err != nil {
+			return err
+		}
+	} else {
+		raw, err := json.Marshal(reg)
+		if err != nil {
+			return err
+		}
+		if err := meta.Put(boltKeyAgentMirrors, raw); err != nil {
+			return err
+		}
+	}
+	if len(manifests) == 0 {
+		return meta.Delete(boltKeyAgentArtifactManifests)
+	}
+	raw, err := json.Marshal(manifests)
+	if err != nil {
+		return err
+	}
+	return meta.Put(boltKeyAgentArtifactManifests, raw)
+}
+
+func readBoltAgentMirrors(tx *bolt.Tx, manifests map[string]AgentArtifactManifest) (*AgentMirrorRegistry, error) {
+	meta := tx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return nil, nil
+	}
+	if raw := meta.Get(boltKeyAgentArtifactManifests); len(raw) > 0 {
+		if err := json.Unmarshal(raw, &manifests); err != nil {
+			return nil, fmt.Errorf("decode agent artifact manifests: %w", err)
+		}
+	}
+	raw := meta.Get(boltKeyAgentMirrors)
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var reg AgentMirrorRegistry
+	if err := json.Unmarshal(raw, &reg); err != nil {
+		return nil, fmt.Errorf("decode agent mirrors: %w", err)
+	}
+	return &reg, nil
+}
+
 var boltStateBuckets = [][]byte{
 	boltBucketUsers,
 	boltBucketTokens,
@@ -586,6 +640,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putBoltBeacon(tx, persist.Beacon); err != nil {
 			return err
 		}
+		if err := putBoltAgentMirrors(tx, persist.AgentMirrors, persist.AgentArtifactManifests); err != nil {
+			return err
+		}
 		if err := putBoltEvidenceSettings(tx, persist.EvidenceSettings); err != nil {
 			return err
 		}
@@ -861,6 +918,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		st.Beacon = beacon
+		if st.AgentMirrors, err = readBoltAgentMirrors(tx, st.AgentArtifactManifests); err != nil {
+			return err
+		}
 		evidence, err := readBoltEvidenceSettings(tx)
 		if err != nil {
 			return err

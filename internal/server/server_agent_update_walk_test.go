@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -106,6 +107,13 @@ func walkScript(t *testing.T, approval model.Approval, mutate func(p *agentUpdat
 	}
 	if mutate != nil {
 		mutate(&payload)
+		// A shape a test builds by hand is one no plan with a source list
+		// takes. Without mirrors the list renders exactly the walk an
+		// approval planned before it renders, so the test keeps its meaning
+		// with the list dropped.
+		if !slices.ContainsFunc(payload.Sources, func(src model.AgentUpdateSource) bool { return src.Kind == model.AgentSourceKindMirror }) {
+			payload.Sources, payload.ChunkManifest = nil, nil
+		}
 		approval.Action = agentUpdateApprovalAction(payload)
 	}
 	script, err := agentUpdateApplyScript(approval, artifactTestPublicURL)
@@ -136,6 +144,10 @@ type walkRun struct {
 	cpURL, fbURL     string
 	cpBody, fbBody   []byte
 	cpSteps, fbSteps string
+	// m1 and m2 are two mirror sources, answered like the others.
+	m1URL, m2URL     string
+	m1Body, m2Body   []byte
+	m1Steps, m2Steps string
 	// clock is "" for the stub clock, which starts at 1000 and moves only
 	// when a stub fetch or sleep says so, "no-epoch" for a date that prints
 	// %s literally, and "host" for the host's date and sleep.
@@ -148,6 +160,11 @@ type walkRun struct {
 	serviceMissing bool
 	noSystemd      bool
 	env            []string
+	// without leaves these host tools out of PATH.
+	without []string
+	// fileLimit, when set, runs the script under that file-size limit, soft
+	// and hard, as a shell that cannot raise it would.
+	fileLimit int
 }
 
 type walkOutcome struct {
@@ -192,6 +209,8 @@ printf '%s %s\n' "$name" "$*" >>"$STUB_CALLS"
 case "$last" in
   "$STUB_CP_URL") src=cp; body=$STUB_CP_BODY; steps=$STUB_CP_STEPS ;;
   "$STUB_FB_URL") src=fb; body=$STUB_FB_BODY; steps=$STUB_FB_STEPS ;;
+  "$STUB_M1_URL") src=m1; body=$STUB_M1_BODY; steps=$STUB_M1_STEPS ;;
+  "$STUB_M2_URL") src=m2; body=$STUB_M2_BODY; steps=$STUB_M2_STEPS ;;
   *) echo "stub: unexpected url $last" >&2; exit 97 ;;
 esac
 n=1
@@ -243,7 +262,8 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 	if err := os.WriteFile(clock, []byte("1000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	tools := []string{"cat", "rm", "awk", "sha256sum", "shasum", "dirname", "mkdir", "chmod", "wc", "tail", "head", "sed", "grep", "cp", "mv", "install", "readlink", "true"}
+	tools := []string{"cat", "rm", "awk", "sha256sum", "shasum", "dirname", "mkdir", "chmod", "wc", "tail", "head", "sed", "grep", "cp", "mv", "install", "readlink", "true", "dd", "cut"}
+	tools = slices.DeleteFunc(tools, func(tool string) bool { return slices.Contains(r.without, tool) })
 	if r.real {
 		tools = append(tools, r.fetcher)
 	}
@@ -308,7 +328,8 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 		}
 	}
 	cpBody, fbBody := filepath.Join(dir, "cp-body"), filepath.Join(dir, "fb-body")
-	for path, body := range map[string][]byte{cpBody: r.cpBody, fbBody: r.fbBody} {
+	m1Body, m2Body := filepath.Join(dir, "m1-body"), filepath.Join(dir, "m2-body")
+	for path, body := range map[string][]byte{cpBody: r.cpBody, fbBody: r.fbBody, m1Body: r.m1Body, m2Body: r.m2Body} {
 		if body != nil {
 			if err := os.WriteFile(path, body, 0o600); err != nil {
 				t.Fatal(err)
@@ -333,6 +354,10 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 			lines[i] = "URL=" + shellQuote(r.cpURL)
 		case r.real && strings.HasPrefix(line, "FALLBACK_URL="):
 			lines[i] = "FALLBACK_URL=" + shellQuote(r.fbURL)
+		case r.real && strings.HasPrefix(line, "MIRROR_URL_1="):
+			lines[i] = "MIRROR_URL_1=" + shellQuote(r.m1URL)
+		case r.real && strings.HasPrefix(line, "MIRROR_URL_2="):
+			lines[i] = "MIRROR_URL_2=" + shellQuote(r.m2URL)
 		}
 		for name, value := range r.overrides {
 			if strings.HasPrefix(line, name+"=") {
@@ -347,6 +372,13 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 	}
 
 	cmd := exec.Command("sh", scriptFile)
+	if r.fileLimit > 0 {
+		sh, err := exec.LookPath("sh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd = exec.Command(sh, "-c", fmt.Sprintf("ulimit -f %d && exec %s \"$1\"", r.fileLimit, sh), "sh", scriptFile)
+	}
 	cmd.Dir = dir
 	cmd.Env = []string{
 		"PATH=" + bin,
@@ -361,6 +393,12 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 		"STUB_FB_BODY=" + fbBody,
 		"STUB_CP_STEPS=" + r.cpSteps,
 		"STUB_FB_STEPS=" + r.fbSteps,
+		"STUB_M1_URL=" + r.m1URL,
+		"STUB_M2_URL=" + r.m2URL,
+		"STUB_M1_BODY=" + m1Body,
+		"STUB_M2_BODY=" + m2Body,
+		"STUB_M1_STEPS=" + r.m1Steps,
+		"STUB_M2_STEPS=" + r.m2Steps,
 	}
 	if r.serviceMissing {
 		cmd.Env = append(cmd.Env, "STUB_SERVICE_MISSING=1")
@@ -776,7 +814,12 @@ func TestAgentUpdateTaskResultRecordsTheFetchSummary(t *testing.T) {
 		{"lattice-agent-fetch v1 1:cp:0:1:1 result:0:done\nlattice-agent-fetch v1 result:1:prepare\n", "lattice-agent-fetch v1 result:1:prepare"},
 		{"lattice-agent-fetch v1 result:1:prepare; rm -rf /", ""},
 		{"lattice-agent-fetch v1 1:cp:0:1:1 result:0:done <script>", ""},
-		{"lattice-agent-fetch v1 1:m.evil:0:1:1 result:0:done", ""},
+		{"lattice-agent-fetch v1 1:m.r2:28:262144:30:x1 2:cp:0:9:3 result:0:done", "lattice-agent-fetch v1 1:m.r2:28:262144:30:x1 2:cp:0:9:3 result:0:done"},
+		{"lattice-agent-fetch v1 1:m.Evil:0:1:1 result:0:done", ""},
+		{"lattice-agent-fetch v1 1:m.:0:1:1 result:0:done", ""},
+		{"lattice-agent-fetch v1 1:m.r2;x:0:1:1 result:0:done", ""},
+		{"lattice-agent-fetch v1 1:m.r2:0:1:1:x0 result:0:done", ""},
+		{"lattice-agent-fetch v1 1:cp:0:1:1:y1 result:0:done", ""},
 		{"lattice-agent-fetch v1 " + strings.Repeat("1:cp:0:1:1 ", 9) + "result:0:done", ""},
 		{"lattice-agent-fetch v2 1:cp:0:1:1 result:0:done", ""},
 		{"no summary at all", ""},

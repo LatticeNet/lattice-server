@@ -40,10 +40,15 @@ func TestAgentUpdateControlPlanePlanNamesThePinnedURLAsFallback(t *testing.T) {
 	if !strings.Contains(approval.Plan, "\nfallback_url: "+fallbackTestReleaseURL+"\n") {
 		t.Fatalf("the plan an operator approves must show the fallback URL:\n%s", approval.Plan)
 	}
-	// A plan made now walks its sources, so the fallback is also used when
-	// the control plane is left early, and the second pass may return to it.
-	if !strings.Contains(approval.Plan, "if the control-plane download fails or is left early, the node fetches fallback_url without the task lease") {
-		t.Fatalf("the plan must say when the fallback is used and that it carries no lease:\n%s", approval.Plan)
+	// A plan made now lists its sources in order, the fallback last, and
+	// says that only the control plane is sent the lease.
+	for _, want := range []string{
+		"  1. this control plane (this control plane holds the pinned bytes): " + payload.BinaryURL + "; the only source sent the task lease",
+		"  2. upstream (the URL the update policy pins): " + fallbackTestReleaseURL + "; followed through redirects to HTTPS only, and sent no credential",
+	} {
+		if !strings.Contains(approval.Plan, want) {
+			t.Fatalf("the plan must say %q:\n%s", want, approval.Plan)
+		}
 	}
 }
 
@@ -187,6 +192,7 @@ func TestAgentUpdatePreFallbackApprovalIsReplannedBeforeItRunsAgain(t *testing.T
 		t.Fatal(err)
 	}
 	payload.FallbackURL = ""
+	payload.Sources, payload.ChunkManifest = nil, nil
 	approval.Action = agentUpdateApprovalAction(payload)
 	approval.Plan = strings.Replace(approval.Plan, "fallback_url: "+fallbackTestReleaseURL+"\n", "", 1)
 	if err := st.UpsertApproval(approval); err != nil {
@@ -245,6 +251,7 @@ func TestAgentUpdateControlPlaneApprovalWithoutFallbackKeepsItsDownload(t *testi
 	}
 	payload.FallbackURL = ""
 	payload.ResumeDownload = false
+	payload.Sources, payload.ChunkManifest = nil, nil
 	approval.Action = agentUpdateApprovalAction(payload)
 	if strings.Contains(approval.Action, "fallback") {
 		t.Fatal("an empty fallback must not appear in the encoded payload")
@@ -514,6 +521,11 @@ func runAgentUpdateFetch(t *testing.T, script string, r fetchStubRun) fetchStubO
 // approved with.
 func approvalBeforeTheWalk(approval model.Approval) model.Approval {
 	approval.Plan = strings.Replace(approval.Plan, agentUpdateCutoffPlanLine+"\n", "", 1)
+	// Nor did it carry a source list, which came after the walk.
+	if payload, err := agentUpdatePayloadFromApproval(approval); err == nil {
+		payload.Sources, payload.ChunkManifest = nil, nil
+		approval.Action = agentUpdateApprovalAction(payload)
+	}
 	return approval
 }
 
@@ -526,6 +538,10 @@ func approvalWithResume(t *testing.T, approval model.Approval, resume bool) mode
 		t.Fatal(err)
 	}
 	payload.ResumeDownload = resume
+	if !resume {
+		// A plan from before resume carried no source list either.
+		payload.Sources, payload.ChunkManifest = nil, nil
+	}
 	approval.Action = agentUpdateApprovalAction(payload)
 	return approval
 }
@@ -730,6 +746,10 @@ func TestAgentUpdateScriptQuotesURLsThatCarryShellSyntax(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The shapes built here are the ones approvals planned before source
+	// lists take; a list's own URLs have their table in
+	// TestAgentUpdateSourcesInjectionTable.
+	base.Sources, base.ChunkManifest = nil, nil
 	for _, tc := range []struct {
 		name, fallback string
 		survives       string

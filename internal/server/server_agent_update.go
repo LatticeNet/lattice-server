@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -88,6 +89,18 @@ type agentUpdatePayload struct {
 	CompressedSHA256 string `json:"compressed_sha256,omitempty"`
 	CompressedSize   int    `json:"compressed_size,omitempty"`
 	BinarySize       int    `json:"binary_size,omitempty"`
+	// Sources is the ordered download list (design 31, S5): mirrors
+	// preferred for the node, the control plane when it holds the digest,
+	// global mirrors, then upstream. The server computes it when it plans,
+	// the plan prints it, and the approval binds it. It agrees with
+	// binary_url and fallback_url, which stay for the binary route, prefetch
+	// and approvals planned before it. Approvals planned before it decode
+	// without it and render the download they were approved with.
+	Sources []model.AgentUpdateSource `json:"sources,omitempty"`
+	// ChunkManifest is set exactly when Sources lists a mirror: the digest
+	// of every agentChunkSize bytes of the binary, which the script holds
+	// each fetch to, so a mirror that sends wrong bytes loses only its own.
+	ChunkManifest *agentChunkManifest `json:"chunk_manifest,omitempty"`
 }
 
 type agentReleaseInfoView struct {
@@ -486,7 +499,7 @@ func (s *Server) createAgentUpdateApproval(ctx context.Context, nodeID, actorID 
 	if approval, ok := s.openAgentUpdateApproval(payload); ok {
 		return approval, nil
 	}
-	plan := renderAgentUpdatePlan(node, payload, mode)
+	plan := renderAgentUpdatePlanWith(node, payload, mode, s.lastAppliedAgentUpdateSources(nodeID))
 	approval := model.Approval{
 		ID:        id.New("approval"),
 		NodeID:    nodeID,
@@ -502,6 +515,7 @@ func (s *Server) createAgentUpdateApproval(ctx context.Context, nodeID, actorID 
 	if err != nil {
 		return model.Approval{}, err
 	}
+	s.noteAgentMirrorsPlanned(node, payload, approval.ID, now)
 	policy.LastPlannedVersion = policy.TargetVersion
 	if payload.TargetVersion != "" {
 		policy.LastPlannedVersion = payload.TargetVersion
@@ -601,6 +615,7 @@ func (s *Server) agentUpdatePayloadForPolicy(node model.Node, policy model.Agent
 		payload = resolved
 	}
 	payload.ResumeDownload = true
+	payload.Sources, payload.ChunkManifest = s.agentUpdateSourcesFor(node, payload)
 	return payload, nil
 }
 
@@ -674,6 +689,16 @@ func (s *Server) resolveOfficialAgentUpdatePayload(node model.Node, policy model
 			payload.FallbackURL = releaseURL
 			return payload, nil
 		}
+	}
+	// An import that did not fit the store still verified the release
+	// against its SHA256SUMS and recorded the digest, which pins the plan as
+	// well as a fetch would; the plan then downloads from the mirrors and
+	// the release.
+	if sha, ok := s.importedAgentArtifactDigest(target, osName, arch); ok {
+		payload.SHA256 = sha
+		payload.BinaryURL = releaseURL
+		payload.BinarySource = agentBinarySourceUpstream
+		return payload, nil
 	}
 	sums, err := s.fetchAgentReleaseText(base + "/SHA256SUMS")
 	if err != nil {
@@ -1016,6 +1041,13 @@ func (s *Server) activeTaskApprovalIDs() map[string]struct{} {
 }
 
 func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode string) string {
+	return renderAgentUpdatePlanWith(node, payload, mode, nil)
+}
+
+// renderAgentUpdatePlanWith is renderAgentUpdatePlan with the node's last
+// successful update, whose source list a plan with sources compares its own
+// with.
+func renderAgentUpdatePlanWith(node model.Node, payload agentUpdatePayload, mode string, last *agentUpdateLastSuccess) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "plugin: agentupdate\n")
 	fmt.Fprintf(&b, "mode: %s\n", mode)
@@ -1046,8 +1078,16 @@ func renderAgentUpdatePlan(node model.Node, payload agentUpdatePayload, mode str
 	if payload.ResumeDownload {
 		fmt.Fprintf(&b, "resume_download: true\n")
 	}
+	if len(payload.Sources) > 0 {
+		fmt.Fprintf(&b, "sources: %s\n", strings.Join(agentUpdateSourceLabels(payload.Sources), " "))
+	}
+	if payload.ChunkManifest != nil {
+		fmt.Fprintf(&b, "chunk_manifest: %s\n", payload.ChunkManifest.digest())
+	}
 	fmt.Fprintf(&b, "\nSafety:\n")
-	if normalizeAgentBinarySource(payload.BinarySource) == agentBinarySourceControlPlane {
+	if len(payload.Sources) > 0 {
+		writeAgentUpdateSourceLines(&b, payload, last)
+	} else if normalizeAgentBinarySource(payload.BinarySource) == agentBinarySourceControlPlane {
 		fmt.Fprintf(&b, "- the binary comes from this control plane, so the node needs no third-party egress\n")
 		fmt.Fprintf(&b, "- the control plane re-verifies the stored bytes against this digest before serving them\n")
 		switch {
@@ -1289,7 +1329,7 @@ func agentUpdatePayloadFromApproval(approval model.Approval) (agentUpdatePayload
 			return agentUpdatePayload{}, fmt.Errorf("binary_size and compressed_size must be between 1 and %d bytes", maxAgentArtifactBytes)
 		}
 	}
-	return agentUpdatePayload{
+	out := agentUpdatePayload{
 		NodeID:           payload.NodeID,
 		CurrentVersion:   payload.CurrentVersion,
 		TargetVersion:    normalized.TargetVersion,
@@ -1303,7 +1343,20 @@ func agentUpdatePayloadFromApproval(approval model.Approval) (agentUpdatePayload
 		CompressedSHA256: compressedSHA,
 		CompressedSize:   payload.CompressedSize,
 		BinarySize:       payload.BinarySize,
-	}, nil
+		Sources:          slices.Clone(payload.Sources),
+	}
+	if payload.ChunkManifest != nil {
+		manifest := *payload.ChunkManifest
+		out.ChunkManifest = &manifest
+	}
+	// Nothing operator-entered reaches the script except through this
+	// validation and shellQuote: every source URL is a canonical HTTPS URL,
+	// a mirror's path holds no character a shell treats specially, and the
+	// control-plane entry names exactly the pinned bytes.
+	if err := validateAgentUpdateSources(out); err != nil {
+		return agentUpdatePayload{}, err
+	}
+	return out, nil
 }
 
 // normalizeAgentBinarySource keeps approvals planned before control-plane
@@ -1366,7 +1419,7 @@ func (s *Server) requireCurrentAgentUpdateApproval(approval model.Approval) erro
 	if err != nil {
 		return fmt.Errorf("agent update policy %q is invalid; re-plan before approving: %w", approval.NodeID, err)
 	}
-	if current != payload {
+	if !agentUpdatePayloadEqual(current, payload) {
 		return fmt.Errorf("%w; %s; re-plan before approving", errAgentUpdateApprovalStale, agentUpdatePayloadChangeSummary(payload, current))
 	}
 	return nil
@@ -1410,6 +1463,12 @@ func agentUpdatePayloadChangeSummary(planned, current agentUpdatePayload) string
 	}
 	if planned.BinarySize != current.BinarySize {
 		changes = append(changes, fmt.Sprintf("binary_size planned=%d current=%d", planned.BinarySize, current.BinarySize))
+	}
+	if change := agentUpdateSourcesChange(planned.Sources, current.Sources); change != "" {
+		changes = append(changes, change)
+	}
+	if p, c := agentChunkManifestDigest(planned.ChunkManifest), agentChunkManifestDigest(current.ChunkManifest); p != c {
+		changes = append(changes, fmt.Sprintf("chunk_manifest planned=%s current=%s", shortDigest(p), shortDigest(c)))
 	}
 	if len(changes) == 0 {
 		return "resolved update payload changed"
@@ -1559,6 +1618,13 @@ func (s *Server) agentUpdateApprovalLocalStaleness(approval model.Approval) (boo
 	if !ok {
 		return true, agentUpdateApprovalStaleReasonWithDetails(fmt.Sprintf("node %q not found", approval.NodeID))
 	}
+	// The source list is derived from the registry and the plan's own URLs,
+	// so it is checked without a fetch: a registry change re-plans every open
+	// approval it changes, and an approval planned before sources existed is
+	// re-planned once. An approval whose task already ran is awaiting
+	// confirmation of what that run did; the sources it no longer needs are
+	// no reason to record it as rejected.
+	ran := approval.Status == model.ApprovalApproved && s.agentUpdateTaskDispatched(approval.ID, approval.NodeID)
 	binaryURL := strings.TrimSpace(policy.BinaryURL)
 	sha256 := strings.TrimSpace(policy.SHA256)
 	if binaryURL != "" || sha256 != "" {
@@ -1569,7 +1635,10 @@ func (s *Server) agentUpdateApprovalLocalStaleness(approval model.Approval) (boo
 		if err != nil {
 			return true, agentUpdateApprovalStaleReasonWithDetails("current policy is invalid: " + err.Error())
 		}
-		if current != payload {
+		if ran {
+			current.Sources, current.ChunkManifest = payload.Sources, payload.ChunkManifest
+		}
+		if !agentUpdatePayloadEqual(current, payload) {
 			return true, agentUpdateApprovalStaleReasonWithDetails(agentUpdatePayloadChangeSummary(payload, current))
 		}
 		return false, ""
@@ -1620,6 +1689,11 @@ func (s *Server) agentUpdateApprovalLocalStaleness(approval model.Approval) (boo
 		current.TargetVersion = target
 		changed = true
 	}
+	if sources, manifest := s.agentUpdateSourcesFor(node, current); !ran && (!slices.Equal(sources, payload.Sources) ||
+		agentChunkManifestDigest(manifest) != agentChunkManifestDigest(payload.ChunkManifest)) {
+		current.Sources, current.ChunkManifest = sources, manifest
+		changed = true
+	}
 	if changed {
 		return true, agentUpdateApprovalStaleReasonWithDetails(agentUpdatePayloadChangeSummary(payload, current))
 	}
@@ -1650,6 +1724,9 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		// and checks it before decompressing; no other download may run it.
 		return "", errors.New("approval pins a compressed binary but its plan predates the source walk; re-plan before approving")
 	}
+	if len(payload.Sources) > 0 && !walk {
+		return "", errors.New("approval names sources but its plan predates the source walk; re-plan before approving")
+	}
 	return "set -e\n" +
 		"umask 077\n" +
 		// The task shim caps every file the script writes at 8 MiB
@@ -1664,6 +1741,7 @@ func agentUpdateApplyScript(approval model.Approval, controlPlaneBase string) (s
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n" +
 		"URL=" + shellQuote(payload.BinaryURL) + "\n" +
 		agentUpdateFallbackURLLine(payload.FallbackURL) +
+		agentUpdateMirrorURLLines(payload) +
 		"BINARY_SOURCE=" + shellQuote(source) + "\n" +
 		"EXPECT_SHA=" + shellQuote(payload.SHA256) + "\n" +
 		agentUpdateCompressedHeader(payload) +

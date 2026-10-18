@@ -1372,6 +1372,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/agent-updates/artifacts", s.withAuth("", s.handleAgentArtifacts))
 	mux.HandleFunc("/api/nodes/agent-updates/artifacts/import", s.withAuth("node:admin", s.handleAgentArtifactImport))
 	mux.HandleFunc("/api/nodes/agent-updates/artifacts/delete", s.withAuth("node:admin", s.handleDeleteAgentArtifact))
+	mux.HandleFunc("/api/nodes/agent-updates/mirrors", s.withAuth("", s.handleAgentMirrors))
+	mux.HandleFunc("/api/nodes/agent-updates/mirrors/plan", s.withAuth("", s.handleAgentMirrorPlan))
 	mux.HandleFunc("/api/nodes/beacon", s.withAuth("monitor:read", s.handleNodeBeacon))
 	mux.HandleFunc("/api/nodes/beacon/plan", s.withAuth("", s.handleBeaconPlan))
 	mux.HandleFunc("/api/nodes/beacon/rotate", s.withAuth("", s.handleBeaconRotate))
@@ -1665,6 +1667,7 @@ func (s *Server) Handler() http.Handler {
 	// Public on purpose as well: the lattice-knock client for operators whose
 	// network cannot reach GitHub. No credential goes in or comes out.
 	mux.HandleFunc(knockToolPathPrefix, s.handleKnockTool)
+	mux.HandleFunc(agentInstallerPath, s.handleAgentInstaller)
 	// Public on purpose too: the icons a Bark push shows, fetched without a
 	// session (notify_icons.go). notifyIconsFirst also catches the paths the
 	// mux would redirect.
@@ -3351,12 +3354,14 @@ func (s *Server) agentEnrollCommands(serverURL, nodeID, token string, launch mod
 		shellQuote(token),
 		manualFlags,
 	)
-	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s%s%s ./lattice-agent-install.sh",
-		agentInstallScriptDownloadCommand(),
+	download, installEnv := s.agentInstallerDownload()
+	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && env LATTICE_SERVER=%s LATTICE_NODE_ID=%s LATTICE_NODE_TOKEN=%s%s%s%s ./lattice-agent-install.sh",
+		download,
 		shellQuote(serverURL),
 		shellQuote(nodeID),
 		shellQuote(token),
 		agentInstallVersionEnv(),
+		installEnv,
 		env,
 	)
 	return map[string]string{
@@ -3416,11 +3421,13 @@ func (s *Server) handleNodeReconfigureCommand(w http.ResponseWriter, r *http.Req
 
 func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model.AgentLaunchConfig) map[string]string {
 	env := agentLaunchEnv(launch)
-	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s%s ./lattice-agent-install.sh",
-		agentInstallScriptDownloadCommand(),
+	download, installEnv := s.agentInstallerDownload()
+	linux := fmt.Sprintf("%s && chmod +x lattice-agent-install.sh && set -a; for f in /opt/lattice/lattice-agent.env /opt/lattice/node-agent/agent.env /etc/lattice/agent.env; do [ -f \"$f\" ] && . \"$f\" && break; done; set +a; env LATTICE_SERVER=%s LATTICE_NODE_ID=%s%s%s%s ./lattice-agent-install.sh",
+		download,
 		shellQuote(serverURL),
 		shellQuote(nodeID),
 		agentInstallVersionEnv(),
+		installEnv,
 		env,
 	)
 	manual := fmt.Sprintf("lattice-agent -server %s -node-id %s%s",
@@ -3432,9 +3439,10 @@ func (s *Server) agentReconfigureCommands(serverURL, nodeID string, launch model
 }
 
 // agentInstallerRef is the stable lattice-node-agent release that enroll and
-// reconfigure commands install from. The installer is fetched at this tag and
-// told to download the binary of the same tag, so the script and the binary
-// it installs always come from one release. A branch ref here (main) once
+// reconfigure commands install. The installer is the copy this server carries
+// (agentinstall, served at agentInstallerPath) when the server has a public
+// HTTPS URL, and otherwise is fetched at this tag; either way it is told to
+// download the binary of this tag. A branch ref here (main) once
 // paired a July installer with whatever binary was latest. Move it with each
 // stable agent cut; the site's release-pin check fails on a stale ref.
 const agentInstallerRef = "v0.3.9"
@@ -7805,6 +7813,13 @@ func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval
 		return !principalHasNodeRestriction(p) &&
 			rbac.Allows(p.Principal, "notify:admin", "") &&
 			rbac.Allows(p.Principal, "network:plan", approval.NodeID)
+	case model.AgentMirrorsApprovalPlugin:
+		// An agent.mirrors plan changes what every node downloads from and
+		// names every node whose order changes, so only a principal that
+		// administers agents across the whole fleet reads it.
+		return !principalHasNodeRestriction(p) &&
+			rbac.Allows(p.Principal, "node:admin", "") &&
+			rbac.Allows(p.Principal, "network:plan", "")
 	case model.BeaconApprovalPlugin:
 		// A node.beacon plan names the beacon's sources and their addresses
 		// and, under NetGuard, the node's whole ruleset; it carries no key.
@@ -8979,6 +8994,11 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	if isSubStorePlanApproval(approval) {
 		return s.subStorePlanApprove(ctx, p, approval, queueApply)
 	}
+	// An agent.mirrors plan's effect is the control plane's own state: the
+	// next update plan for each node reads the new registry.
+	if isAgentMirrorsApproval(approval) {
+		return s.agentMirrorsApprove(ctx, p, approval)
+	}
 	// A node.beacon plan's effect is the control plane's own state, which
 	// reaches the node through its config pull; only its NetGuard
 	// companion, when there is one, is a node task (beacon_plan.go).
@@ -9493,7 +9513,7 @@ func approvalDecisionExtraScope(approval model.Approval) string {
 	switch approval.Plugin {
 	case "nftpolicy":
 		return "netpolicy:admin"
-	case agentUpdatePlugin:
+	case agentUpdatePlugin, model.AgentMirrorsApprovalPlugin:
 		return "node:admin"
 	case "selfdns":
 		return "dns:admin"

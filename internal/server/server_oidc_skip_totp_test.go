@@ -352,7 +352,12 @@ func TestOIDCSkipLocalTOTPIssuerFlippedDuringTheExchangeLendsNoTrust(t *testing.
 			t.Error(err)
 		}
 	}
-	assertChallenged(t, f.sso(t, "198.51.100.28:1000"))
+	// The record no longer names the issuer the claims were verified with,
+	// so the sign-in admits nobody at all, let alone without the code.
+	rec := f.sso(t, "198.51.100.28:1000")
+	if cookieNamed(rec, "lattice_session") != nil || cookieNamed(rec, totpChallengeCookie) != nil || !strings.Contains(rec.Header().Get("Location"), "sso_error=unavailable") {
+		t.Fatalf("claims verified against one issuer must not borrow another's trust: %s", rec.Header().Get("Location"))
+	}
 	if auditCount(f.st, "login.oidc.totp_skipped") != 0 {
 		t.Fatal("claims verified against one issuer must not borrow another's trust")
 	}

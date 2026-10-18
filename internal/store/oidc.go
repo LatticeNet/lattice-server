@@ -23,11 +23,12 @@ func oidcIdentityKey(providerID, subject string) string {
 
 // --- providers (admin config) --------------------------------------------
 
+// UpsertOIDCProvider stores p and settles its links as every provider write
+// does (UpsertOIDCProviderSettlingLinks without clearing confirmations), so
+// no caller can store a provider that its links from another issuer outlive.
 func (s *Store) UpsertOIDCProvider(p model.OIDCProvider) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.state.OIDCProviders[p.ID] = p
-	return s.Save()
+	_, _, err := s.UpsertOIDCProviderSettlingLinks(p, false)
+	return err
 }
 
 func (s *Store) OIDCProvider(id string) (model.OIDCProvider, bool) {
@@ -99,7 +100,7 @@ func (s *Store) ConfirmOIDCIdentitySecondFactor(providerID, issuer, subject, use
 	defer s.mu.Unlock()
 	key := oidcIdentityKey(providerID, subject)
 	prior, ok := s.state.OIDCIdentities[key]
-	if !ok || prior.UserID != userID {
+	if !ok || prior.UserID != userID || prior.Issuer != issuer {
 		return model.OIDCIdentity{}, false, nil
 	}
 	idn := prior
@@ -123,7 +124,8 @@ func (s *Store) ConfirmOIDCIdentitySecondFactor(providerID, issuer, subject, use
 func (s *Store) ClearOIDCIdentityConfirmations(providerID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next, n := clearedOIDCConfirmations(s.state.OIDCIdentities, providerID)
+	next := maps.Clone(s.state.OIDCIdentities)
+	n := clearOIDCConfirmations(next, providerID)
 	if n == 0 {
 		return 0, nil
 	}
@@ -167,7 +169,7 @@ func (s *Store) UpsertOIDCProviderSettlingLinks(p model.OIDCProvider, clearConfi
 		}
 	}
 	if clearConfirmations {
-		identities, changes.ConfirmationsCleared = clearedOIDCConfirmations(identities, p.ID)
+		changes.ConfirmationsCleared = clearOIDCConfirmations(identities, p.ID)
 	}
 	providers := maps.Clone(s.state.OIDCProviders)
 	providers[p.ID] = p
@@ -182,20 +184,19 @@ func (s *Store) UpsertOIDCProviderSettlingLinks(p model.OIDCProvider, clearConfi
 	return changes, true, err
 }
 
-// clearedOIDCConfirmations returns a copy of identities with the confirmations
-// of providerID's links cleared, and how many it cleared.
-func clearedOIDCConfirmations(identities map[string]model.OIDCIdentity, providerID string) (map[string]model.OIDCIdentity, int) {
-	next := maps.Clone(identities)
+// clearOIDCConfirmations forgets, in identities (a copy the caller owns), the
+// confirmations of providerID's links, and reports how many it cleared.
+func clearOIDCConfirmations(identities map[string]model.OIDCIdentity, providerID string) int {
 	n := 0
-	for k, idn := range next {
+	for k, idn := range identities {
 		if idn.ProviderID != providerID || (idn.SecondFactorAt.IsZero() && idn.SecondFactorEpoch == 0) {
 			continue
 		}
 		idn.SecondFactorAt, idn.SecondFactorEpoch = time.Time{}, 0
-		next[k] = idn
+		identities[k] = idn
 		n++
 	}
-	return next, n
+	return n
 }
 
 // DeleteOIDCIdentitiesByUser removes every durable subject→user link bound to

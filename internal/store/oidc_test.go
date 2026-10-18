@@ -114,10 +114,10 @@ func TestOIDCAuthStateSingleUseAndExpiry(t *testing.T) {
 	}
 }
 
-// A link's second-factor confirmation changes only a link that exists and
-// still names the account, takes the issuer the sign-in saw, survives a
-// restart together with the provider's skip_local_totp policy, and is
-// cleared per provider without touching the link.
+// A link's second-factor confirmation changes only a link that exists, still
+// names the account and was recorded under the issuer the sign-in saw; it
+// survives a restart together with the provider's skip_local_totp policy, and
+// is cleared per provider without touching the link.
 func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	c := testCipher(t)
@@ -139,6 +139,15 @@ func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: "https://old.example", Subject: "sub-1", UserID: "u1", CreatedAt: at}); err != nil {
 		t.Fatal(err)
 	}
+	if _, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u1", at, 2); err != nil || ok {
+		t.Fatalf("a link recorded under another issuer must not be confirmed under this one: ok=%v err=%v", ok, err)
+	}
+	if got, _ := s.OIDCIdentity("g", "sub-1"); got.Issuer != "https://old.example" || !got.SecondFactorAt.IsZero() {
+		t.Fatalf("a refused confirmation must leave the link as it was: %+v", got)
+	}
+	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: issuer, Subject: "sub-1", UserID: "u1", CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "other", Issuer: "https://other.example", Subject: "sub-1", UserID: "u1", CreatedAt: at, SecondFactorAt: at, SecondFactorEpoch: 2}); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +155,7 @@ func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 		t.Fatalf("confirming for another account must change nothing: ok=%v err=%v", ok, err)
 	}
 	prior, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u1", at, 2)
-	if err != nil || !ok || !prior.SecondFactorAt.IsZero() || prior.Issuer != "https://old.example" {
+	if err != nil || !ok || !prior.SecondFactorAt.IsZero() || prior.Issuer != issuer {
 		t.Fatalf("confirm: prior=%+v ok=%v err=%v", prior, ok, err)
 	}
 

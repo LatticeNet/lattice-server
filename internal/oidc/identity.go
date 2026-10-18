@@ -13,10 +13,11 @@ type IdentityResolution struct {
 	UserID      string
 	Email       string
 	BindSubject bool // create a new (issuer,sub) link for this user
-	// IgnoredLinkIssuer is the issuer of a link that exists for this provider
-	// and subject but was not honoured, because the provider now names
-	// another issuer. Set whether or not the resolution succeeded, so the
-	// caller can audit it.
+	// LinkIgnored reports that a link exists for this provider and subject
+	// but was not honoured: it was recorded under another issuer (or none),
+	// or names no account. IgnoredLinkIssuer is that link's issuer. Both are
+	// set whether or not the resolution succeeded, so the caller can audit.
+	LinkIgnored       bool
 	IgnoredLinkIssuer string
 }
 
@@ -45,9 +46,9 @@ type IdentityResolution struct {
 func ResolveIdentity(p model.OIDCProvider, claims Claims, link *model.OIDCIdentity, userByEmail func(email string) (string, bool)) (IdentityResolution, error) {
 	email := strings.ToLower(strings.TrimSpace(claims.Email))
 	base := IdentityResolution{}
-	honoured := link != nil && link.Issuer != "" && link.Issuer == p.Issuer
+	honoured := link != nil && link.Issuer != "" && link.Issuer == p.Issuer && link.UserID != ""
 	if link != nil && !honoured {
-		base.IgnoredLinkIssuer = link.Issuer
+		base.LinkIgnored, base.IgnoredLinkIssuer = true, link.Issuer
 	}
 
 	// Domain policy is enforced on every login, link or not.
@@ -60,7 +61,7 @@ func ResolveIdentity(p model.OIDCProvider, claims Claims, link *model.OIDCIdenti
 		}
 	}
 
-	if honoured && link.UserID != "" {
+	if honoured {
 		base.UserID, base.Email = link.UserID, claims.Email
 		return base, nil
 	}
@@ -74,7 +75,7 @@ func ResolveIdentity(p model.OIDCProvider, claims Claims, link *model.OIDCIdenti
 	}
 	userID, ok := userByEmail(email)
 	if !ok {
-		return base, fmt.Errorf("oidc: no local account for %q; an admin must provision a user whose username is that email", email)
+		return base, fmt.Errorf("oidc: no local account for the verified email; an admin must provision a user whose username is that email")
 	}
 	base.UserID, base.Email, base.BindSubject = userID, email, true
 	return base, nil

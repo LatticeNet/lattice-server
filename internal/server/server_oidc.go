@@ -355,26 +355,48 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		}
 		return u.ID, true
 	})
-	if existing != nil && existing.Issuer != provider.Issuer {
+	if res.LinkIgnored {
 		// A subject linked under another issuer was presented by this one:
-		// what a provider repointed at someone else's IdP looks like.
-		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: existing.UserID, Action: "login.oidc.stale_link_ignored", Decision: "observe",
+		// what a provider repointed at someone else's IdP looks like. The
+		// presenter is unknown, so the event has no actor; the account the
+		// link names is in the metadata.
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), Action: "login.oidc.stale_link_ignored", Decision: "observe",
 			Reason: "identity link recorded under another issuer",
 			Metadata: map[string]string{
 				"provider":        provider.ID,
-				"link_issuer":     existing.Issuer,
+				"link_issuer":     res.IgnoredLinkIssuer,
 				"provider_issuer": provider.Issuer,
+				"linked_user":     existing.UserID,
 				"subject":         maskSSOSubject(claims.Subject),
 			}})
 	}
 	if err != nil {
-		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), Action: "login.oidc", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"provider": provider.ID, "sub": claims.Subject}})
+		// The subject and email come from the provider, possibly one an
+		// attacker runs: both are masked and bounded like every other SSO
+		// identity the server records.
+		meta := map[string]string{"provider": provider.ID, "sub": maskSSOSubject(auditTruncate(claims.Subject, 256))}
+		if email := strings.TrimSpace(claims.Email); email != "" {
+			meta["email"] = maskSSOEmail(auditTruncate(email, 256))
+		}
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), Action: "login.oidc", Decision: "deny", Reason: err.Error(), Metadata: meta})
 		s.oidcFail(w, r, st.RedirectAfter, "denied", "")
 		return
 	}
 	user, ok := s.store.User(res.UserID)
 	if !ok {
 		s.oidcFail(w, r, st.RedirectAfter, "denied", "")
+		return
+	}
+	// The claims were verified against provider, read before the exchange's
+	// round trip. Before a link is written or any session or challenge is
+	// issued, the record must still be enabled and still name that issuer and
+	// client: a provider disabled, deleted or repointed meanwhile (because its
+	// IdP is compromised, say) admits nobody on the strength of the old one.
+	current, ok := s.store.OIDCProvider(provider.ID)
+	if !ok || !current.Enabled || current.Issuer != provider.Issuer || current.ClientID != provider.ClientID {
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), Action: "login.oidc", Decision: "deny", Reason: "provider changed during sign-in",
+			Metadata: map[string]string{"provider": provider.ID, "sub": maskSSOSubject(auditTruncate(claims.Subject, 256))}})
+		s.oidcFail(w, r, st.RedirectAfter, "unavailable", "")
 		return
 	}
 	if res.BindSubject {
@@ -393,10 +415,10 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	// A provider the operator marked as the whole first and second factor
 	// (SkipLocalTOTP) opens the console without the local code, but only
 	// through a subject this account already confirmed with that code in its
-	// current security epoch; see ssoVouchesForSecondFactor. The policy is
-	// read again here, after the code exchange's round trip to the provider,
-	// so a flag turned off or a provider disabled meanwhile is honoured.
-	if current, ok := s.store.OIDCProvider(provider.ID); ok && user.TOTPEnabled && s.ssoVouchesForSecondFactor(provider, current, claims.Subject, user) {
+	// current security epoch; see ssoVouchesForSecondFactor. current is the
+	// record read again after the exchange, so a flag turned off meanwhile is
+	// honoured.
+	if user.TOTPEnabled && s.ssoVouchesForSecondFactor(provider, current, claims.Subject, user) {
 		if _, err := s.startSessionAudited(w, r, user, model.AuditEvent{
 			Action: "login.oidc.totp_skipped",
 			Reason: "local second factor skipped by provider policy",

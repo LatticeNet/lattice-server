@@ -63,8 +63,16 @@ func TestOIDCLinkFromAnotherIssuerDoesNotSignIn(t *testing.T) {
 			ignored = &ev
 		}
 	}
-	if ignored == nil || ignored.Metadata["link_issuer"] != "https://accounts.google.com" || ignored.Metadata["provider_issuer"] != idp.server.URL || ignored.ActorID != "u-victim" {
+	// The presenter is unknown: the event names no actor, and the account the
+	// link names sits in the metadata, so nobody reads the victim as the actor.
+	if ignored == nil || ignored.Metadata["link_issuer"] != "https://accounts.google.com" || ignored.Metadata["provider_issuer"] != idp.server.URL ||
+		ignored.Metadata["linked_user"] != "u-victim" || ignored.ActorID != "" {
 		t.Fatalf("the ignored link must be audited with both issuers and the linked account: %+v", ignored)
+	}
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "login.oidc" && ev.Decision == "deny" && (strings.Contains(ev.Metadata["sub"], "sub-linked") || strings.Contains(ev.Metadata["email"], "attacker@") || strings.Contains(ev.Reason, "attacker@")) {
+			t.Fatalf("the deny audit must mask what the provider asserted: %+v", ev)
+		}
 	}
 	if strings.Contains(ignored.Metadata["subject"], "sub-linked") {
 		t.Fatalf("the audit must mask the subject: %q", ignored.Metadata["subject"])
@@ -72,19 +80,10 @@ func TestOIDCLinkFromAnotherIssuerDoesNotSignIn(t *testing.T) {
 }
 
 func TestOIDCLinkUnderTheCurrentIssuerStillSignsIn(t *testing.T) {
-	idp := newMockIDP(t)
-	idp.sub = "sub-linked"
-	_, st, h := func() (*mockIDP, *store.Store, http.Handler) {
-		srv, st := newOIDCServer(t, idp.server.Client())
-		return idp, st, srv.Handler()
-	}()
-	if err := st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: idp.server.URL, ClientID: idp.clientID, Enabled: true, CreatedAt: time.Now().UTC()}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.UpsertUser(model.User{ID: "u-ops", Username: "ops"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: idp.server.URL, Subject: "sub-linked", UserID: "u-ops", CreatedAt: time.Now().UTC()}); err != nil {
+	idp, st, h := linkIssuerFixture(t, "", model.User{ID: "u-ops", Username: "ops"})
+	link, _ := st.OIDCIdentity("g", "sub-linked")
+	link.Issuer = idp.server.URL
+	if err := st.PutOIDCIdentity(link); err != nil {
 		t.Fatal(err)
 	}
 	if res := ssoOnce(t, h, idp); !hasSessionCookie(res.Cookies()) {
@@ -161,5 +160,130 @@ func TestOIDCIssuerChangeRemovesTheOldIssuersLinks(t *testing.T) {
 	}
 	if _, ok := st.OIDCIdentity("g", "s3"); !ok {
 		t.Fatal("a link under the current issuer must survive a save")
+	}
+}
+
+func TestOIDCProviderRepointedDuringTheExchangeAdmitsNobody(t *testing.T) {
+	// The link is under the issuer the claims are verified against, and the
+	// account's username is the verified email, so either path would admit
+	// it. The operator repoints, disables or re-clients the provider while
+	// the exchange is in flight, because that IdP is compromised. Nothing is
+	// admitted on the strength of the old record: no session, no challenge,
+	// and no link written under the issuer the provider left.
+	for name, change := range map[string]func(p *model.OIDCProvider){
+		"repointed":  func(p *model.OIDCProvider) { p.Issuer = "https://idp.replacement.example" },
+		"disabled":   func(p *model.OIDCProvider) { p.Enabled = false },
+		"new client": func(p *model.OIDCProvider) { p.ClientID = "another-client" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			idp, st, h := linkIssuerFixture(t, "", model.User{ID: "u-ops", Username: "ops@example.com"})
+			idp.email = "ops@example.com"
+			link, _ := st.OIDCIdentity("g", "sub-linked")
+			link.Issuer = idp.server.URL
+			if err := st.PutOIDCIdentity(link); err != nil {
+				t.Fatal(err)
+			}
+			idp.onToken = func() {
+				p, _ := st.OIDCProvider("g")
+				change(&p)
+				if err := st.UpsertOIDCProvider(p); err != nil {
+					t.Error(err)
+				}
+			}
+			res := ssoOnce(t, h, idp)
+			if hasSessionCookie(res.Cookies()) || !strings.Contains(res.Header.Get("Location"), "sso_error=unavailable") {
+				t.Fatalf("a provider changed during the exchange must admit nobody: %s", res.Header.Get("Location"))
+			}
+			if p, _ := st.OIDCProvider("g"); p.Issuer != idp.server.URL {
+				if _, ok := st.OIDCIdentity("g", "sub-linked"); ok {
+					t.Fatal("no link may be written under the issuer the provider left")
+				}
+			}
+		})
+	}
+}
+
+func TestOIDCStaleConfirmedLinkDoesNotSkipTheCode(t *testing.T) {
+	// A link confirmed for skip_local_totp under the old issuer: the new
+	// issuer's sign-in rebinds by email (a fresh, unconfirmed link), so the
+	// account's code is asked even though the policy is on.
+	idp, st, h := linkIssuerFixture(t, "https://accounts.google.com", model.User{ID: "u-2fa", Username: "twofa@example.com", TOTPEnabled: true, TOTPSecret: "JBSWY3DPEHPK3PXP"})
+	idp.email = "twofa@example.com"
+	p, _ := st.OIDCProvider("g")
+	p.SkipLocalTOTP = true
+	if err := st.UpsertOIDCProvider(p); err != nil {
+		t.Fatal(err)
+	}
+	// The settle above removed the old-issuer link; put it back as a link a
+	// flip-back or a race could have left behind, confirmed.
+	if err := st.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: "https://accounts.google.com", Subject: "sub-linked", UserID: "u-2fa",
+		CreatedAt: time.Now().UTC(), SecondFactorAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	res := ssoOnce(t, h, idp)
+	if hasSessionCookie(res.Cookies()) || !strings.Contains(res.Header.Get("Location"), "totp_challenge=") {
+		t.Fatalf("a stale confirmation must not skip the code: %s", res.Header.Get("Location"))
+	}
+	if link, _ := st.OIDCIdentity("g", "sub-linked"); link.Issuer != idp.server.URL || !link.SecondFactorAt.IsZero() {
+		t.Fatalf("the rebind must be under the current issuer and unconfirmed: %+v", link)
+	}
+}
+
+func TestOIDCRepointAndPolicyOnInOneSaveReportBoth(t *testing.T) {
+	srv, st := newOIDCServer(t)
+	h := srv.Handler()
+	const oldIssuer, newIssuer = "https://idp.old.example", "https://idp.new.example"
+	if err := st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: oldIssuer, ClientID: "cid", Enabled: true, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: oldIssuer, Subject: "s1", UserID: "u1", CreatedAt: time.Now().UTC(), SecondFactorAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	cookie, csrf := adminLogin(t, h)
+	body := `{"id":"g","issuer":"` + newIssuer + `","client_id":"cid","enabled":true,"skip_local_totp":true,"step_up_grant":"` + adminStepUp(t, srv, st, cookie) + `"}`
+	if rec := adminPOST(t, h, "/api/auth/oidc/providers", body, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("repoint and turn on: %d %s", rec.Code, rec.Body.String())
+	}
+	var meta map[string]string
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "oidc.provider.upsert" && ev.Decision == "allow" {
+			meta = ev.Metadata
+			break
+		}
+	}
+	if meta["links_removed"] != "1" || meta["confirmations_cleared"] != "0" || meta["old_issuer"] != oldIssuer || meta["new_skip_local_totp"] != "true" {
+		t.Fatalf("one save that repoints and turns the policy on must report both: %v", meta)
+	}
+}
+
+func TestOIDCProviderRecreatedUnderAnotherIssuerFindsNoLinks(t *testing.T) {
+	srv, st := newOIDCServer(t)
+	h := srv.Handler()
+	if err := st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: "https://idp.old.example", ClientID: "cid", Enabled: true, CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: "https://idp.old.example", Subject: "s1", UserID: "u1", CreatedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	cookie, csrf := adminLogin(t, h)
+	if rec := adminPOST(t, h, "/api/auth/oidc/providers/delete", `{"id":"g"}`, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, ok := st.OIDCIdentity("g", "s1"); !ok {
+		t.Fatal("deleting a provider keeps its links (a re-created provider under the same issuer finds them)")
+	}
+	if rec := adminPOST(t, h, "/api/auth/oidc/providers", `{"id":"g","issuer":"https://idp.new.example","client_id":"cid","enabled":true}`, cookie, csrf); rec.Code != http.StatusOK {
+		t.Fatalf("re-create: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, ok := st.OIDCIdentity("g", "s1"); ok {
+		t.Fatal("a provider re-created under another issuer must not find the old issuer's links")
+	}
+	for _, ev := range st.AuditEvents() {
+		if ev.Action == "oidc.provider.upsert" && ev.Decision == "allow" {
+			if ev.Metadata["links_removed"] != "1" {
+				t.Fatalf("the re-create must report the links it removed: %v", ev.Metadata)
+			}
+			break
+		}
 	}
 }

@@ -368,10 +368,17 @@ func agentUpdateWalkStep(payload agentUpdatePayload) string {
 		// wget's own timeouts reset on every read, so only the timeout
 		// command bounds a wget fetch; a mirror the walk cannot bound could
 		// spend the whole budget one byte at a time.
+		// A mirror is fetched only under the file-size cap; a shell that
+		// cannot set it, under a hard limit below it, skips the mirrors
+		// rather than fetch one uncapped. The other sources are unchanged.
 		b.WriteString("FETCH_MIRRORS=$CHUNK_ON\n" +
 			"if [ \"$FETCH_MIRRORS\" = 1 ] && [ \"$FETCHER\" = wget ] && [ \"$FETCH_TIMEOUT\" = 0 ]; then\n" +
 			"  FETCH_MIRRORS=0\n" +
 			"  echo 'lattice agent update: this node has no timeout command to bound a wget fetch, so it skips the mirrors' >&2\n" +
+			"fi\n" +
+			"if [ \"$FETCH_MIRRORS\" = 1 ] && ! ( ulimit -f \"$FETCH_FCAP\" ) 2>/dev/null; then\n" +
+			"  FETCH_MIRRORS=0\n" +
+			"  echo \"lattice agent update: this shell cannot cap a download at $FETCH_FCAP blocks, so it skips the mirrors\" >&2\n" +
 			"fi\n")
 	}
 	untried := make([]string, 0, len(sources))

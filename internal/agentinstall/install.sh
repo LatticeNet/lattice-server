@@ -557,10 +557,6 @@ elif have wget; then
   if have timeout && timeout 5 true >/dev/null 2>&1; then wget_bound=1; fi
   fetch() {
     if [ "$1" = m ]; then
-      if [ "$wget_bound" = 0 ]; then
-        log "skipping mirror $3: no working timeout command to bound a wget fetch"
-        return 1
-      fi
       timeout 600 wget --https-only -q --max-redirect=0 --connect-timeout=20 --read-timeout=60 --tries=2 -c -O "$2" "$3"
     else
       wget --https-only -q --connect-timeout=20 --read-timeout=60 --tries=2 -c -O "$2" "$3"
@@ -575,15 +571,20 @@ else die "need curl or wget to download the agent"; fi
 # a core dump.
 # yagni: a fixed cap; raise it if the agent binary ever nears 64 MiB.
 # A shell that cannot set the cap fetches a release anyway, as before, but
-# skips a mirror, which is optional and the one source the cap is for.
+# never a mirror, which is optional and the one source the cap is for.
 fetch_capped() {
   ( trap '' XFSZ
-    if ! ulimit -f 131072 2>/dev/null && [ "$1" = m ]; then
-      log "skipping mirror $3: this shell cannot cap the download's size"
-      exit 1
-    fi
+    if ! ulimit -f 131072 2>/dev/null && [ "$1" = m ]; then exit 1; fi
     fetch "$@" )
 }
+# mirror_skip says why this machine cannot use a mirror at all, or is empty:
+# a mirror is fetched only under the size cap and, with wget, under timeout.
+mirror_skip=""
+if ! ( ulimit -f 131072 ) 2>/dev/null; then
+  mirror_skip="this shell cannot cap the download's size"
+elif [ "$dl_tool" = wget ] && [ "$wget_bound" = 0 ]; then
+  mirror_skip="no working timeout command to bound a wget fetch"
+fi
 
 # checksum tool (sha256sum on Linux, shasum on macOS/BSD, sha256 on FreeBSD)
 if have sha256sum; then sha256_file() { sha256sum "$1" | awk '{ print $1 }'; }
@@ -647,6 +648,11 @@ fetch_ok=0
 try_source() {
   try_kind="${2%%=*}"
   try_url="${2#?=}"
+  if [ "$try_kind" = m ] && [ -n "$mirror_skip" ]; then
+    log "round $1: skipping mirror $try_url: $mirror_skip"
+    fetch_report="$fetch_report${nl}  round $1, $try_url: skipped ($mirror_skip)"
+    return 2
+  fi
   log "round $1: downloading $artifact ($version) from $try_url ..."
   if [ -s "$part" ]; then fetch_resumed=1; fi
   if fetch_capped "$try_kind" "$part" "$try_url"; then

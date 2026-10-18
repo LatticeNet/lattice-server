@@ -162,6 +162,9 @@ type walkRun struct {
 	env            []string
 	// without leaves these host tools out of PATH.
 	without []string
+	// fileLimit, when set, runs the script under that file-size limit, soft
+	// and hard, as a shell that cannot raise it would.
+	fileLimit int
 }
 
 type walkOutcome struct {
@@ -369,6 +372,13 @@ func runWalkScript(t *testing.T, script string, r walkRun) walkOutcome {
 	}
 
 	cmd := exec.Command("sh", scriptFile)
+	if r.fileLimit > 0 {
+		sh, err := exec.LookPath("sh")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cmd = exec.Command(sh, "-c", fmt.Sprintf("ulimit -f %d && exec %s \"$1\"", r.fileLimit, sh), "sh", scriptFile)
+	}
 	cmd.Dir = dir
 	cmd.Env = []string{
 		"PATH=" + bin,

@@ -331,3 +331,36 @@ func TestAgentWalkFileCapStopsAnOverrun(t *testing.T) {
 		t.Fatalf("exit %v, wrote %d bytes; a cap of 16 blocks must stop the write with an error", err, info.Size())
 	}
 }
+
+// A shell that cannot set the file-size cap, here under an inherited hard
+// limit below it, never fetches a mirror: it says why and walks the other
+// sources as before.
+func TestAgentUpdateWalkSkipsMirrorsItCannotCap(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("the update script raises the hard limit again when it runs as root")
+	}
+	const c = agentChunkSize
+	script, payload, data := chunkWalk(t, 2*c+10, true, false)
+	// Room for the binary, not for the cap one chunk past it.
+	limit := (len(data)+c/2)/512 + 1
+	o := runWalkScript(t, script, walkRun{
+		fetcher: "curl", fileLimit: limit,
+		m1URL: mirrorURLOf(payload), m1Body: data,
+		cpURL: payload.BinaryURL, cpBody: data, cpSteps: "0:0:5",
+		fbURL: payload.FallbackURL, fbBody: data,
+	})
+	if o.exit != 0 || !bytes.Equal(o.installed, data) {
+		t.Fatalf("exit %d stderr:\n%s", o.exit, o.stderr)
+	}
+	if want := fmt.Sprintf("lattice-agent-fetch v1 2:cp:0:%d:5 result:0:done", len(data)); o.summary != want {
+		t.Fatalf("summary %q, want %q", o.summary, want)
+	}
+	for _, call := range o.fetches("curl") {
+		if strings.HasSuffix(call, mirrorURLOf(payload)) {
+			t.Fatalf("the mirror was fetched uncapped: %s", call)
+		}
+	}
+	if !strings.Contains(o.stderr, "this shell cannot cap a download at") {
+		t.Fatalf("the output must say why the mirrors were skipped, stderr:\n%s", o.stderr)
+	}
+}

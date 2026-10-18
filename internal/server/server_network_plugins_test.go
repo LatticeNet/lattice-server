@@ -285,6 +285,9 @@ func TestWireGuardOverviewSaysNeverReportedWithoutYearOne(t *testing.T) {
 		{ID: "n-never", Name: "fresh-box", WireGuardIP: "10.9.0.1", WireGuardPublicKey: "k1"},
 		{ID: "n-online", Name: "beating", Online: true, LastSeen: now.Add(-10 * time.Second)},
 		{ID: "n-offline", Name: "flagged-off", Online: false, LastSeen: now.Add(-time.Hour)},
+		// The sweep flipped the flag on a beat still inside the threshold: the
+		// flag alone makes it offline.
+		{ID: "n-flagged", Name: "flag-only", Online: false, LastSeen: now.Add(-time.Second)},
 		// The liveness sweep has not flipped the flag yet, but the last beat is
 		// past the threshold: the node status rule already says offline.
 		{ID: "n-stale", Name: "stale-beat", Online: true, LastSeen: now.Add(-nodeOfflineThreshold - time.Second)},
@@ -318,6 +321,7 @@ func TestWireGuardOverviewSaysNeverReportedWithoutYearOne(t *testing.T) {
 		"n-never":    NodeStatusNeverReported,
 		"n-online":   NodeStatusOnline,
 		"n-offline":  NodeStatusOffline,
+		"n-flagged":  NodeStatusOffline,
 		"n-stale":    NodeStatusOffline,
 		"n-disabled": NodeStatusDisabled,
 	} {

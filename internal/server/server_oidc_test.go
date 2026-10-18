@@ -348,10 +348,16 @@ func TestOIDCPendingSecondFactorNamesProviderAndEmail(t *testing.T) {
 
 	challengeID, cookie := ssoToSecondFactor(t, h, idp, "g")
 
-	got := decodePendingSecondFactor(t, getPendingSecondFactor(h, cookie, ""))
-	want := map[string]any{"provider": "Google", "email": "twofa@example.com"}
+	rec0 := getPendingSecondFactor(h, cookie, "")
+	got := decodePendingSecondFactor(t, rec0)
+	// The verified email is masked: the page confirms which account without
+	// putting the whole address on screen or on the wire.
+	want := map[string]any{"provider": "Google", "email": "t***a@example.com"}
 	if len(got) != len(want) || got["provider"] != want["provider"] || got["email"] != want["email"] {
 		t.Fatalf("pending second factor = %v, want exactly %v", got, want)
+	}
+	if strings.Contains(rec0.Body.String(), "twofa@") {
+		t.Fatalf("pending second factor carries the full email: %s", rec0.Body.String())
 	}
 
 	// The read is not a way around the second factor and does not spend the
@@ -396,8 +402,8 @@ func TestOIDCPendingSecondFactorFallsBackToSubject(t *testing.T) {
 	_, cookie := ssoToSecondFactor(t, h, idp, "corp")
 
 	got := decodePendingSecondFactor(t, getPendingSecondFactor(h, cookie, ""))
-	if len(got) != 2 || got["provider"] != "corp" || got["subject"] != "sub-unverified" {
-		t.Fatalf("pending second factor = %v, want exactly provider=corp subject=sub-unverified", got)
+	if len(got) != 2 || got["provider"] != "corp" || got["subject"] != "***fied" {
+		t.Fatalf("pending second factor = %v, want exactly provider=corp subject=***fied", got)
 	}
 }
 
@@ -452,7 +458,7 @@ func TestPendingSecondFactorNamesNobodyWithoutAValidSSOChallenge(t *testing.T) {
 
 	// The same valid challenge from its own network does answer, so the cases
 	// above fail for their stated reason and not for a broken fixture.
-	if got := decodePendingSecondFactor(t, getPendingSecondFactor(h, valid, "")); got["email"] != "twofa@example.com" {
+	if got := decodePendingSecondFactor(t, getPendingSecondFactor(h, valid, "")); got["email"] != "t***a@example.com" {
 		t.Fatalf("valid challenge = %v", got)
 	}
 }
@@ -637,4 +643,127 @@ func adminPOST(t *testing.T, h http.Handler, path, body, cookie, csrf string) *h
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+func TestOIDCStartAsksForTheAccountChooser(t *testing.T) {
+	idp := newMockIDP(t)
+	srv, st := newOIDCServer(t, idp.server.Client())
+	h := srv.Handler()
+	st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", DisplayName: "Google", Issuer: idp.server.URL, ClientID: idp.clientID, Enabled: true, CreatedAt: time.Now().UTC()})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/oidc/start?provider=g", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("start: got %d, want 302; body=%s", rec.Code, rec.Body.String())
+	}
+	u, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Without a prompt, a provider with one signed-in account and a prior
+	// grant answers at once, so the operator never sees which account
+	// signed in. select_account makes the provider show its chooser.
+	if got := u.Query().Get("prompt"); got != "select_account" {
+		t.Fatalf("authorization request prompt = %q, want select_account; url=%s", got, u)
+	}
+}
+
+func TestPendingSSOSecondFactorCancel(t *testing.T) {
+	idp := newMockIDP(t)
+	idp.sub = "sub-2fa"
+	idp.email = "twofa@example.com"
+	idp.emailVerified = true
+
+	srv, st := newOIDCServer(t, idp.server.Client())
+	h := srv.Handler()
+	st.UpsertOIDCProvider(model.OIDCProvider{ID: "g", DisplayName: "Google", Issuer: idp.server.URL, ClientID: idp.clientID, Enabled: true, AllowedDomains: []string{"example.com"}, CreatedAt: time.Now().UTC()})
+	st.UpsertUser(model.User{ID: "u-2fa", Username: "twofa@example.com", TOTPEnabled: true, TOTPSecret: "JBSWY3DPEHPK3PXP"})
+
+	cancel := func(cookie, remoteAddr string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodDelete, "/api/login/totp", nil)
+		if cookie != "" {
+			req.Header.Set("Cookie", cookie)
+		}
+		if remoteAddr != "" {
+			req.RemoteAddr = remoteAddr
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// No cookie: nothing to cancel, and the answer says nothing either way.
+	if rec := cancel("", ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("cancel without a challenge: got %d, want 204", rec.Code)
+	}
+
+	challengeID, cookie := ssoToSecondFactor(t, h, idp, "g")
+
+	// Another address holding the cookie cannot cancel the challenge.
+	if rec := cancel(cookie, "203.0.113.9:4000"); rec.Code != http.StatusNoContent {
+		t.Fatalf("cancel from another address: got %d, want 204", rec.Code)
+	}
+	if rec := getPendingSecondFactor(h, cookie, ""); rec.Code != http.StatusOK {
+		t.Fatalf("a cancel from another address spent the challenge: got %d", rec.Code)
+	}
+
+	rec := cancel(cookie, "")
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("cancel: got %d, want 204; body=%s", rec.Code, rec.Body.String())
+	}
+	cleared := false
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == totpChallengeCookie && c.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatal("cancel did not clear the second-factor challenge cookie")
+	}
+	if rec := getPendingSecondFactor(h, cookie, ""); rec.Code != http.StatusNotFound {
+		t.Fatalf("after cancel the pending read: got %d, want 404", rec.Code)
+	}
+
+	// The cancelled challenge no longer completes a sign-in.
+	code, err := auth.TOTPCodeAt("JBSWY3DPEHPK3PXP", time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/login/totp", strings.NewReader(`{"challenge_id":"`+challengeID+`","code":"`+code+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", cookie)
+	post := httptest.NewRecorder()
+	h.ServeHTTP(post, req)
+	if post.Code != http.StatusUnauthorized || hasSessionCookie(post.Result().Cookies()) {
+		t.Fatalf("second factor after cancel: got %d, want 401 and no session", post.Code)
+	}
+}
+
+func TestMaskSSOIdentity(t *testing.T) {
+	email := map[string]string{
+		"twofa@example.com":     "t***a@example.com",
+		"lidongguinb@gmail.com": "l***b@gmail.com",
+		"ab@example.com":        "a***@example.com",
+		"a@example.com":         "***@example.com",
+		"not-an-email":          "***mail",
+		"@example.com":          "***",
+		"":                      "",
+	}
+	for in, want := range email {
+		if got := maskSSOEmail(in); got != want {
+			t.Errorf("maskSSOEmail(%q) = %q, want %q", in, got, want)
+		}
+	}
+	subject := map[string]string{
+		"sub-unverified":        "***fied",
+		"109876543210987654321": "***4321",
+		"abcd":                  "***",
+		"":                      "",
+	}
+	for in, want := range subject {
+		if got := maskSSOSubject(in); got != want {
+			t.Errorf("maskSSOSubject(%q) = %q, want %q", in, got, want)
+		}
+	}
 }

@@ -17,22 +17,31 @@ func TestResolveIdentity(t *testing.T) {
 		}
 	}
 	none := func(string) (string, bool) { return "", false }
+	// linked is a durable link recorded under issuer for the existing user.
+	linked := func(issuer string) *model.OIDCIdentity {
+		return &model.OIDCIdentity{Issuer: issuer, Subject: "linked-sub", UserID: "user-existing"}
+	}
 
 	cases := []struct {
 		name     string
 		provider model.OIDCProvider
 		claims   Claims
-		existing string
+		link     *model.OIDCIdentity
 		lookup   func(string) (string, bool)
 		wantUser string
 		wantBind bool
 		wantErr  bool
+		// wantIgnored is the issuer of a link that was not honoured because
+		// the provider now names another issuer.
+		wantIgnored string
+		// wantLinkIgnored reports that a link existed and was not honoured.
+		wantLinkIgnored bool
 	}{
 		{
 			name:     "existing link, no domain policy, ignores email",
 			provider: model.OIDCProvider{Issuer: "https://idp", ClientID: "c"}, // no AllowedDomains
 			claims:   Claims{Subject: "s1", Email: "changed@other.com", EmailVerified: false},
-			existing: "user-existing",
+			link:     linked("https://idp"),
 			lookup:   none,
 			wantUser: "user-existing",
 			wantBind: false,
@@ -41,7 +50,7 @@ func TestResolveIdentity(t *testing.T) {
 			name:     "existing link, domain policy satisfied, logs in",
 			provider: prov,
 			claims:   Claims{Subject: "s1b", Email: "still@example.com", EmailVerified: true},
-			existing: "user-existing",
+			link:     linked("https://idp"),
 			lookup:   none,
 			wantUser: "user-existing",
 			wantBind: false,
@@ -50,7 +59,7 @@ func TestResolveIdentity(t *testing.T) {
 			name:     "existing link RE-CHECKED: denied when domain no longer allowed",
 			provider: prov,
 			claims:   Claims{Subject: "s1c", Email: "moved@other.com", EmailVerified: true},
-			existing: "user-existing",
+			link:     linked("https://idp"),
 			lookup:   none,
 			wantErr:  true,
 		},
@@ -58,9 +67,58 @@ func TestResolveIdentity(t *testing.T) {
 			name:     "existing link RE-CHECKED: denied when email now unverified",
 			provider: prov,
 			claims:   Claims{Subject: "s1d", Email: "still@example.com", EmailVerified: false},
-			existing: "user-existing",
+			link:     linked("https://idp"),
 			lookup:   none,
 			wantErr:  true,
+		},
+		{
+			name:        "link from another issuer is not honoured, and with no local user the sign-in is denied",
+			provider:    model.OIDCProvider{Issuer: "https://idp.repointed.example", ClientID: "c"},
+			claims:      Claims{Subject: "linked-sub", Email: "attacker@repointed.example", EmailVerified: true},
+			link:        linked("https://idp"),
+			lookup:      none,
+			wantErr:     true,
+			wantIgnored: "https://idp",
+		},
+		{
+			name:        "link from another issuer is not honoured; the email path decides as for a first sign-in",
+			provider:    model.OIDCProvider{Issuer: "https://idp.repointed.example", ClientID: "c"},
+			claims:      Claims{Subject: "linked-sub", Email: "alice@example.com", EmailVerified: true},
+			link:        linked("https://idp"),
+			lookup:      userByEmail("alice@example.com"),
+			wantUser:    "user-1",
+			wantBind:    true,
+			wantIgnored: "https://idp",
+		},
+		{
+			name:            "link with no recorded issuer is not honoured",
+			provider:        model.OIDCProvider{Issuer: "https://idp", ClientID: "c"},
+			claims:          Claims{Subject: "linked-sub", Email: "nobody@example.com", EmailVerified: true},
+			link:            linked(""),
+			lookup:          none,
+			wantErr:         true,
+			wantLinkIgnored: true,
+		},
+		{
+			name:            "link naming no account is not honoured; the email path decides",
+			provider:        model.OIDCProvider{Issuer: "https://idp", ClientID: "c"},
+			claims:          Claims{Subject: "linked-sub", Email: "alice@example.com", EmailVerified: true},
+			link:            &model.OIDCIdentity{Issuer: "https://idp", Subject: "linked-sub"},
+			lookup:          userByEmail("alice@example.com"),
+			wantUser:        "user-1",
+			wantBind:        true,
+			wantIgnored:     "https://idp",
+			wantLinkIgnored: true,
+		},
+		{
+			name:            "domain policy runs before the issuer check, and the ignored link is still reported",
+			provider:        model.OIDCProvider{Issuer: "https://idp.repointed.example", ClientID: "c", AllowedDomains: []string{"example.com"}},
+			claims:          Claims{Subject: "linked-sub", Email: "alice@evil.example", EmailVerified: true},
+			link:            linked("https://idp"),
+			lookup:          userByEmail("alice@evil.example"),
+			wantErr:         true,
+			wantIgnored:     "https://idp",
+			wantLinkIgnored: true,
 		},
 		{
 			name:     "first login binds when verified+allowed+local user exists",
@@ -109,7 +167,13 @@ func TestResolveIdentity(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			res, err := ResolveIdentity(tc.provider, tc.claims, tc.existing, tc.lookup)
+			res, err := ResolveIdentity(tc.provider, tc.claims, tc.link, tc.lookup)
+			if res.IgnoredLinkIssuer != tc.wantIgnored {
+				t.Fatalf("ignored link issuer = %q, want %q", res.IgnoredLinkIssuer, tc.wantIgnored)
+			}
+			if want := tc.wantLinkIgnored || tc.wantIgnored != ""; res.LinkIgnored != want {
+				t.Fatalf("link ignored = %v, want %v", res.LinkIgnored, want)
+			}
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got resolution %+v", res)

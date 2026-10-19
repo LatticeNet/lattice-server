@@ -23,11 +23,12 @@ func oidcIdentityKey(providerID, subject string) string {
 
 // --- providers (admin config) --------------------------------------------
 
+// UpsertOIDCProvider stores p and settles its links as every provider write
+// does (UpsertOIDCProviderSettlingLinks without clearing confirmations), so
+// no caller can store a provider that its links from another issuer outlive.
 func (s *Store) UpsertOIDCProvider(p model.OIDCProvider) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.state.OIDCProviders[p.ID] = p
-	return s.Save()
+	_, _, err := s.UpsertOIDCProviderSettlingLinks(p, false, nil)
+	return err
 }
 
 func (s *Store) OIDCProvider(id string) (model.OIDCProvider, bool) {
@@ -99,7 +100,7 @@ func (s *Store) ConfirmOIDCIdentitySecondFactor(providerID, issuer, subject, use
 	defer s.mu.Unlock()
 	key := oidcIdentityKey(providerID, subject)
 	prior, ok := s.state.OIDCIdentities[key]
-	if !ok || prior.UserID != userID {
+	if !ok || prior.UserID != userID || prior.Issuer != issuer {
 		return model.OIDCIdentity{}, false, nil
 	}
 	idn := prior
@@ -123,7 +124,8 @@ func (s *Store) ConfirmOIDCIdentitySecondFactor(providerID, issuer, subject, use
 func (s *Store) ClearOIDCIdentityConfirmations(providerID string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next, n := clearedOIDCConfirmations(s.state.OIDCIdentities, providerID)
+	next := maps.Clone(s.state.OIDCIdentities)
+	n := clearOIDCConfirmations(next, providerID)
 	if n == 0 {
 		return 0, nil
 	}
@@ -137,16 +139,49 @@ func (s *Store) ClearOIDCIdentityConfirmations(providerID string) (int, error) {
 	return n, err
 }
 
-// UpsertOIDCProviderClearingConfirmations stores p and, in the same write,
-// forgets every second-factor confirmation on its links: the write that turns
-// skip_local_totp on, so no confirmation made before the policy can be
-// honoured under it, not even one landing between two writes. It returns how
-// many confirmations it cleared and whether the write is live; a live write
-// may still report a persistence error.
-func (s *Store) UpsertOIDCProviderClearingConfirmations(p model.OIDCProvider) (int, bool, error) {
+// OIDCLinkChanges is what UpsertOIDCProviderSettlingLinks did to a
+// provider's identity links.
+type OIDCLinkChanges struct {
+	// LinksRemoved counts links recorded under an issuer other than the
+	// provider's.
+	LinksRemoved int
+	// ConfirmationsCleared counts second-factor confirmations forgotten on the
+	// links that stayed.
+	ConfirmationsCleared int
+}
+
+// UpsertOIDCProviderSettlingLinks stores p and, in the same write, settles its
+// identity links: every link of p.ID recorded under an issuer other than
+// p.Issuer is removed, and with clearConfirmations every confirmation on the
+// links that stay is forgotten (the write that turns skip_local_totp on). One
+// write, so nothing can land between the provider change and the links it
+// invalidates. It returns what changed and whether the write is live; a live
+// write may still report a persistence error. guard, when set, sees the
+// record about to be replaced (nil for a new provider) under the store lock;
+// an error from it refuses the write and is returned as is.
+func (s *Store) UpsertOIDCProviderSettlingLinks(p model.OIDCProvider, clearConfirmations bool, guard func(current *model.OIDCProvider) error) (OIDCLinkChanges, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	identities, n := clearedOIDCConfirmations(s.state.OIDCIdentities, p.ID)
+	if guard != nil {
+		var current *model.OIDCProvider
+		if existing, ok := s.state.OIDCProviders[p.ID]; ok {
+			current = &existing
+		}
+		if err := guard(current); err != nil {
+			return OIDCLinkChanges{}, false, err
+		}
+	}
+	var changes OIDCLinkChanges
+	identities := maps.Clone(s.state.OIDCIdentities)
+	for k, idn := range identities {
+		if idn.ProviderID == p.ID && idn.Issuer != p.Issuer {
+			delete(identities, k)
+			changes.LinksRemoved++
+		}
+	}
+	if clearConfirmations {
+		changes.ConfirmationsCleared = clearOIDCConfirmations(identities, p.ID)
+	}
 	providers := maps.Clone(s.state.OIDCProviders)
 	providers[p.ID] = p
 	staged := s.state
@@ -154,26 +189,25 @@ func (s *Store) UpsertOIDCProviderClearingConfirmations(p model.OIDCProvider) (i
 	staged.OIDCProviders = providers
 	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
 	if !committed {
-		return 0, false, err
+		return OIDCLinkChanges{}, false, err
 	}
 	s.state = staged
-	return n, true, err
+	return changes, true, err
 }
 
-// clearedOIDCConfirmations returns a copy of identities with the confirmations
-// of providerID's links cleared, and how many it cleared.
-func clearedOIDCConfirmations(identities map[string]model.OIDCIdentity, providerID string) (map[string]model.OIDCIdentity, int) {
-	next := maps.Clone(identities)
+// clearOIDCConfirmations forgets, in identities (a copy the caller owns), the
+// confirmations of providerID's links, and reports how many it cleared.
+func clearOIDCConfirmations(identities map[string]model.OIDCIdentity, providerID string) int {
 	n := 0
-	for k, idn := range next {
+	for k, idn := range identities {
 		if idn.ProviderID != providerID || (idn.SecondFactorAt.IsZero() && idn.SecondFactorEpoch == 0) {
 			continue
 		}
 		idn.SecondFactorAt, idn.SecondFactorEpoch = time.Time{}, 0
-		next[k] = idn
+		identities[k] = idn
 		n++
 	}
-	return next, n
+	return n
 }
 
 // DeleteOIDCIdentitiesByUser removes every durable subject→user link bound to

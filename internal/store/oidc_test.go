@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -114,10 +115,10 @@ func TestOIDCAuthStateSingleUseAndExpiry(t *testing.T) {
 	}
 }
 
-// A link's second-factor confirmation changes only a link that exists and
-// still names the account, takes the issuer the sign-in saw, survives a
-// restart together with the provider's skip_local_totp policy, and is
-// cleared per provider without touching the link.
+// A link's second-factor confirmation changes only a link that exists, still
+// names the account and was recorded under the issuer the sign-in saw; it
+// survives a restart together with the provider's skip_local_totp policy, and
+// is cleared per provider without touching the link.
 func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	c := testCipher(t)
@@ -139,6 +140,15 @@ func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: "https://old.example", Subject: "sub-1", UserID: "u1", CreatedAt: at}); err != nil {
 		t.Fatal(err)
 	}
+	if _, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u1", at, 2); err != nil || ok {
+		t.Fatalf("a link recorded under another issuer must not be confirmed under this one: ok=%v err=%v", ok, err)
+	}
+	if got, _ := s.OIDCIdentity("g", "sub-1"); got.Issuer != "https://old.example" || !got.SecondFactorAt.IsZero() {
+		t.Fatalf("a refused confirmation must leave the link as it was: %+v", got)
+	}
+	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: issuer, Subject: "sub-1", UserID: "u1", CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "other", Issuer: "https://other.example", Subject: "sub-1", UserID: "u1", CreatedAt: at, SecondFactorAt: at, SecondFactorEpoch: 2}); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +156,7 @@ func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 		t.Fatalf("confirming for another account must change nothing: ok=%v err=%v", ok, err)
 	}
 	prior, ok, err := s.ConfirmOIDCIdentitySecondFactor("g", issuer, "sub-1", "u1", at, 2)
-	if err != nil || !ok || !prior.SecondFactorAt.IsZero() || prior.Issuer != "https://old.example" {
+	if err != nil || !ok || !prior.SecondFactorAt.IsZero() || prior.Issuer != issuer {
 		t.Fatalf("confirm: prior=%+v ok=%v err=%v", prior, ok, err)
 	}
 
@@ -179,7 +189,7 @@ func TestOIDCIdentitySecondFactorConfirmationPersists(t *testing.T) {
 // Turning the policy on stores the provider and clears its links'
 // confirmations in one write, and the provider's client secret stays
 // encrypted at rest on that path too.
-func TestUpsertOIDCProviderClearingConfirmations(t *testing.T) {
+func TestUpsertOIDCProviderSettlingLinksClearsConfirmations(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	c := testCipher(t)
 	s, err := OpenWithCipher(path, c)
@@ -198,9 +208,9 @@ func TestUpsertOIDCProviderClearingConfirmations(t *testing.T) {
 		}
 	}
 	p.SkipLocalTOTP = true
-	n, committed, err := s.UpsertOIDCProviderClearingConfirmations(p)
-	if err != nil || !committed || n != 2 {
-		t.Fatalf("upsert clearing: n=%d committed=%v err=%v", n, committed, err)
+	changes, committed, err := s.UpsertOIDCProviderSettlingLinks(p, true, nil)
+	if err != nil || !committed || changes.ConfirmationsCleared != 2 || changes.LinksRemoved != 0 {
+		t.Fatalf("upsert clearing: changes=%+v committed=%v err=%v", changes, committed, err)
 	}
 	raw, _ := os.ReadFile(path)
 	if strings.Contains(string(raw), secret) {
@@ -218,5 +228,85 @@ func TestUpsertOIDCProviderClearingConfirmations(t *testing.T) {
 		if idn, _ := s2.OIDCIdentity("g", sub); !idn.SecondFactorAt.IsZero() || idn.SecondFactorEpoch != 0 {
 			t.Fatalf("%s kept its confirmation: %+v", sub, idn)
 		}
+	}
+}
+
+// Saving a provider removes its links recorded under any other issuer, in the
+// same write, keeps the links under its own issuer and leaves other providers'
+// links alone; the result survives a restart.
+func TestUpsertOIDCProviderSettlingLinksRemovesOtherIssuers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	c := testCipher(t)
+	s, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 10, 18, 7, 0, 0, 0, time.UTC)
+	for _, idn := range []model.OIDCIdentity{
+		{ProviderID: "g", Issuer: "https://old.example", Subject: "s1", UserID: "u1"},
+		{ProviderID: "g", Issuer: "", Subject: "s2", UserID: "u2"},
+		{ProviderID: "g", Issuer: "https://new.example", Subject: "s3", UserID: "u3", SecondFactorAt: at},
+		{ProviderID: "other", Issuer: "https://old.example", Subject: "s1", UserID: "u1"},
+	} {
+		idn.CreatedAt = at
+		if err := s.PutOIDCIdentity(idn); err != nil {
+			t.Fatal(err)
+		}
+	}
+	changes, committed, err := s.UpsertOIDCProviderSettlingLinks(model.OIDCProvider{ID: "g", Issuer: "https://new.example", ClientID: "cid", Enabled: true, CreatedAt: at}, false, nil)
+	if err != nil || !committed || changes.LinksRemoved != 2 || changes.ConfirmationsCleared != 0 {
+		t.Fatalf("settle: changes=%+v committed=%v err=%v", changes, committed, err)
+	}
+	s2, err := OpenWithCipher(path, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sub := range []string{"s1", "s2"} {
+		if _, ok := s2.OIDCIdentity("g", sub); ok {
+			t.Fatalf("link %s from another issuer survived", sub)
+		}
+	}
+	if idn, ok := s2.OIDCIdentity("g", "s3"); !ok || idn.SecondFactorAt.IsZero() {
+		t.Fatalf("the link under the provider's issuer must stay, confirmation and all: %+v ok=%v", idn, ok)
+	}
+	if _, ok := s2.OIDCIdentity("other", "s1"); !ok {
+		t.Fatal("another provider's link must not be touched")
+	}
+	if p, ok := s2.OIDCProvider("g"); !ok || p.Issuer != "https://new.example" {
+		t.Fatalf("provider after restart: %+v ok=%v", p, ok)
+	}
+}
+
+// A guard sees the record about to be replaced under the store lock, and its
+// refusal leaves the provider and its links as they were.
+func TestUpsertOIDCProviderSettlingLinksGuard(t *testing.T) {
+	s, _ := OpenWithCipher("", nil)
+	at := time.Date(2026, 10, 18, 7, 0, 0, 0, time.UTC)
+	if err := s.UpsertOIDCProvider(model.OIDCProvider{ID: "g", Issuer: "https://old.example", ClientID: "cid", Enabled: true, CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutOIDCIdentity(model.OIDCIdentity{ProviderID: "g", Issuer: "https://old.example", Subject: "s1", UserID: "u1", CreatedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	refused := errors.New("changed meanwhile")
+	var seen *model.OIDCProvider
+	_, committed, err := s.UpsertOIDCProviderSettlingLinks(model.OIDCProvider{ID: "g", Issuer: "https://new.example", ClientID: "cid", Enabled: true, CreatedAt: at}, false,
+		func(current *model.OIDCProvider) error { seen = current; return refused })
+	if !errors.Is(err, refused) || committed {
+		t.Fatalf("a guard refusal must refuse the write: committed=%v err=%v", committed, err)
+	}
+	if seen == nil || seen.Issuer != "https://old.example" {
+		t.Fatalf("the guard must see the record about to be replaced: %+v", seen)
+	}
+	if p, _ := s.OIDCProvider("g"); p.Issuer != "https://old.example" {
+		t.Fatalf("a refused write must leave the provider: %+v", p)
+	}
+	if _, ok := s.OIDCIdentity("g", "s1"); !ok {
+		t.Fatal("a refused write must leave the links")
+	}
+	var created *model.OIDCProvider = &model.OIDCProvider{}
+	if _, committed, err := s.UpsertOIDCProviderSettlingLinks(model.OIDCProvider{ID: "new", Issuer: "https://x.example", ClientID: "c", CreatedAt: at}, false,
+		func(current *model.OIDCProvider) error { created = current; return nil }); err != nil || !committed || created != nil {
+		t.Fatalf("a new provider's guard sees nil and the write goes through: committed=%v err=%v current=%+v", committed, err, created)
 	}
 }

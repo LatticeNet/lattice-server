@@ -352,7 +352,12 @@ func TestOIDCSkipLocalTOTPIssuerFlippedDuringTheExchangeLendsNoTrust(t *testing.
 			t.Error(err)
 		}
 	}
-	assertChallenged(t, f.sso(t, "198.51.100.28:1000"))
+	// The record no longer names the issuer the claims were verified with,
+	// so the sign-in admits nobody at all, let alone without the code.
+	rec := f.sso(t, "198.51.100.28:1000")
+	if cookieNamed(rec, "lattice_session") != nil || cookieNamed(rec, totpChallengeCookie) != nil || !strings.Contains(rec.Header().Get("Location"), "sso_error=unavailable") {
+		t.Fatalf("claims verified against one issuer must not borrow another's trust: %s", rec.Header().Get("Location"))
+	}
 	if auditCount(f.st, "login.oidc.totp_skipped") != 0 {
 		t.Fatal("claims verified against one issuer must not borrow another's trust")
 	}
@@ -419,15 +424,23 @@ func TestOIDCSkipLocalTOTPNotifiesWhenAnAccountBecomesTrusted(t *testing.T) {
 		if rec := f.answerChallenge(t, addr, challengeID, "code", code, cookie); rec.Code != http.StatusOK {
 			t.Fatalf("skip=%v: second factor: %d", skip, rec.Code)
 		}
+		// The first sign-in also linked the subject by email, which is
+		// notified on its own; count the trust notifications.
+		var trusted []string
+		for _, n := range sent {
+			if strings.HasPrefix(n, "Single sign-on account trusted for sign-in") {
+				trusted = append(trusted, n)
+			}
+		}
 		want := 0
 		if skip {
 			want = 1
 		}
-		if len(sent) != want {
-			t.Fatalf("skip=%v: notifications = %q, want %d", skip, sent, want)
+		if len(trusted) != want {
+			t.Fatalf("skip=%v: trust notifications = %q, want %d", skip, trusted, want)
 		}
-		if skip && (!strings.Contains(sent[0], skipTOTPEmail) || strings.Contains(sent[0], skipTOTPSubject)) {
-			t.Fatalf("the notification names the account and masks the subject: %q", sent[0])
+		if skip && (!strings.Contains(trusted[0], skipTOTPEmail) || strings.Contains(trusted[0], skipTOTPSubject)) {
+			t.Fatalf("the notification names the account and masks the subject: %q", trusted[0])
 		}
 		var confirmed *model.AuditEvent
 		for _, ev := range f.st.AuditEvents() {

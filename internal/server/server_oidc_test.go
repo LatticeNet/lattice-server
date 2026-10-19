@@ -578,7 +578,8 @@ func TestOIDCAdminProviderSecretWriteOnly(t *testing.T) {
 	cookie, csrf := adminLogin(t, h)
 
 	// Create with a secret.
-	body := `{"display_name":"G","issuer":"https://accounts.google.com","client_id":"cid","client_secret":"mysecret","enabled":true}`
+	// Adding a provider and changing its client take a fresh step-up.
+	body := `{"display_name":"G","issuer":"https://accounts.google.com","client_id":"cid","client_secret":"mysecret","enabled":true,"step_up_grant":"` + adminStepUp(t, srv, st, cookie) + `"}`
 	rec := adminPOST(t, h, "/api/auth/oidc/providers", body, cookie, csrf)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
@@ -596,7 +597,7 @@ func TestOIDCAdminProviderSecretWriteOnly(t *testing.T) {
 	}
 
 	// Update other fields with empty secret → stored secret preserved.
-	upd := `{"id":"` + created.ID + `","issuer":"https://accounts.google.com","client_id":"cid2","client_secret":"","enabled":true}`
+	upd := `{"id":"` + created.ID + `","issuer":"https://accounts.google.com","client_id":"cid2","client_secret":"","enabled":true,"step_up_grant":"` + adminStepUp(t, srv, st, cookie) + `"}`
 	if rec := adminPOST(t, h, "/api/auth/oidc/providers", upd, cookie, csrf); rec.Code != http.StatusOK {
 		t.Fatalf("update: %d %s", rec.Code, rec.Body.String())
 	}

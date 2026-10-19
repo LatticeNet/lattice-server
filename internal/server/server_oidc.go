@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/auth"
@@ -342,25 +344,66 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	existingUserID := ""
+	// The link is judged against provider, the record the claims were just
+	// verified with, so it answers only for the issuer it was created under.
+	var existing *model.OIDCIdentity
 	if link, ok := s.store.OIDCIdentity(provider.ID, claims.Subject); ok {
-		existingUserID = link.UserID
+		existing = &link
 	}
-	res, err := oidc.ResolveIdentity(provider, claims, existingUserID, func(email string) (string, bool) {
+	res, err := oidc.ResolveIdentity(provider, claims, existing, func(email string) (string, bool) {
 		u, ok := s.store.UserByUsername(email)
 		if !ok {
 			return "", false
 		}
 		return u.ID, true
 	})
+	if res.LinkIgnored {
+		// A subject linked under another issuer was presented by this one:
+		// what a provider repointed at someone else's IdP looks like. The
+		// presenter is unknown, so the event has no actor; the account the
+		// link names is in the metadata.
+		reason := "identity link recorded under another issuer"
+		if res.IgnoredLinkIssuer == provider.Issuer {
+			reason = "identity link names no account"
+		}
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), Action: "login.oidc.stale_link_ignored", Decision: "observe",
+			Reason: reason,
+			Metadata: map[string]string{
+				"provider":        provider.ID,
+				"link_issuer":     res.IgnoredLinkIssuer,
+				"provider_issuer": provider.Issuer,
+				"linked_user":     existing.UserID,
+				"subject":         maskSSOSubject(claims.Subject),
+			}})
+	}
 	if err != nil {
-		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), Action: "login.oidc", Decision: "deny", Reason: err.Error(), Metadata: map[string]string{"provider": provider.ID, "sub": claims.Subject}})
+		// The subject and email come from the provider, possibly one an
+		// attacker runs: both are masked and bounded like every other SSO
+		// identity the server records.
+		meta := map[string]string{"provider": provider.ID, "sub": maskSSOSubject(auditTruncate(claims.Subject, 256))}
+		if email := strings.TrimSpace(claims.Email); email != "" {
+			meta["email"] = maskSSOEmail(auditTruncate(email, 256))
+		}
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), Action: "login.oidc", Decision: "deny", Reason: err.Error(), Metadata: meta})
 		s.oidcFail(w, r, st.RedirectAfter, "denied", "")
 		return
 	}
 	user, ok := s.store.User(res.UserID)
 	if !ok {
 		s.oidcFail(w, r, st.RedirectAfter, "denied", "")
+		return
+	}
+	// The claims were verified against provider, read before the exchange's
+	// round trip. Before a link is written or any session or challenge is
+	// issued, the record must still be enabled and still name that issuer and
+	// client, and the email domains the resolution was judged by: a provider
+	// disabled, deleted, repointed or narrowed meanwhile (because its IdP is
+	// compromised, say) admits nobody on the strength of the old record.
+	current, ok := s.store.OIDCProvider(provider.ID)
+	if !ok || !current.Enabled || current.Issuer != provider.Issuer || current.ClientID != provider.ClientID || !slices.Equal(current.AllowedDomains, provider.AllowedDomains) {
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), Action: "login.oidc", Decision: "deny", Reason: "provider changed during sign-in",
+			Metadata: map[string]string{"provider": provider.ID, "sub": maskSSOSubject(auditTruncate(claims.Subject, 256))}})
+		s.oidcFail(w, r, st.RedirectAfter, "unavailable", "")
 		return
 	}
 	if res.BindSubject {
@@ -375,14 +418,32 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 			s.oidcFail(w, r, st.RedirectAfter, "denied", "")
 			return
 		}
+		// A provider account newly linked to a local account by its email is
+		// where a provider pointed at the wrong IdP does its damage: said
+		// beyond the audit log, with whether the account still meets its own
+		// second factor.
+		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: user.ID, Action: "login.oidc.linked", Decision: "observe",
+			Metadata: map[string]string{
+				"provider":     provider.ID,
+				"issuer":       provider.Issuer,
+				"subject":      maskSSOSubject(claims.Subject),
+				"totp_enabled": strconv.FormatBool(user.TOTPEnabled),
+			}})
+		name := strings.TrimSpace(provider.DisplayName)
+		if name == "" {
+			name = provider.ID
+		}
+		s.emitNotify("Single sign-on account linked", fmt.Sprintf("a %s account (subject %s, %s) was linked to %s by its verified email; %s",
+			notifyField(name), maskSSOSubject(claims.Subject), notifyField(provider.Issuer), notifyField(user.Username),
+			map[bool]string{true: "the account still asks for its authenticator code", false: "the account has no second factor, so this sign-in opened the console"}[user.TOTPEnabled]))
 	}
 	// A provider the operator marked as the whole first and second factor
 	// (SkipLocalTOTP) opens the console without the local code, but only
 	// through a subject this account already confirmed with that code in its
-	// current security epoch; see ssoVouchesForSecondFactor. The policy is
-	// read again here, after the code exchange's round trip to the provider,
-	// so a flag turned off or a provider disabled meanwhile is honoured.
-	if current, ok := s.store.OIDCProvider(provider.ID); ok && user.TOTPEnabled && s.ssoVouchesForSecondFactor(provider, current, claims.Subject, user) {
+	// current security epoch; see ssoVouchesForSecondFactor. current is the
+	// record read again after the exchange, so a flag turned off meanwhile is
+	// honoured.
+	if user.TOTPEnabled && s.ssoVouchesForSecondFactor(provider, current, claims.Subject, user) {
 		if _, err := s.startSessionAudited(w, r, user, model.AuditEvent{
 			Action: "login.oidc.totp_skipped",
 			Reason: "local second factor skipped by provider policy",
@@ -623,10 +684,12 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 		// stored record: a request that leaves skip_local_totp out turns it
 		// off, the value that keeps the local TOTP step.
 		oldSkipLocalTOTP, oldIssuer := false, ""
+		var prior *model.OIDCProvider
 		if req.ID == "" {
 			req.ID = id.New("oidc")
 			req.CreatedAt = now
 		} else if existing, ok := s.store.OIDCProvider(req.ID); ok {
+			prior = &existing
 			req.CreatedAt = existing.CreatedAt
 			oldSkipLocalTOTP, oldIssuer = existing.SkipLocalTOTP, existing.Issuer
 			if req.ClientSecret == "" {
@@ -636,6 +699,10 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 			req.CreatedAt = now
 		}
 		enablingSkip := req.SkipLocalTOTP && !oldSkipLocalTOTP
+		signInChange := oidcSignInChange(prior, req)
+		if signInChange != "" && !enablingSkip && !s.requireOIDCSignInChangeAuthority(w, p, req.ID, signInChange, strings.TrimSpace(body.StepUpGrant)) {
+			return
+		}
 		// Turning the local second factor off for everyone who signs in through
 		// this provider is a relaxation of sign-in, so it takes what revealing a
 		// secret takes: an interactive session with a fresh step-up. A token
@@ -647,25 +714,35 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 				"turning on skip_local_totp requires an interactive session with a fresh second-factor step-up"))
 			return
 		}
-		// Confirmations made before the policy was on do not carry over: each
-		// account confirms its provider account again, under the policy, before
-		// the provider stands in for its code. The store clears them in the same
-		// write that turns the policy on.
+		// One store write stores the provider and settles its links. Links
+		// recorded under any other issuer are removed: they could never answer
+		// for this one (oidc.ResolveIdentity), and a provider pointed back
+		// later must not find them waiting. And confirmations made before the
+		// policy was on do not carry over: each account confirms its provider
+		// account again, under the policy, before the provider stands in for
+		// its code.
 		req.UpdatedAt = now
-		cleared := 0
-		if enablingSkip {
-			n, committed, err := s.store.UpsertOIDCProviderClearingConfirmations(req)
-			if !committed {
-				writeError(w, http.StatusInternalServerError, err)
-				return
+		// The gate above judged the change against the record as read then.
+		// The store judges it again against the record as it is when it
+		// writes, so a save authorised against an older record (a token's
+		// rename racing an operator's repoint, say) cannot carry an issuer,
+		// client or policy change past the gate, or silently undo one.
+		changes, committed, err := s.store.UpsertOIDCProviderSettlingLinks(req, enablingSkip, func(current *model.OIDCProvider) error {
+			if oidcSignInChange(current, req) != signInChange || (current != nil && current.SkipLocalTOTP) != oldSkipLocalTOTP {
+				return errOIDCProviderChanged
 			}
-			if err != nil {
-				s.logger.Printf("oidc provider upsert (%s): %v", req.ID, err)
-			}
-			cleared = n
-		} else if err := s.store.UpsertOIDCProvider(req); err != nil {
+			return nil
+		})
+		if errors.Is(err, errOIDCProviderChanged) {
+			writeError(w, http.StatusConflict, errors.New("the identity provider changed while this save was being made; reload it and save again"))
+			return
+		}
+		if !committed {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if err != nil {
+			s.logger.Printf("oidc provider upsert (%s): %v", req.ID, err)
 		}
 		meta := map[string]string{
 			"provider":            req.ID,
@@ -673,17 +750,104 @@ func (s *Server) handleOIDCProviders(w http.ResponseWriter, r *http.Request, p p
 			"old_skip_local_totp": strconv.FormatBool(oldSkipLocalTOTP),
 			"new_skip_local_totp": strconv.FormatBool(req.SkipLocalTOTP),
 		}
-		if oldIssuer != "" && oldIssuer != req.Issuer {
+		issuerChanged := oldIssuer != "" && oldIssuer != req.Issuer
+		if issuerChanged {
 			meta["old_issuer"] = oldIssuer
 		}
+		if issuerChanged || changes.LinksRemoved > 0 {
+			meta["links_removed"] = strconv.Itoa(changes.LinksRemoved)
+		}
 		if enablingSkip {
-			meta["confirmations_cleared"] = strconv.Itoa(cleared)
+			meta["confirmations_cleared"] = strconv.Itoa(changes.ConfirmationsCleared)
+		}
+		if signInChange != "" {
+			meta["sign_in_change"] = signInChange
+			meta["new_issuer"], meta["new_client_id"] = req.Issuer, req.ClientID
+			if prior != nil {
+				meta["old_issuer"], meta["old_client_id"] = prior.Issuer, prior.ClientID
+			}
 		}
 		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Decision: "allow", Metadata: meta})
+		if signInChange == "created" || signInChange == "repointed" || signInChange == "client_changed" {
+			// A new way to assert identities: said beyond the audit log.
+			name := strings.TrimSpace(req.DisplayName)
+			if name == "" {
+				name = req.ID
+			}
+			title := map[string]string{"created": "Identity provider added", "repointed": "Identity provider repointed", "client_changed": "Identity provider client changed"}[signInChange]
+			s.emitNotify(title, fmt.Sprintf("%s now signs operators in through %s (client %s), changed by %s",
+				notifyField(name), notifyField(req.Issuer), notifyField(req.ClientID), principalLabel(p)))
+		}
 		writeJSON(w, http.StatusOK, toOIDCProviderView(req))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+// errOIDCProviderChanged refuses a provider save whose gate decision no
+// longer holds against the record the store is about to replace.
+var errOIDCProviderChanged = errors.New("oidc provider changed since it was read")
+
+// notifyField bounds a provider-supplied value for a notification and drops
+// control characters, so a channel that renders it shows one plain line.
+func notifyField(v string) string {
+	v = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, v)
+	return auditTruncate(v, 200)
+}
+
+// oidcSignInChange names how saving next over prior changes which IdP
+// asserts identities through this provider, or returns "" when it does not:
+// "created" for a new provider, "repointed" for another issuer,
+// "client_changed" for another client. The provider has no discovery or
+// endpoint override, so issuer and client are the whole of it. Renaming,
+// editing the email domains or scopes, replacing the secret, disabling,
+// re-enabling, or turning skip_local_totp off leave the asserting IdP as it
+// is, and stay ungated.
+func oidcSignInChange(prior *model.OIDCProvider, next model.OIDCProvider) string {
+	switch {
+	case prior == nil:
+		return "created"
+	case prior.Issuer != next.Issuer:
+		return "repointed"
+	case prior.ClientID != next.ClientID:
+		return "client_changed"
+	default:
+		return ""
+	}
+}
+
+// requireOIDCSignInChangeAuthority is the gate in front of a change of the
+// IdP that asserts identities (oidcSignInChange). Whoever controls that
+// controls who can sign in: an IdP that says a victim's email is verified
+// binds that account on its first sign-in. So such a change is made only from
+// an interactive session with a fresh second-factor step-up, as revealing a
+// secret is; a token never makes it, so agents cannot add or repoint an IdP.
+// An operator with no second factor enrolled enrolls one first. When the
+// change may not go ahead it has audited and answered, and returns false.
+func (s *Server) requireOIDCSignInChangeAuthority(w http.ResponseWriter, p principal, providerID, change, grant string) bool {
+	refuse := func(reason, message string) bool {
+		s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "oidc.provider.upsert", Scope: "oidc:admin", Decision: "deny",
+			Reason: reason, Metadata: map[string]string{"provider": providerID, "sign_in_change": change}})
+		writeError(w, http.StatusForbidden, apiError(apiErrorStepUpRequired, message))
+		return false
+	}
+	if p.viaBearer || p.ActorID == "" || p.sessionID == "" {
+		return refuse("identity provider change from a non-session principal",
+			"adding an identity provider, or changing its issuer or client, is done from an interactive session with a fresh second-factor step-up, never by a token")
+	}
+	if !s.stepUpGrantHeld(p, grant) {
+		message := "adding an identity provider, or changing its issuer or client, requires a fresh second-factor step-up"
+		if user, ok := s.store.User(p.ActorID); ok && !user.TOTPEnabled && s.store.CountWebAuthnCredentialsByUser(user.ID) == 0 {
+			message += "; enroll an authenticator app or a passkey first"
+		}
+		return refuse("identity provider change without a fresh second-factor step-up", message)
+	}
+	return true
 }
 
 // handleDeleteOIDCProvider removes a provider by id.

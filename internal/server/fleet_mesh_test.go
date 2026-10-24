@@ -460,6 +460,42 @@ func TestFleetMeshMigrationOfMethodsAndPins(t *testing.T) {
 	}
 }
 
+// A pinned source's monitors go to the definition that holds it: the auto
+// definition can produce tcp too, but its sources measured nothing with it,
+// so every measured pair keeps its path set monitor and no pair is measured
+// twice (design 32 R1).
+func TestFleetMeshAdoptionFollowsTheSourcesAMonitorMeasuredFrom(t *testing.T) {
+	srv, _, st := meshFleet(t, t.TempDir())
+	cfg := meshConfig()
+	cfg.Method = model.LatencyMethodAuto
+	cfg.Sources = []string{"cd-hs-sh", "node-jp"}
+	cfg.SourceMethods = map[string]string{"node-jp": model.LatencyMethodTCP}
+	storePathSet(t, st, cfg)
+	if _, _, err := srv.syncLatencyProbes(meshT0); err != nil {
+		t.Fatal(err)
+	}
+	before := pathSetPairs(t, srv)
+	if _, err := srv.migratePathSet(meshT0); err != nil {
+		t.Fatal(err)
+	}
+	after := matrixPairs(t, srv)
+	pinned := 0
+	for key, want := range before {
+		if want.measure != model.PathMeasured {
+			continue
+		}
+		if strings.HasPrefix(key, "node-jp~") {
+			pinned++
+		}
+		if got := after[key]; got.monitorID != want.monitorID || got.method != want.method {
+			t.Fatalf("pair %s: path set %+v, Fleet mesh %+v", key, want, got)
+		}
+	}
+	if pinned == 0 {
+		t.Fatal("the pinned source measured nothing; the fixture proves nothing")
+	}
+}
+
 // The state file holds a definition that adopted path set monitors as
 // paused, with its own setting beside it, so the release before the
 // migration plans it paused; this release reads it back as it was.

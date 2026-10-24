@@ -192,8 +192,12 @@ func planFleetMeshMigration(cfg model.LatencyProbeConfig, nodes []model.Node, pa
 		out.defs = append(out.defs, def)
 	}
 
-	// Adoption: each path set monitor by the first definition whose method
-	// can produce it, the default method's first, else the first one.
+	// Adoption: each path set monitor by the definition that holds most of
+	// the sources it measured from, one of its own method before an auto
+	// one, so a pinned source's monitors stay with its pin instead of going
+	// to an auto definition whose sources never used that method. A
+	// definition that can produce the method comes first, else the first
+	// one.
 	ids := make([]string, 0, len(pathSet))
 	monitorByID := map[string]model.Monitor{}
 	for _, mon := range pathSet {
@@ -206,11 +210,22 @@ func planFleetMeshMigration(cfg model.LatencyProbeConfig, nodes []model.Node, pa
 		if !ok {
 			continue
 		}
-		chosen := 0
+		chosen, best := 0, -1
 		for i, def := range out.defs {
-			if def.Type == method || def.Type == model.CheckMethodAuto {
-				chosen = i
-				break
+			if def.Type != method && def.Type != model.CheckMethodAuto {
+				continue
+			}
+			score := 0
+			for _, sourceID := range monitorByID[monitorID].NodeIDs {
+				if slices.Contains(def.Sources.Nodes, sourceID) {
+					score += 2
+				}
+			}
+			if def.Type == method {
+				score++
+			}
+			if score > best {
+				chosen, best = i, score
 			}
 		}
 		def := &out.defs[chosen]

@@ -40,6 +40,10 @@ type dnsDeploymentView struct {
 	EnableTCP  bool            `json:"enable_tcp"`
 	Exposure   string          `json:"exposure"`
 	Zones      []model.DNSZone `json:"zones"`
+	// OpenResolver flags a stored deployment with public exposure and a
+	// forward zone. New ones are refused; one stored before the refusal
+	// stays readable and carries the flag until it is reshaped or disabled.
+	OpenResolver bool `json:"open_resolver,omitempty"`
 	// Listeners, CertNotAfter and Drift describe an external (observed) engine
 	// and stay empty for engines Lattice deploys itself.
 	Listeners        []model.DNSListener `json:"listeners,omitempty"`
@@ -769,6 +773,14 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 		return model.DNSDeployment{}, err
 	}
 	req.Zones = zones
+	// Refused at save as well as at plan, so the operator hears it where the
+	// exposure is chosen. A disabled deployment may still be saved, so a
+	// stored open resolver can be switched off without first being reshaped.
+	if !req.Disabled {
+		if err := selfdns.RefuseOpenResolver(req); err != nil {
+			return model.DNSDeployment{}, err
+		}
+	}
 
 	if req.Hostname != "" {
 		host, err := normalizeDNSName(req.Hostname, false, false)
@@ -1009,6 +1021,7 @@ func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView 
 		LastAppliedAt: dep.LastAppliedAt, LastError: dep.LastError,
 		LastPublishedAt: dep.LastPublishedAt, LastPublishError: dep.LastPublishError, Disabled: dep.Disabled,
 		CreatedAt: dep.CreatedAt, UpdatedAt: dep.UpdatedAt,
+		OpenResolver: selfdns.IsOpenResolver(dep),
 	}
 	if dep.Engine == model.DNSEngineExternal {
 		v.Listeners = dep.Listeners

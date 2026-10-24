@@ -730,6 +730,34 @@ func validateDeployment(dep model.DNSDeployment, opts RenderOptions) error {
 			return fmt.Errorf("zone %d unsupported mode %q", i+1, zone.Mode)
 		}
 	}
+	return RefuseOpenResolver(dep)
+}
+
+// IsOpenResolver reports whether a deployment Lattice renders would recurse
+// for anyone who reaches it: public exposure with a forward zone. Such a
+// resolver is an open resolver and a reflection source (design 32 D7).
+func IsOpenResolver(dep model.DNSDeployment) bool {
+	if dep.Engine != model.DNSEngineCoreDNS || dep.Exposure != model.DNSExposurePublic {
+		return false
+	}
+	for _, zone := range dep.Zones {
+		if strings.ToLower(strings.TrimSpace(zone.Mode)) == model.DNSZoneForward {
+			return true
+		}
+	}
+	return false
+}
+
+// ErrOpenResolver is the refusal for a deployment IsOpenResolver reports.
+var ErrOpenResolver = errors.New("public exposure with a forward zone would answer recursive queries from anyone, an open resolver; use mesh exposure, or expose only static and block zones publicly")
+
+// RefuseOpenResolver refuses a deployment that would be an open resolver.
+// Naming allowed client networks is design 32 D8 work and not an exception
+// here.
+func RefuseOpenResolver(dep model.DNSDeployment) error {
+	if IsOpenResolver(dep) {
+		return ErrOpenResolver
+	}
 	return nil
 }
 

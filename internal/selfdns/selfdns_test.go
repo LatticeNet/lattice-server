@@ -96,6 +96,28 @@ func TestGenerateConfigRejectsUnsafeInputs(t *testing.T) {
 	}
 }
 
+// A public listener with a forward zone recurses for anyone who reaches it,
+// which makes the node an open resolver and a reflection source. Design 32
+// D7 refuses it outright; a public deployment of static or block zones only
+// answers for itself and still renders.
+func TestGenerateConfigRefusesOpenPublicResolver(t *testing.T) {
+	dep := baseDeployment()
+	dep.Exposure = model.DNSExposurePublic
+	if _, err := GenerateConfig(dep, RenderOptions{}); err == nil || !strings.Contains(err.Error(), "open resolver") {
+		t.Fatalf("public forward deployment must be refused, got %v", err)
+	}
+	dep.Zones = []model.DNSZone{{Suffix: "ads.example.", Mode: model.DNSZoneBlock}}
+	if _, err := GenerateConfig(dep, RenderOptions{}); err != nil {
+		t.Fatalf("public block-only deployment should render: %v", err)
+	}
+	if !IsOpenResolver(model.DNSDeployment{Engine: model.DNSEngineCoreDNS, Exposure: model.DNSExposurePublic, Zones: []model.DNSZone{{Mode: " Forward "}}}) {
+		t.Fatal("mode is matched case and space insensitively")
+	}
+	if IsOpenResolver(model.DNSDeployment{Engine: model.DNSEngineExternal, Exposure: model.DNSExposurePublic, Zones: []model.DNSZone{{Mode: model.DNSZoneForward}}}) {
+		t.Fatal("an observed engine is never rendered, so it is not flagged")
+	}
+}
+
 func TestComposeFirewallPlan(t *testing.T) {
 	dep := baseDeployment()
 	plan, summary, err := ComposeFirewallPlan(dep, network.NFTPlan{WireGuardUDP: []int{51820}})

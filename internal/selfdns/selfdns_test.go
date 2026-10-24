@@ -350,3 +350,36 @@ func ints(values []int) []string {
 	}
 	return out
 }
+
+// A plan for a node NetGuard manages carries no lattice_guard candidate and
+// its apply script never reads or writes the table; a plan with neither the
+// candidate nor the NetGuard section is refused rather than read as one.
+func TestNetGuardOwnedPlanAppliesCoreDNSOnly(t *testing.T) {
+	dep := baseDeployment()
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RenderApprovalPlanWithOptions(dep, "tokyo-1", cfg, "table inet lattice_guard {}\n", nil, ApprovalPlanOptions{NetGuardOwnsFirewall: true}); err == nil {
+		t.Fatal("a NetGuard-owned plan must refuse a ruleset")
+	}
+	plan, err := RenderApprovalPlanWithOptions(dep, "tokyo-1", cfg, "", []string{"firewall: NetGuard manages lattice_guard on this node; this plan does not change it"}, ApprovalPlanOptions{NetGuardOwnsFirewall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := ParseApprovalPlan(plan)
+	if err != nil || artifacts.NFTRuleset != "" {
+		t.Fatalf("NetGuard-owned plan should parse with no ruleset: %+v %v", artifacts, err)
+	}
+	script, err := ApplyScriptFromPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(script, "nft") || strings.Contains(script, "lattice_guard") {
+		t.Fatalf("NetGuard-owned apply script touches the firewall:\n%s", script)
+	}
+	stripped := strings.Replace(plan, "\n## lattice_guard\n", "\n", 1)
+	if _, err := ParseApprovalPlan(stripped); err == nil {
+		t.Fatal("a plan with neither a ruleset nor the NetGuard section must not parse")
+	}
+}

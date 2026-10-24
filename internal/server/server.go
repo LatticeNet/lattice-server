@@ -8927,6 +8927,11 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	if approval.Plugin == "nft" && approval.Action == "apply-ruleset" && s.nodeGuardManaged(approval.NodeID) {
 		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "node is managed by NetGuard, which is the only writer of its lattice_guard table; plan its firewall with /api/netguard/plan")}
 	}
+	if approval.Plugin == "selfdns" {
+		if err := s.requireSelfDNSFirewallOwner(approval); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+	}
 	if approval.Plugin == proxyCorePlugin {
 		if err := s.requireCurrentProxyCoreApproval(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}

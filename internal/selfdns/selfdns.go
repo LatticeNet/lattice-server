@@ -88,7 +88,14 @@ func (src CoreDNSBinarySource) Normalize() (CoreDNSBinarySource, error) {
 
 type ApprovalPlanOptions struct {
 	CoreDNSBinary CoreDNSBinarySource
+	// NetGuardOwnsFirewall renders a plan for a node NetGuard manages: it
+	// carries no lattice_guard candidate, and its apply script installs
+	// CoreDNS only and never touches the table (design 32 D7). NetGuard
+	// stays the one writer of lattice_guard on such a node.
+	NetGuardOwnsFirewall bool
 }
+
+const netGuardFirewallHeading = "## lattice_guard"
 
 type ZoneFile struct {
 	Path    string
@@ -270,13 +277,21 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 		}
 		b.WriteString("```\n")
 	}
-	b.WriteString("\n## nftables lattice_guard candidate\n")
-	b.WriteString("```nft\n")
-	b.WriteString(nftRuleset)
-	if !strings.HasSuffix(nftRuleset, "\n") {
-		b.WriteByte('\n')
+	if opts.NetGuardOwnsFirewall {
+		if strings.TrimSpace(nftRuleset) != "" {
+			return "", errors.New("a plan for a node NetGuard manages carries no lattice_guard candidate")
+		}
+		b.WriteString("\n" + netGuardFirewallHeading + "\n")
+		b.WriteString("NetGuard manages this table on the node. This plan does not change it.\n")
+	} else {
+		b.WriteString("\n## nftables lattice_guard candidate\n")
+		b.WriteString("```nft\n")
+		b.WriteString(nftRuleset)
+		if !strings.HasSuffix(nftRuleset, "\n") {
+			b.WriteByte('\n')
+		}
+		b.WriteString("```\n")
 	}
-	b.WriteString("```\n")
 	if dep.Hostname != "" {
 		b.WriteString("\n## Cloudflare action\n")
 		fmt.Fprintf(&b, "- publish %s A=%t AAAA=%t via server-side DDNS/Cloudflare credential; token is not included in this plan\n", dep.Hostname, dep.PublishIPv4, dep.PublishIPv6)
@@ -292,9 +307,14 @@ func ParseApprovalPlan(plan string) (ApplyArtifacts, error) {
 	if err != nil {
 		return ApplyArtifacts{}, err
 	}
-	nft, err := fencedSection(plan, "## nftables lattice_guard candidate", "nft")
+	// A plan for a node NetGuard manages carries no candidate, and its apply
+	// leaves lattice_guard alone; any other plan must carry one.
+	nft, hasNFT, err := optionalFencedSection(plan, "## nftables lattice_guard candidate", "nft")
 	if err != nil {
 		return ApplyArtifacts{}, err
+	}
+	if !hasNFT && !strings.Contains(plan, "\n"+netGuardFirewallHeading+"\n") {
+		return ApplyArtifacts{}, errors.New(`missing section "## nftables lattice_guard candidate"`)
 	}
 	zones, err := zoneSections(plan)
 	if err != nil {
@@ -315,28 +335,42 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Without a candidate the plan is for a node NetGuard manages: the script
+	// installs CoreDNS and rolls back its config only, and never reads or
+	// writes lattice_guard.
+	firewall := artifacts.NFTRuleset != ""
+	rollbackWhat := "config"
+	if firewall {
+		rollbackWhat = "config and firewall"
+	}
 	var b strings.Builder
 	b.WriteString("set -e\n")
 	b.WriteString("umask 077\n")
 	b.WriteString("SELF_DNS_DIR=/etc/lattice/selfdns\n")
 	b.WriteString("ZONE_DIR=/etc/lattice/selfdns/zones\n")
 	b.WriteString("CORE_CANDIDATE=/etc/lattice/selfdns/Corefile.new\n")
-	b.WriteString("NFT_CANDIDATE=/etc/lattice/guard.nft.new\n")
-	b.WriteString("NFT_ROLLBACK=/etc/lattice/guard.rollback.nft\n")
+	if firewall {
+		b.WriteString("NFT_CANDIDATE=/etc/lattice/guard.nft.new\n")
+		b.WriteString("NFT_ROLLBACK=/etc/lattice/guard.rollback.nft\n")
+	}
 	b.WriteString("CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$\n")
 	b.WriteString("WATCHDOG=\n")
 	b.WriteString("WATCHDOG_FIRED=/tmp/lattice-selfdns-watchdog.$$\n")
 	b.WriteString("UNIT=/etc/systemd/system/lattice-selfdns.service\n")
 	writeCoreDNSBootstrap(&b, artifacts.CoreDNSBinary)
-	b.WriteString("command -v nft >/dev/null || { echo 'lattice selfdns: nft binary not found in PATH' >&2; exit 1; }\n")
+	if firewall {
+		b.WriteString("command -v nft >/dev/null || { echo 'lattice selfdns: nft binary not found in PATH' >&2; exit 1; }\n")
+	}
 	b.WriteString("command -v systemctl >/dev/null || { echo 'lattice selfdns: systemd is required for this apply slice' >&2; exit 1; }\n")
 	b.WriteString("mkdir -p \"$SELF_DNS_DIR\" \"$ZONE_DIR\" /etc/lattice\n")
 	b.WriteString("rm -rf \"$CONFIG_BACKUP\"\n")
 	b.WriteString("if [ -d \"$SELF_DNS_DIR\" ]; then cp -a \"$SELF_DNS_DIR\" \"$CONFIG_BACKUP\"; else mkdir -p \"$CONFIG_BACKUP\"; fi\n")
 	b.WriteString("rollback() {\n")
 	b.WriteString("  set +e\n")
-	b.WriteString("  echo 'lattice selfdns: rolling back config and firewall' >&2\n")
-	b.WriteString("  nft -f \"$NFT_ROLLBACK\" 2>/dev/null || true\n")
+	b.WriteString("  echo 'lattice selfdns: rolling back " + rollbackWhat + "' >&2\n")
+	if firewall {
+		b.WriteString("  nft -f \"$NFT_ROLLBACK\" 2>/dev/null || true\n")
+	}
 	b.WriteString("  if [ -d \"$CONFIG_BACKUP\" ]; then rm -rf \"$SELF_DNS_DIR\"; mv \"$CONFIG_BACKUP\" \"$SELF_DNS_DIR\"; fi\n")
 	b.WriteString("  systemctl restart lattice-selfdns.service 2>/dev/null || true\n")
 	b.WriteString("}\n")
@@ -349,7 +383,11 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	b.WriteString("}\n")
 	b.WriteString("start_watchdog() {\n")
 	b.WriteString("  if command -v setsid >/dev/null 2>&1; then\n")
-	b.WriteString("    setsid sh -c 'sleep 60; echo \"lattice selfdns: watchdog rollback fired\" >&2; touch \"$1\" 2>/dev/null || true; echo \"lattice selfdns: rolling back config and firewall\" >&2; nft -f \"$2\" 2>/dev/null || true; if [ -d \"$3\" ]; then rm -rf \"$4\"; mv \"$3\" \"$4\"; fi; systemctl restart lattice-selfdns.service 2>/dev/null || true' sh \"$WATCHDOG_FIRED\" \"$NFT_ROLLBACK\" \"$CONFIG_BACKUP\" \"$SELF_DNS_DIR\" &\n")
+	if firewall {
+		b.WriteString("    setsid sh -c 'sleep 60; echo \"lattice selfdns: watchdog rollback fired\" >&2; touch \"$1\" 2>/dev/null || true; echo \"lattice selfdns: rolling back config and firewall\" >&2; nft -f \"$2\" 2>/dev/null || true; if [ -d \"$3\" ]; then rm -rf \"$4\"; mv \"$3\" \"$4\"; fi; systemctl restart lattice-selfdns.service 2>/dev/null || true' sh \"$WATCHDOG_FIRED\" \"$NFT_ROLLBACK\" \"$CONFIG_BACKUP\" \"$SELF_DNS_DIR\" &\n")
+	} else {
+		b.WriteString("    setsid sh -c 'sleep 60; echo \"lattice selfdns: watchdog rollback fired\" >&2; touch \"$1\" 2>/dev/null || true; echo \"lattice selfdns: rolling back config\" >&2; if [ -d \"$2\" ]; then rm -rf \"$3\"; mv \"$2\" \"$3\"; fi; systemctl restart lattice-selfdns.service 2>/dev/null || true' sh \"$WATCHDOG_FIRED\" \"$CONFIG_BACKUP\" \"$SELF_DNS_DIR\" &\n")
+	}
 	b.WriteString("  else\n")
 	b.WriteString("    ( sleep 60; echo 'lattice selfdns: watchdog rollback fired' >&2; touch \"$WATCHDOG_FIRED\" 2>/dev/null || true; rollback ) &\n")
 	b.WriteString("  fi\n")
@@ -369,14 +407,18 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	b.WriteString(heredocWrite(CorefilePath+".new", "LATTICE_SELF_DNS_CORE_EOF", artifacts.Corefile))
 	b.WriteString("mv \"$CORE_CANDIDATE\" " + shellQuote(CorefilePath) + "\n")
 	b.WriteString("\"$COREDNS_BIN\" -conf " + shellQuote(CorefilePath) + " -plugins >/dev/null\n")
-	b.WriteString(heredocWrite(NFTGuardPath+".new", "LATTICE_SELF_DNS_NFT_EOF", artifacts.NFTRuleset))
-	b.WriteString("nft -c -f \"$NFT_CANDIDATE\"\n")
-	// One table only: a `flush ruleset` snapshot would take Docker's tables,
-	// SSH Guard's lattice_knock and every other tenant with it on rollback.
-	b.WriteString("{ echo 'add table inet lattice_guard'; echo 'delete table inet lattice_guard'; nft list table inet lattice_guard 2>/dev/null || true; } > \"$NFT_ROLLBACK\"\n")
-	b.WriteString("start_watchdog\n")
-	b.WriteString("nft -f \"$NFT_CANDIDATE\"\n")
-	b.WriteString("mv \"$NFT_CANDIDATE\" " + shellQuote(NFTGuardPath) + "\n")
+	if firewall {
+		b.WriteString(heredocWrite(NFTGuardPath+".new", "LATTICE_SELF_DNS_NFT_EOF", artifacts.NFTRuleset))
+		b.WriteString("nft -c -f \"$NFT_CANDIDATE\"\n")
+		// One table only: a `flush ruleset` snapshot would take Docker's tables,
+		// SSH Guard's lattice_knock and every other tenant with it on rollback.
+		b.WriteString("{ echo 'add table inet lattice_guard'; echo 'delete table inet lattice_guard'; nft list table inet lattice_guard 2>/dev/null || true; } > \"$NFT_ROLLBACK\"\n")
+		b.WriteString("start_watchdog\n")
+		b.WriteString("nft -f \"$NFT_CANDIDATE\"\n")
+		b.WriteString("mv \"$NFT_CANDIDATE\" " + shellQuote(NFTGuardPath) + "\n")
+	} else {
+		b.WriteString("start_watchdog\n")
+	}
 	serviceExec := "/usr/bin/env coredns"
 	if artifacts.CoreDNSBinary != nil && artifacts.CoreDNSBinary.Enabled() {
 		serviceExec = CoreDNSPath

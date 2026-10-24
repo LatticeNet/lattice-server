@@ -214,6 +214,10 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if s.nodeGuardManaged(dep.NodeID) {
+		s.planSelfDNSUnderNetGuard(w, r, p, dep, node, cfg)
+		return
+	}
 	planInput := network.NFTPlan{}
 	inputSource := "default"
 	if stored, ok := s.store.NFTInputs(dep.NodeID); ok {
@@ -301,6 +305,111 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: dep.NodeID, Action: "dns.plan", Scope: "dns:admin", Metadata: metadata})
 	writeJSON(w, http.StatusOK, map[string]any{"approval": approval, "findings": findings})
+}
+
+// planSelfDNSUnderNetGuard plans a deployment on a node NetGuard manages
+// (design 32 D7). NetGuard is the one writer of lattice_guard there, so the
+// plan installs CoreDNS only and never carries a ruleset. It first checks,
+// against the node's current NetGuard compile and without changing anything,
+// that every listener the deployment serves is already open to its audience,
+// and refuses with what to open otherwise: a resolver behind a closed port
+// would apply cleanly and answer nobody.
+func (s *Server) planSelfDNSUnderNetGuard(w http.ResponseWriter, r *http.Request, p principal, dep model.DNSDeployment, node model.Node, cfg selfdns.ConfigBundle) {
+	var listeners []string
+	if !dep.Disabled {
+		input, err := s.compileInputForSystem(dep.NodeID)
+		var compiled network.NFTPlan
+		if err == nil {
+			compiled, err = netguard.Compile(input)
+		}
+		if err != nil {
+			writeError(w, http.StatusConflict, errors.New("the node's NetGuard intent does not compile, so the DNS ports cannot be checked; fix it in NetGuard first"))
+			return
+		}
+		audience, where := netguard.AudiencePublic, "to the public"
+		if dep.Exposure == model.DNSExposureMesh {
+			audience, where = netguard.AudienceMesh, "from the WireGuard range"
+		}
+		var closed []string
+		for _, proto := range dnsListenerProtocols(dep) {
+			socket := fmt.Sprintf("%s/%d", proto, dep.ListenPort)
+			if !netguard.Admits(compiled, proto, dep.ListenPort, audience) {
+				closed = append(closed, socket)
+				continue
+			}
+			listeners = append(listeners, socket)
+		}
+		if len(closed) > 0 {
+			writeError(w, http.StatusConflict, fmt.Errorf("open %s %s in a security group on %s first: NetGuard manages this node's firewall, and a DNS plan here does not change it",
+				strings.Join(closed, " and "), where, node.Name))
+			return
+		}
+	}
+	summary := []string{"firewall: NetGuard manages lattice_guard on this node; this plan does not change it"}
+	for _, socket := range listeners {
+		summary = append(summary, "NetGuard admits "+socket)
+	}
+	if dep.Disabled {
+		summary = append(summary, "disabled deployment: no DNS listener ports checked")
+	}
+	planText, err := selfdns.RenderApprovalPlanWithOptions(dep, node.Name, cfg, "", summary, selfdns.ApprovalPlanOptions{CoreDNSBinary: s.coreDNSBinary, NetGuardOwnsFirewall: true})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	approval := model.Approval{
+		ID:        id.New("approval"),
+		NodeID:    dep.NodeID,
+		Plugin:    "selfdns",
+		Action:    selfDNSApprovalAction(dep.ID),
+		Plan:      planText,
+		Status:    model.ApprovalPending,
+		ActorID:   p.ActorID,
+		CreatedAt: time.Now().UTC(),
+	}
+	approval, err = s.submitApproval(r.Context(), approval)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: dep.NodeID, Action: "dns.plan", Scope: "dns:admin", Metadata: map[string]string{
+		"approval_id": approval.ID,
+		"dns_id":      dep.ID,
+		"engine":      dep.Engine,
+		"exposure":    dep.Exposure,
+		"nft_source":  "netguard",
+	}})
+	writeJSON(w, http.StatusOK, map[string]any{"approval": approval, "findings": []netguard.Finding{}})
+}
+
+// dnsListenerProtocols is the protocols a deployment listens on.
+func dnsListenerProtocols(dep model.DNSDeployment) []string {
+	var out []string
+	if dep.EnableUDP {
+		out = append(out, network.NFTProtoUDP)
+	}
+	if dep.EnableTCP {
+		out = append(out, network.NFTProtoTCP)
+	}
+	return out
+}
+
+// requireSelfDNSFirewallOwner refuses a DNS approval that would write
+// lattice_guard on a node NetGuard manages: one planned before the node was
+// adopted, or one an auto-approve rule decides. NetGuard stays the one writer
+// of the table there; a plan made under NetGuard carries no ruleset.
+func (s *Server) requireSelfDNSFirewallOwner(approval model.Approval) error {
+	if !s.nodeGuardManaged(approval.NodeID) {
+		return nil
+	}
+	artifacts, err := selfdns.ParseApprovalPlan(approval.Plan)
+	if err != nil {
+		return fmt.Errorf("selfdns plan is no longer applyable: %w", err)
+	}
+	if artifacts.NFTRuleset != "" {
+		return errors.New("node is managed by NetGuard, which is the only writer of its lattice_guard table, and this DNS plan would replace it; plan the deployment again")
+	}
+	return nil
 }
 
 func (s *Server) handleDNSPublish(w http.ResponseWriter, r *http.Request, p principal) {

@@ -5208,27 +5208,28 @@ func (s *Store) Groups() []model.Group {
 	return out
 }
 
-// DeleteGroup removes a group. It refuses (returns an error) when the group
-// still has child groups (another group's ParentID points at it) or is the
-// scope of any GroupNetPolicy, so deletion cannot orphan a subtree or silently
-// drop an authored policy. Phase 1 surfaces this as an explicit
-// reparent-to-root flow before delete. A missing id is a no-op (idempotent,
-// matching the other Delete* methods).
+// DeleteGroup removes a group. It refuses with a *GroupInUseError when the
+// group still has child groups (another group's ParentID points at it) or
+// when any outbound policy names it, as a target or as a rule's remote, so
+// deletion cannot orphan a subtree or leave a policy naming nothing. Phase 1
+// surfaces this as an explicit reparent-to-root flow before delete. A missing
+// id is a no-op (idempotent, matching the other Delete* methods).
 func (s *Store) DeleteGroup(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.state.Groups[id]; !ok {
 		return nil
 	}
-	for _, child := range s.state.Groups {
-		if child.ParentID == id {
-			return fmt.Errorf("group %q has child group %q; reparent or delete children first", id, child.ID)
-		}
+	all := make([]model.Group, 0, len(s.state.Groups))
+	for _, g := range s.state.Groups {
+		all = append(all, g)
 	}
+	policies := make([]model.GroupNetPolicy, 0, len(s.state.GroupPolicies))
 	for _, gp := range s.state.GroupPolicies {
-		if gp.ScopeGroupID == id {
-			return fmt.Errorf("group %q is referenced by group policy %q; delete the policy first", id, gp.ID)
-		}
+		policies = append(policies, gp)
+	}
+	if err := groupInUse(id, all, policies); err != nil {
+		return err
 	}
 	delete(s.state.Groups, id)
 	return s.Save()
@@ -5302,6 +5303,10 @@ func cloneGroup(g model.Group) model.Group {
 // cloneGroupPolicy deep-copies a group policy's Rules (and each rule's Ports)
 // so persisted state and returned values never share a backing array.
 func cloneGroupPolicy(p model.GroupNetPolicy) model.GroupNetPolicy {
+	if p.Scope != nil {
+		scope := p.TargetScope()
+		p.Scope = &scope
+	}
 	if p.Rules != nil {
 		rules := make([]model.GroupNetRule, len(p.Rules))
 		for i, r := range p.Rules {

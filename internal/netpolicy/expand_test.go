@@ -25,7 +25,7 @@ func TestExpandGroupPoliciesGroupRemoteFanout(t *testing.T) {
 		}},
 	}}
 
-	out := ExpandGroupPolicies(policies, resolved)
+	out := ExpandGroupPolicies(policies, aliasTargets(policies, resolved), resolved)
 	// Both web members get policies; each fans the g-db remote to n3 and n4.
 	for _, target := range []string{"n1", "n2"} {
 		np, ok := out[target]
@@ -58,7 +58,7 @@ func TestExpandSkipsSelfRef(t *testing.T) {
 			Remote: model.NetEndpoint{Kind: model.NetRefGroup, GroupID: "g"}, // intra-group
 		}},
 	}}
-	out := ExpandGroupPolicies(policies, resolved)
+	out := ExpandGroupPolicies(policies, aliasTargets(policies, resolved), resolved)
 	// n1 should get a rule to n2 only (not to itself); likewise n2 -> n1.
 	if len(out["n1"].Rules) != 1 || out["n1"].Rules[0].Remote.NodeID != "n2" {
 		t.Fatalf("n1 self-ref not skipped: %+v", out["n1"].Rules)
@@ -74,7 +74,7 @@ func TestExpandMultiPolicyPriorityUnion(t *testing.T) {
 		{ID: "gnp_b", ScopeGroupID: "g", Enabled: true, Priority: 10, Rules: []model.GroupNetRule{{ID: "low", Action: "allow", Direction: "egress", Protocol: "tcp", Remote: model.NetEndpoint{Kind: model.NetRefCIDR, CIDR: "10.0.0.0/8"}}}},
 		{ID: "gnp_a", ScopeGroupID: "g", Enabled: true, Priority: 1, Rules: []model.GroupNetRule{{ID: "high", Action: "deny", Direction: "egress", Protocol: "any", Remote: model.NetEndpoint{Kind: model.NetRefAny}}}},
 	}
-	out := ExpandGroupPolicies(policies, resolved)
+	out := ExpandGroupPolicies(policies, aliasTargets(policies, resolved), resolved)
 	np := out["n1"]
 	if len(np.Rules) != 2 {
 		t.Fatalf("expected union of 2 rules, got %d", len(np.Rules))
@@ -94,7 +94,7 @@ func TestExpandDropsDisabledAndPassesThroughNonGroup(t *testing.T) {
 			{ID: "cidr", Action: "allow", Direction: "egress", Protocol: "tcp", Ports: []int{443}, Remote: model.NetEndpoint{Kind: model.NetRefCIDR, CIDR: "1.1.1.1/32"}},
 		},
 	}}
-	out := ExpandGroupPolicies(policies, resolved)
+	out := ExpandGroupPolicies(policies, aliasTargets(policies, resolved), resolved)
 	np := out["n1"]
 	if len(np.Rules) != 1 || np.Rules[0].ID != "cidr" || np.Rules[0].Remote.CIDR != "1.1.1.1/32" {
 		t.Fatalf("expected only the cidr rule passed through, got %+v", np.Rules)
@@ -107,8 +107,18 @@ func TestExpandDisabledPolicyAndEmptyScope(t *testing.T) {
 		{ID: "off", ScopeGroupID: "g", Enabled: false, Rules: []model.GroupNetRule{{ID: "x", Remote: model.NetEndpoint{Kind: model.NetRefAny}}}},
 		{ID: "empty", ScopeGroupID: "empty", Enabled: true, Rules: []model.GroupNetRule{{ID: "y", Remote: model.NetEndpoint{Kind: model.NetRefAny}}}},
 	}
-	out := ExpandGroupPolicies(policies, resolved)
+	out := ExpandGroupPolicies(policies, aliasTargets(policies, resolved), resolved)
 	if len(out) != 0 {
 		t.Fatalf("disabled policy + empty-scope policy should yield nothing, got %v", out)
 	}
+}
+
+// aliasTargets is the target map for policies that name only scope_group_id,
+// built from a hand-written membership map: each policy targets its group.
+func aliasTargets(policies []model.GroupNetPolicy, resolved map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(policies))
+	for _, gp := range policies {
+		out[gp.ID] = resolved[gp.ScopeGroupID]
+	}
+	return out
 }

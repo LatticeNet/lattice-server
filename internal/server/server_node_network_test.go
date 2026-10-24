@@ -520,6 +520,35 @@ func TestNodeNetworkRefusesOutsideTheCallersScope(t *testing.T) {
 	}
 }
 
+// A manual document is compiled as it is stored, without the normalisation
+// that refuses a group-derived one, so the compile itself must refuse a rule
+// naming a node the caller cannot read rather than drop the rule.
+func TestNodeNetworkRefusesAManualPolicyNamingAnUnreadableNode(t *testing.T) {
+	_, handler, _, cookies, csrf := nodeNetworkFleet(t)
+	res := doJSON(t, handler, http.MethodPost, "/api/netpolicy", `{"target_node_id":"n1","enabled":true,"rules":[{"id":"ssh","action":"allow","direction":"egress","protocol":"tcp","ports":[22],"remote":{"kind":"node","node_id":"n2"}}]}`, cookies, csrf)
+	if raw := readBody(t, res); res.StatusCode != http.StatusOK {
+		t.Fatalf("manual policy = %d %s", res.StatusCode, raw)
+	}
+	if _, view, raw := getNodeNetwork(t, handler, cookies, "node_id=n1&rules=1"); view.Outbound.Source != "manual" || !strings.Contains(view.Tables[view.table(t, "inet lattice_policy")].CompileNow.Ruleset, "10.66.0.2") {
+		t.Fatalf("an unrestricted reader sees the manual compile with its remote: %s", raw)
+	}
+
+	confined := createPAT(t, handler, cookies, csrf, []string{"node:read", "netpolicy:read"}, []string{"n1"})
+	code, view, raw := bearerNodeNetwork(t, handler, confined, "node_id=n1&rules=1")
+	if code != http.StatusOK || view.Outbound.Source != "manual" {
+		t.Fatalf("confined = %d %s", code, raw)
+	}
+	policy := view.Tables[view.table(t, "inet lattice_policy")]
+	if policy.CompileNow.State != "refused" || policy.CompileNow.Scope != "netpolicy:read" || policy.CompileNow.Ruleset != "" || policy.CompileNow.SHA256 != "" {
+		t.Fatalf("a manual rule naming an unreadable node refuses the compile: %+v", policy.CompileNow)
+	}
+	for _, leak := range []string{"10.66.0.2", "198.51.100.9", "la-1"} {
+		if strings.Contains(raw, leak) {
+			t.Fatalf("confined body leaks %q: %s", leak, raw)
+		}
+	}
+}
+
 // Access says whether a knock is required and the stage, never the sequence;
 // the knock table serves no rules at all.
 func TestNodeNetworkNeverServesTheKnockSequence(t *testing.T) {

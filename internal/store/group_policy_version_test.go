@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -71,5 +73,33 @@ func TestNodeDeleteMovesTheVersionOfAPolicyItRewrites(t *testing.T) {
 		if got.Version != want.Version+1 {
 			t.Fatalf("%s version after the cascade = %d, want %d", want.ID, got.Version, want.Version+1)
 		}
+	}
+}
+
+// A policy stored before versions existed has none on disk. It loads as
+// version 1, so an editor that read it sends 1 and a second editor's stale
+// save is refused from the first save after the upgrade.
+func TestAnUnversionedStoredPolicyLoadsAsVersionOne(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(`{"group_policies":{"gnp_old":{"id":"gnp_old","enabled":true,"priority":10}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st, err := LoadJSONState(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := st.GroupPolicies["gnp_old"].Version; got != 1 {
+		t.Fatalf("loaded version = %d, want 1", got)
+	}
+	s, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.state.GroupPolicies["gnp_old"] = st.GroupPolicies["gnp_old"]
+	if saved, err := s.SaveGroupPolicy(model.GroupNetPolicy{ID: "gnp_old", Name: "first", Enabled: true}, 1); err != nil || saved.Version != 2 {
+		t.Fatalf("first save at the loaded version = %+v, %v", saved, err)
+	}
+	if _, err := s.SaveGroupPolicy(model.GroupNetPolicy{ID: "gnp_old", Name: "second", Enabled: true}, 1); !errors.Is(err, ErrGroupPolicyVersion) {
+		t.Fatalf("the other editor's save = %v, want ErrGroupPolicyVersion", err)
 	}
 }

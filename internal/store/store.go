@@ -1157,6 +1157,15 @@ func (st *State) ensureMaps() {
 	if st.GroupPolicies == nil {
 		st.GroupPolicies = map[string]model.GroupNetPolicy{}
 	}
+	// A policy stored before versions existed reads as version 1, so two
+	// editors who read it before its first save still conflict instead of
+	// the later one silently winning. Kept in memory; the next save writes it.
+	for id, gp := range st.GroupPolicies {
+		if gp.Version < 1 {
+			gp.Version = 1
+			st.GroupPolicies[id] = gp
+		}
+	}
 	if st.GeoRouting == nil {
 		st.GeoRouting = map[string]model.GeoRouting{}
 	}
@@ -5278,8 +5287,19 @@ func (s *Store) SaveGroupPolicy(p model.GroupNetPolicy, expected int64) (model.G
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = p.UpdatedAt
 	}
-	s.state.GroupPolicies[p.ID] = cloneGroupPolicy(p)
-	if err := s.Save(); err != nil {
+	// Staged, so a save that fails to persist leaves the version the caller
+	// read in place and its retry is not refused as stale.
+	staged := s.state
+	staged.GroupPolicies = make(map[string]model.GroupNetPolicy, len(s.state.GroupPolicies)+1)
+	for id, gp := range s.state.GroupPolicies {
+		staged.GroupPolicies[id] = gp
+	}
+	staged.GroupPolicies[p.ID] = cloneGroupPolicy(p)
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	if err != nil {
 		return model.GroupNetPolicy{}, err
 	}
 	return cloneGroupPolicy(p), nil

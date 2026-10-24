@@ -36,6 +36,8 @@ func cloneCheckDefinition(def model.CheckDefinition) model.CheckDefinition {
 	def.Addresses = slices.Clone(def.Addresses)
 	def.Headers = slices.Clone(def.Headers)
 	def.SecretsOrigins = slices.Clone(def.SecretsOrigins)
+	def.ExcludedPairs = slices.Clone(def.ExcludedPairs)
+	def.Adopted = slices.Clone(def.Adopted)
 	if def.Degraded != nil {
 		rule := *def.Degraded
 		def.Degraded = &rule
@@ -166,7 +168,7 @@ func (s *Store) DeleteCheckDefinition(id string, expected int64, monitorIDs []st
 	owner := CheckDefinitionOwner(id)
 	var held []string
 	for monitorID, mon := range s.state.Monitors {
-		if mon.ManagedBy == owner {
+		if MonitorOwnerKey(mon) == owner {
 			held = append(held, monitorID)
 		}
 	}
@@ -216,7 +218,7 @@ func (s *Store) ForgetCheckMonitors(id string, monitorIDs []string) ([]string, e
 	}
 	for _, monitorID := range ids {
 		mon, ok := s.state.Monitors[monitorID]
-		if !ok || mon.ManagedBy != owner || mon.Enabled {
+		if !ok || MonitorOwnerKey(mon) != owner || mon.Enabled {
 			return nil, ErrCheckDefinitionMonitors
 		}
 	}

@@ -533,6 +533,7 @@ func (s *Server) handleMonitorSeries(w http.ResponseWriter, r *http.Request, p p
 	// with no current check.
 	var basePair *store.MonitorPair
 	var rule model.MonitorDegradedRule
+	checkID := ""
 	if monitorID := strings.TrimSpace(q.Get("monitor")); monitorID != "" {
 		mon, ok := s.store.Monitor(monitorID)
 		if !ok {
@@ -570,29 +571,21 @@ func (s *Server) handleMonitorSeries(w http.ResponseWriter, r *http.Request, p p
 			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
 			return
 		}
-		checks = s.generatedPathChecks(target)
-		if len(checks) == 0 {
-			writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "no generated check reaches that node"))
+		// A pair is keyed by its nodes whichever check measures it (design
+		// 32 R1): ?check= names which one's series, else the first.
+		pick, ok := s.pairCheckFor(p, source, target, strings.TrimSpace(q.Get("check")), now)
+		if !ok {
+			writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "no check measures that pair"))
 			return
 		}
-		interval = s.latencyInterval()
-		plan := s.pathPlan(now)
-		for _, pair := range plan.Pairs {
-			if pair.Source != source || pair.Target != target || pair.MonitorID == "" {
-				continue
-			}
-			if _, ok := s.store.Monitor(pair.MonitorID); ok {
-				basePair = &store.MonitorPair{MonitorID: pair.MonitorID, NodeID: source}
-				rule = pathSetPolicy(plan.Config).rule
-			}
-			break
-		}
+		checks, interval, basePair, rule, checkID = pick.checks, pick.interval, pick.basePair, pick.rule, pick.id
 	}
 	series, err := s.pathSeriesFor(checks, source, window, interval, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	series.Check = checkID
 	if basePair != nil {
 		if series.Baseline, err = s.pathBaselineView(*basePair, rule, now); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -607,6 +600,160 @@ func (s *Server) handleMonitorSeries(w http.ResponseWriter, r *http.Request, p p
 		}
 	}
 	writeJSON(w, http.StatusOK, series)
+}
+
+// pairCheck is one check on a node pair as the series route reads it: a
+// definition (all of its monitors that reached the pair, every method an
+// auto definition used) or a single check, or the unmigrated path set.
+type pairCheck struct {
+	id       string
+	name     string
+	checks   []pathCheck
+	interval time.Duration
+	// basePair and rule are the pair the path is judged on now, nil when
+	// nothing measures it now.
+	basePair *store.MonitorPair
+	rule     model.MonitorDegradedRule
+	measured bool
+}
+
+// pairChecksFor lists the checks that reach the pair (source, target)
+// that p may read: the path set's generated checks while it is not
+// migrated, then every authored check whose target is the node or an
+// address of it and which holds the source, its history included. Measured
+// checks come first, then by name.
+func (s *Server) pairChecksFor(p principal, source, target string, now time.Time) []pairCheck {
+	nodes := map[string]model.Node{}
+	for _, n := range s.store.Nodes() {
+		nodes[n.ID] = n
+	}
+	var out []pairCheck
+	if generated := s.generatedPathChecks(target); len(generated) > 0 {
+		// The unmigrated path set has no definition or monitor id to name,
+		// so its series answers without one.
+		pc := pairCheck{name: model.CheckFleetMeshName, checks: generated, interval: s.latencyInterval()}
+		plan := s.pathPlan(now)
+		for _, pair := range plan.Pairs {
+			if pair.Source != source || pair.Target != target || pair.MonitorID == "" {
+				continue
+			}
+			if _, ok := s.store.Monitor(pair.MonitorID); ok {
+				pc.basePair = &store.MonitorPair{MonitorID: pair.MonitorID, NodeID: source}
+				pc.rule = pathSetPolicy(plan.Config).rule
+				pc.measured = pair.Active
+			}
+			break
+		}
+		out = append(out, pc)
+	}
+	byAddress := pathNodesByAddress(nodes)
+	byKey := map[string]int{}
+	definitions := map[string]bool{}
+	var authored []pairCheck
+	for _, mon := range s.store.Monitors() {
+		if !store.MonitorOwnerOf(mon).Authored() || mon.Type == model.MonitorTypeTLS {
+			continue
+		}
+		targetNode := mon.TargetNode
+		if targetNode == "" {
+			targetNode = byAddress.get(pathTargetHost(mon))
+		}
+		if targetNode != target || (!mon.AssignAll && !slices.Contains(mon.NodeIDs, source)) {
+			continue
+		}
+		if !monitorVisibleToPrincipal(p, "monitor:read", mon) || !s.operatorPathVisible(p, mon, source) {
+			continue
+		}
+		key, name := mon.ID, mon.Name
+		if definitionID, ok := store.MonitorDefinitionID(mon); ok {
+			key = definitionID
+			definitions[key] = true
+			if def, found := s.store.CheckDefinition(definitionID); found {
+				name = def.Name
+			}
+		}
+		i, seen := byKey[key]
+		if !seen {
+			i = len(authored)
+			byKey[key] = i
+			authored = append(authored, pairCheck{id: key, name: name, interval: time.Duration(mon.IntervalSec) * time.Second})
+		}
+		pc := &authored[i]
+		pc.checks = append(pc.checks, pathCheck{monitorID: mon.ID, method: mon.Type})
+		if mon.Enabled && !slices.Contains(mon.PausedNodeIDs, source) && !pc.measured {
+			pc.measured = true
+			pc.basePair = &store.MonitorPair{MonitorID: mon.ID, NodeID: source}
+			pc.rule = s.monitorPolicy(mon).rule
+			pc.interval = time.Duration(mon.IntervalSec) * time.Second
+		}
+	}
+	s.joinAdoptedHistory(p, authored, definitions, target)
+	for i := range authored {
+		sort.Slice(authored[i].checks, func(a, b int) bool { return authored[i].checks[a].monitorID < authored[i].checks[b].monitorID })
+	}
+	sort.SliceStable(authored, func(a, b int) bool {
+		if authored[a].measured != authored[b].measured {
+			return authored[a].measured
+		}
+		if authored[a].name != authored[b].name {
+			return authored[a].name < authored[b].name
+		}
+		return authored[a].id < authored[b].id
+	})
+	return append(out, authored...)
+}
+
+// joinAdoptedHistory adds to each definition's check on a pair the monitors
+// an adoption map recorded for the same method and target: when two
+// definitions' sources shared one path set monitor, one definition adopted
+// it and the other measures its pairs on a monitor of its own, and the
+// adopted monitor's rows from the pair's source are that pair's history
+// (design 32 R1). The series reads rows per source, so only the pair's own
+// runs join. Only adoption records join, never a check of the operator's
+// own, which may dial another endpoint with the same method.
+func (s *Server) joinAdoptedHistory(p principal, checks []pairCheck, definitions map[string]bool, target string) {
+	var adopted []pathCheck
+	for _, def := range s.store.CheckDefinitions() {
+		for _, a := range def.Adopted {
+			if a.TargetNode != target {
+				continue
+			}
+			if mon, ok := s.store.Monitor(a.MonitorID); ok && monitorVisibleToPrincipal(p, "monitor:read", mon) {
+				adopted = append(adopted, pathCheck{monitorID: a.MonitorID, method: a.Method})
+			}
+		}
+	}
+	if len(adopted) == 0 {
+		return
+	}
+	for i := range checks {
+		pc := &checks[i]
+		if !definitions[pc.id] {
+			continue
+		}
+		methods, have := map[string]bool{}, map[string]bool{}
+		for _, c := range pc.checks {
+			methods[c.method] = true
+			have[c.monitorID] = true
+		}
+		for _, a := range adopted {
+			if methods[a.method] && !have[a.monitorID] {
+				have[a.monitorID] = true
+				pc.checks = append(pc.checks, a)
+			}
+		}
+	}
+}
+
+// pairCheckFor is the check named id on the pair, or the first when id is
+// empty; false when none matches.
+func (s *Server) pairCheckFor(p principal, source, target, id string, now time.Time) (pairCheck, bool) {
+	for _, pc := range s.pairChecksFor(p, source, target, now) {
+		if id == "" || pc.id == id {
+			return pc, true
+		}
+	}
+	return pairCheck{}, false
 }
 
 // pathEntry is one path of the matrix before the caller's scope narrows it.
@@ -704,6 +851,7 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	firstAuthored := len(out)
 	for _, id := range ids {
 		mon := monitors[id]
 		owner := store.MonitorOwnerOf(mon)
@@ -711,6 +859,7 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 			continue
 		}
 		definition := owner == store.MonitorOwnerDefinition
+		definitionID, _ := store.MonitorDefinitionID(mon)
 		var sources []string
 		switch {
 		case mon.Type == model.MonitorTypeTLS:
@@ -745,6 +894,10 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 				cell: model.PathCell{
 					Source: source, TargetNode: targetNode, Target: target,
 					MonitorID: mon.ID, Method: mon.Type,
+					CheckDefinitionID: definitionID,
+					// The path set's definitions keep the deprecated mark on
+					// their node cells for one release (design 32 R1).
+					Managed: isFleetMeshID(definitionID) && mon.TargetNode != "",
 				},
 				monitor:      &m,
 				interval:     time.Duration(mon.IntervalSec) * time.Second,
@@ -772,6 +925,31 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 				}
 			}
 			out = append(out, e)
+		}
+	}
+	return append(out[:firstAuthored], onePathPerCheck(out[firstAuthored:])...)
+}
+
+// onePathPerCheck keeps one path per (definition, source, target node): an
+// auto definition holds a monitor per method it used, and only the method a
+// pair uses now is its path; the others are that pair's history, which the
+// series joins. A pair that no method runs now keeps one paused path.
+func onePathPerCheck(entries []pathEntry) []pathEntry {
+	kept := map[string]int{}
+	out := entries[:0:0]
+	for _, e := range entries {
+		if e.cell.CheckDefinitionID == "" || e.cell.TargetNode == "" {
+			out = append(out, e)
+			continue
+		}
+		key := e.cell.CheckDefinitionID + "\x00" + e.cell.Source + "\x00" + e.cell.TargetNode
+		i, seen := kept[key]
+		switch {
+		case !seen:
+			kept[key] = len(out)
+			out = append(out, e)
+		case out[i].paused && !e.paused:
+			out[i] = e
 		}
 	}
 	return out
@@ -902,6 +1080,15 @@ func (m *monitorPathState) notePlan(plan latencyPlan, at time.Time) {
 		return
 	}
 	m.plan, m.planAt = plan, at
+}
+
+// dropPlan forgets the newest plan, so the next reader plans again: after
+// the path set's migration, a plan made before it would still list the path
+// set's pairs beside the definitions that now measure them.
+func (m *monitorPathState) dropPlan() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.plan, m.planAt = latencyPlan{}, time.Time{}
 }
 
 // pathPlan is the latency plan the matrix reads: the newest one if it is

@@ -45,6 +45,10 @@ func (s *Store) SetLatencyProbeConfig(cfg model.LatencyProbeConfig, expected int
 	var current int64
 	if s.state.LatencyProbes != nil {
 		current = s.state.LatencyProbes.Version
+		if s.state.LatencyProbes.Migrated != nil {
+			// The definitions run it now; a save would also drop the marker.
+			return model.LatencyProbeConfig{}, ErrPathSetMigrated
+		}
 	}
 	if expected != current {
 		return model.LatencyProbeConfig{}, ErrLatencyProbeVersion
@@ -258,6 +262,9 @@ func (s *Store) planManagedSetsLocked(sets map[string][]model.Monitor, definitio
 			if mon.ID == "" || strings.ContainsAny(mon.ID, "/\x00") {
 				return managedPlan{}, errors.New("managed monitor id is empty or malformed")
 			}
+			if mon.CheckDefinitionID != "" && CheckDefinitionOwner(mon.CheckDefinitionID) != owner {
+				return managedPlan{}, errors.New("managed monitor " + mon.ID + " names a definition its owner is not")
+			}
 			if other, taken := claimed[mon.ID]; taken && other != owner {
 				return managedPlan{}, errors.New("managed monitor " + mon.ID + " is desired by two owners")
 			}
@@ -268,15 +275,16 @@ func (s *Store) planManagedSetsLocked(sets map[string][]model.Monitor, definitio
 	}
 	sort.Strings(owners)
 	for id, mon := range s.state.Monitors {
-		set, synced := want[mon.ManagedBy]
+		key := MonitorOwnerKey(mon)
+		set, synced := want[key]
 		if !synced {
 			continue
 		}
 		if _, ok := set[id]; !ok {
 			plan.deletes = append(plan.deletes, id)
-			c := plan.changes[mon.ManagedBy]
+			c := plan.changes[key]
 			c.Deleted = append(c.Deleted, id)
-			plan.changes[mon.ManagedBy] = c
+			plan.changes[key] = c
 		}
 	}
 	sort.Strings(plan.deletes)
@@ -292,7 +300,7 @@ func (s *Store) planManagedSetsLocked(sets map[string][]model.Monitor, definitio
 			next := want[owner][id]
 			current, exists := s.state.Monitors[id]
 			switch {
-			case exists && current.ManagedBy != owner:
+			case exists && MonitorOwnerKey(current) != owner:
 				continue
 			case exists && managedMonitorEqual(current, next):
 				continue
@@ -341,9 +349,14 @@ func (s *Store) applyManagedSetsLocked(sets map[string][]model.Monitor, now time
 }
 
 // managedDesired is a desired monitor as the sync stores it: stamped with
-// its owner, its sources sorted.
+// its owner, its sources sorted. A monitor a definition adopted from the
+// path set names the definition in CheckDefinitionID and keeps the
+// ManagedBy its planner gave it ("latency"), so the release before the
+// migration still re-owns it after a rollback.
 func managedDesired(owner string, mon model.Monitor) model.Monitor {
-	mon.ManagedBy = owner
+	if mon.CheckDefinitionID == "" {
+		mon.ManagedBy = owner
+	}
 	mon.NodeIDs = slices.Clone(mon.NodeIDs)
 	sort.Strings(mon.NodeIDs)
 	return mon

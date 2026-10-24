@@ -183,7 +183,7 @@ func (s *Server) buildBeaconPlan(node model.Node, action string, settings model.
 		for _, n := range s.store.Nodes() {
 			nodes[n.ID] = n
 		}
-		current := s.beaconCurrentSources(node.ID, s.pathPlanned(now), s.store.Monitors(), nodes)
+		current := s.beaconCurrentSources(node.ID, s.beaconPlanned(now, nodes), s.store.Monitors(), nodes)
 		ids := s.store.BeaconSourceIDs()
 		sourceIDs := make([]string, 0, len(current))
 		for sourceID := range current {
@@ -390,7 +390,7 @@ func (s *Server) handleBeaconPlan(w http.ResponseWriter, r *http.Request, p prin
 		for _, n := range s.store.Nodes() {
 			nodes[n.ID] = n
 		}
-		current := s.beaconCurrentSources(req.NodeID, s.pathPlanned(now), s.store.Monitors(), nodes)
+		current := s.beaconCurrentSources(req.NodeID, s.beaconPlanned(now, nodes), s.store.Monitors(), nodes)
 		sourceIDs := make([]string, 0, len(current))
 		for sourceID := range current {
 			// The plan names each source and its addresses.
@@ -802,7 +802,7 @@ func (s *Server) beaconView(p principal, node model.Node, now time.Time) model.B
 	for _, n := range s.store.Nodes() {
 		nodes[n.ID] = n
 	}
-	current := s.beaconCurrentSources(node.ID, s.pathPlanned(now), s.store.Monitors(), nodes)
+	current := s.beaconCurrentSources(node.ID, s.beaconPlanned(now, nodes), s.store.Monitors(), nodes)
 	ids := s.store.BeaconSourceIDs()
 	seen := map[string]bool{}
 	add := func(sourceID string, approved bool) {
@@ -937,7 +937,7 @@ func (s *Server) beaconReplans(p principal, nodes map[string]model.Node, now tim
 		return out
 	}
 	sort.Strings(ids)
-	planned := s.pathPlanned(now)
+	planned := s.beaconPlanned(now, nodes)
 	monitors := s.store.Monitors()
 	visible := func(nodeID string) bool { return latencyNodeVisible(p, nodeID) }
 	for _, nodeID := range ids {

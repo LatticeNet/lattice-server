@@ -13,15 +13,6 @@ import (
 // request field at fault, and a save that names a stale version is refused
 // with version_conflict instead of overwriting the newer policy.
 
-func apiErrorOf(t *testing.T, raw string) model.APIError {
-	t.Helper()
-	var out model.APIErrorResponse
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		t.Fatalf("error body %q: %v", raw, err)
-	}
-	return out.Error
-}
-
 func TestOutboundPolicyRefusedSaveNamesTheField(t *testing.T) {
 	handler, _, cookies, csrf := outboundFleet(t, "n1", "n2")
 	web := decodeGroup(t, doJSON(t, handler, http.MethodPost, "/api/groups", `{"name":"Web","slug":"web","members":["n1","n2"]}`, cookies, csrf))

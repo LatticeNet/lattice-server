@@ -252,6 +252,39 @@ func putBoltCheckDefinitions(tx *bolt.Tx, defs map[string]model.CheckDefinition)
 	return meta.Put(boltKeyCheckDefinitions, raw)
 }
 
+// boltKeyCheckDefinitionsEnabled holds State.CheckDefinitionsEnabled, the
+// rollback projection of the definitions that adopted the path set (design
+// 32 R1), beside the definitions, so the offline round trip keeps it too.
+var boltKeyCheckDefinitionsEnabled = []byte("check_definitions_enabled")
+
+func putBoltCheckDefinitionsEnabled(tx *bolt.Tx, enabled map[string]bool) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if len(enabled) == 0 {
+		return meta.Delete(boltKeyCheckDefinitionsEnabled)
+	}
+	raw, err := json.Marshal(enabled)
+	if err != nil {
+		return err
+	}
+	return meta.Put(boltKeyCheckDefinitionsEnabled, raw)
+}
+
+func readBoltCheckDefinitionsEnabled(tx *bolt.Tx) (map[string]bool, error) {
+	meta := tx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return nil, nil
+	}
+	raw := meta.Get(boltKeyCheckDefinitionsEnabled)
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var out map[string]bool
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("decode check definitions enabled: %w", err)
+	}
+	return out, nil
+}
+
 func readBoltCheckDefinitions(tx *bolt.Tx) (map[string]model.CheckDefinition, error) {
 	out := map[string]model.CheckDefinition{}
 	meta := tx.Bucket(boltBucketMeta)
@@ -602,7 +635,7 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 	if err := validateManagedLineCollections(st.ManagedLines, st.ManagedLineSecrets); err != nil {
 		return fmt.Errorf("invalid managed line secret collections: %w", err)
 	}
-	persist, err := encryptedState(st, bs.cipher)
+	persist, err := encryptedState(projectedState(st), bs.cipher)
 	if err != nil {
 		return err
 	}
@@ -669,6 +702,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 			return err
 		}
 		if err := putBoltCheckDefinitions(tx, persist.CheckDefinitions); err != nil {
+			return err
+		}
+		if err := putBoltCheckDefinitionsEnabled(tx, persist.CheckDefinitionsEnabled); err != nil {
 			return err
 		}
 		if err := putBoltMonitorSettings(tx, persist.MonitorSettings); err != nil {
@@ -948,6 +984,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 		if st.CheckDefinitions, err = readBoltCheckDefinitions(tx); err != nil {
 			return err
 		}
+		if st.CheckDefinitionsEnabled, err = readBoltCheckDefinitionsEnabled(tx); err != nil {
+			return err
+		}
 		monitorSettings, err := readBoltMonitorSettings(tx)
 		if err != nil {
 			return err
@@ -1110,6 +1149,7 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 		return State{}, err
 	}
 	migrateSubscriptionSecrets := subscriptionSecretsNeedMigration(st, bs.cipher)
+	restoreProjection(&st)
 	if err := decryptState(&st, bs.cipher); err != nil {
 		return State{}, err
 	}

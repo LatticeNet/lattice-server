@@ -234,7 +234,7 @@ func (s *Server) generatedPathChecks(target string) []pathCheck {
 	var out []pathCheck
 	for _, m := range latencyCheckMethods {
 		mon, ok := s.store.Monitor(m.prefix + target)
-		if ok && mon.ManagedBy == model.MonitorManagedLatency {
+		if ok && store.MonitorOwnerOf(mon) == store.MonitorOwnerPathSet {
 			out = append(out, pathCheck{monitorID: mon.ID, method: m.method})
 		}
 	}
@@ -540,7 +540,7 @@ func (s *Server) handleMonitorSeries(w http.ResponseWriter, r *http.Request, p p
 			return
 		}
 		visible := monitorVisibleToPrincipal(p, "monitor:read", mon) && (source == "" || latencyNodeVisible(p, source))
-		if visible && mon.ManagedBy == "" {
+		if visible && store.MonitorOwnerOf(mon).Authored() {
 			visible = s.operatorPathVisible(p, mon, source)
 		}
 		if !visible {
@@ -553,7 +553,7 @@ func (s *Server) handleMonitorSeries(w http.ResponseWriter, r *http.Request, p p
 		}
 		checks = []pathCheck{{monitorID: mon.ID, method: mon.Type}}
 		interval = time.Duration(mon.IntervalSec) * time.Second
-		if mon.ManagedBy == model.MonitorManagedLatency {
+		if store.MonitorOwnerOf(mon) == store.MonitorOwnerPathSet {
 			interval = s.latencyInterval()
 		}
 		if mon.Type != model.MonitorTypeTLS {
@@ -633,7 +633,7 @@ func (e pathEntry) pair() store.MonitorPair {
 // visibleTo is the matrix scope rule: the caller reads the source and the
 // target node, and for an operator check the check itself.
 func (e pathEntry) visibleTo(p principal) bool {
-	if e.monitor != nil && e.monitor.ManagedBy == "" && !monitorVisibleToPrincipal(p, "monitor:read", *e.monitor) {
+	if e.monitor != nil && store.MonitorOwnerOf(*e.monitor).Authored() && !monitorVisibleToPrincipal(p, "monitor:read", *e.monitor) {
 		return false
 	}
 	if e.cell.Source != "" && !latencyNodeVisible(p, e.cell.Source) {
@@ -706,7 +706,7 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 	sort.Strings(ids)
 	for _, id := range ids {
 		mon := monitors[id]
-		if mon.ManagedBy != "" {
+		if !store.MonitorOwnerOf(mon).Authored() {
 			continue
 		}
 		var sources []string

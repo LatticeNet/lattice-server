@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -135,5 +136,80 @@ func TestSyncManagedMonitors(t *testing.T) {
 	}
 	if _, ok := s.Monitor("mon-op"); !ok {
 		t.Fatal("the operator monitor was deleted")
+	}
+}
+
+// An edit that changes only a generated check's alert policy is written. The
+// path set keeps its policy on its configuration today; a check definition
+// (design 32 D1) puts it on each check it expands.
+func TestSyncManagedMonitorsWritesAPolicyOnlyChange(t *testing.T) {
+	s := openHotStore(t, t.TempDir())
+	defer s.Close()
+	mon := model.Monitor{ID: "mon_lat_jp", Name: "Latency to jp", Type: model.MonitorTypeTCP, Target: "203.0.113.1:443", TargetNode: "node-jp", IntervalSec: 60, TimeoutSec: 5, NodeIDs: []string{"node-sh"}, Enabled: true}
+	now := time.Now().UTC()
+	if _, err := s.SyncManagedMonitors(model.MonitorManagedLatency, []model.Monitor{mon}, now); err != nil {
+		t.Fatal(err)
+	}
+	for i, edit := range []func(*model.Monitor){
+		func(m *model.Monitor) { m.Alert = model.MonitorAlertDownAndDegraded },
+		func(m *model.Monitor) { m.AlertAfter = 4 },
+		func(m *model.Monitor) { m.Degraded = &model.MonitorDegradedRule{LossPercent: 20} },
+	} {
+		edit(&mon)
+		calls := s.testPersistCalls
+		changes, err := s.SyncManagedMonitors(model.MonitorManagedLatency, []model.Monitor{mon}, now.Add(time.Duration(i+1)*time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(changes.Updated) != 1 || s.testPersistCalls-calls != 1 {
+			t.Fatalf("policy edit %d = %+v, writes %d", i, changes, s.testPersistCalls-calls)
+		}
+		stored, _ := s.Monitor(mon.ID)
+		if stored.Alert != mon.Alert || stored.AlertAfter != mon.AlertAfter || !degradedRuleEqual(stored.Degraded, mon.Degraded) {
+			t.Fatalf("policy edit %d stored %+v", i, stored)
+		}
+	}
+}
+
+func degradedRuleEqual(a, b *model.MonitorDegradedRule) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
+// Every field of a generated check but its version and timestamps decides
+// whether a sync rewrites it, including a field added to the model later; an
+// empty list and a missing one are the same, as they are once stored.
+func TestManagedMonitorEqualComparesEveryField(t *testing.T) {
+	bookkeeping := map[string]bool{"Version": true, "CreatedAt": true, "UpdatedAt": true}
+	typ := reflect.TypeOf(model.Monitor{})
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		var changed model.Monitor
+		v := reflect.ValueOf(&changed).Elem().Field(i)
+		switch {
+		case field.Type == reflect.TypeOf(time.Time{}):
+			v.Set(reflect.ValueOf(time.Unix(1700000000, 0)))
+		case v.Kind() == reflect.String:
+			v.SetString("x")
+		case v.CanInt():
+			v.SetInt(1)
+		case v.Kind() == reflect.Bool:
+			v.SetBool(true)
+		case v.Kind() == reflect.Slice:
+			v.Set(reflect.MakeSlice(field.Type, 1, 1))
+		case v.Kind() == reflect.Pointer:
+			v.Set(reflect.New(field.Type.Elem()))
+		default:
+			t.Fatalf("Monitor.%s is a %s; give it a non-zero value here", field.Name, field.Type)
+		}
+		if got, want := managedMonitorEqual(model.Monitor{}, changed), bookkeeping[field.Name]; got != want {
+			t.Errorf("Monitor.%s changed: equal = %v, want %v", field.Name, got, want)
+		}
+	}
+	empty := model.Monitor{NodeIDs: []string{}, PausedNodeIDs: []string{}, Headers: []model.MonitorHeader{}}
+	if !managedMonitorEqual(model.Monitor{}, empty) {
+		t.Error("an empty list reads as a change from a missing one")
 	}
 }

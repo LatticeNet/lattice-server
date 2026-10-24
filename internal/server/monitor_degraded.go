@@ -71,14 +71,15 @@ func pathSetPolicy(cfg model.LatencyProbeConfig) checkPolicy {
 	return checkPolicy{alert: model.EffectiveMonitorAlert(cfg.Alert, true), after: after, rule: cfg.Degraded.Effective()}
 }
 
-// monitorPolicyWith resolves mon's policy: an operator check's own fields,
-// the path set's for a generated latency check, and never paging for any
-// other generated check (a beacon's reachability check is not a path).
+// monitorPolicyWith resolves mon's policy: an authored check's own fields
+// (an operator's, or one expanded from a check definition), the path set's
+// for a generated latency check, and never paging for any other generated
+// check (a beacon's reachability check is not a path).
 func monitorPolicyWith(mon model.Monitor, pathSet checkPolicy) checkPolicy {
-	switch mon.ManagedBy {
-	case "":
+	switch owner := store.MonitorOwnerOf(mon); {
+	case owner.Authored():
 		return checkPolicy{alert: model.EffectiveMonitorAlert(mon.Alert, false), after: store.MonitorAlertAfter(mon), rule: mon.Degraded.Effective()}
-	case model.MonitorManagedLatency:
+	case owner == store.MonitorOwnerPathSet:
 		return pathSet
 	default:
 		return checkPolicy{alert: model.MonitorAlertOff, after: model.MonitorAlertAfterDefault, rule: (*model.MonitorDegradedRule)(nil).Effective()}
@@ -89,7 +90,7 @@ func monitorPolicyWith(mon model.Monitor, pathSet checkPolicy) checkPolicy {
 // when the check is generated.
 func (s *Server) monitorPolicy(mon model.Monitor) checkPolicy {
 	var pathSet checkPolicy
-	if mon.ManagedBy == model.MonitorManagedLatency {
+	if store.MonitorOwnerOf(mon) == store.MonitorOwnerPathSet {
 		cfg, _ := s.store.LatencyProbeConfig()
 		pathSet = pathSetPolicy(cfg)
 	}

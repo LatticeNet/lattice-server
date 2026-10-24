@@ -200,7 +200,7 @@ func (s *Store) UpdateMonitor(next model.Monitor, expected int64, at time.Time) 
 	switch {
 	case !ok:
 		return model.Monitor{}, ErrMonitorNotFound
-	case current.ManagedBy != "":
+	case MonitorOwnerOf(current).Generated():
 		return model.Monitor{}, ErrMonitorManaged
 	case current.Version != expected:
 		return model.Monitor{}, ErrMonitorVersion

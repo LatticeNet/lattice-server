@@ -604,3 +604,46 @@ func TestLatencyDefaultSourceMatchesIDOrName(t *testing.T) {
 		})
 	}
 }
+
+// With every field of a generated check compared, a sweep that follows no
+// change still writes nothing: not for a tcp or an icmp check that probes,
+// and not for one held paused. The path set carries an alert policy, which
+// stays on its configuration and must not reach its checks unevenly.
+func TestLatencySweepWithoutAChangeWritesNothing(t *testing.T) {
+	srv, handler, st := latencyFleet(t)
+	cookies, csrf := loginSession(t, handler)
+	bj, _ := st.Node("node-bj")
+	bj.ProbeMethods = []string{model.MonitorTypeTCP, model.MonitorTypeICMP}
+	if err := st.UpsertNode(bj); err != nil {
+		t.Fatal(err)
+	}
+	cfg := model.LatencyProbeConfig{
+		Enabled: true, IntervalSec: 30, TimeoutSec: 5, AutoTargets: true, Sources: []string{"node-sh", "node-bj"},
+		SourceMethods: map[string]string{"node-bj": model.LatencyMethodICMP},
+		Alert:         model.MonitorAlertDownAndDegraded, AlertAfter: 3, Degraded: &model.MonitorDegradedRule{LossPercent: 20},
+	}
+	code, _, body := putLatencyConfig(t, handler, cookies, csrf, cfg)
+	if code != http.StatusOK {
+		t.Fatalf("save = %d %s", code, body)
+	}
+	cfg.Version = 1
+	cfg.ExcludeTargets = []string{"node-jp"}
+	if code, _, body := putLatencyConfig(t, handler, cookies, csrf, cfg); code != http.StatusOK {
+		t.Fatalf("second save = %d %s", code, body)
+	}
+	if paused, ok := st.Monitor(latencyMonitorID("node-jp")); !ok || paused.Enabled {
+		t.Fatalf("the excluded target's check = %+v %v, want it held paused", paused, ok)
+	}
+	probingICMP := false
+	for _, mon := range st.Monitors() {
+		probingICMP = probingICMP || (mon.Type == model.MonitorTypeICMP && mon.Enabled && mon.ManagedBy == model.MonitorManagedLatency)
+	}
+	if !probingICMP {
+		t.Fatalf("no generated icmp check probes: %+v", st.Monitors())
+	}
+	for i := range 3 {
+		if _, changes, err := srv.syncLatencyProbes(time.Now()); err != nil || changes.Changed() {
+			t.Fatalf("sweep %d wrote %+v %v", i, changes, err)
+		}
+	}
+}

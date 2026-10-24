@@ -262,11 +262,11 @@ func toMonitorLatestView(l store.MonitorLatest) monitorLatestView {
 	return v
 }
 
-// monitorAlertOf is the policy an operator's check follows, an empty one
-// read as the default. A generated check's is the path set's, which
-// monitorViews fills in.
+// monitorAlertOf is the policy an authored check follows, an empty one read
+// as the default. A generated path's is the path set's, which monitorViews
+// fills in; any other generated check never pages.
 func monitorAlertOf(m model.Monitor) string {
-	if m.ManagedBy != "" {
+	if !store.MonitorOwnerOf(m).Authored() {
 		return model.MonitorAlertOff
 	}
 	return model.EffectiveMonitorAlert(m.Alert, false)

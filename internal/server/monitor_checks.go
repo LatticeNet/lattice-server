@@ -106,10 +106,11 @@ func (t monitorTargets) resolve(kind, nodeID, prior string) (target, reason stri
 }
 
 // resolved is mon with its target resolved now, and false when a check that
-// names a node cannot be resolved for its kind. Generated checks are
-// resolved by the planner and come back as they are.
+// names a node cannot be resolved for its kind. Checks the path set or a
+// beacon plan generated are resolved by their planner and come back as they
+// are.
 func (t monitorTargets) resolved(mon model.Monitor) (model.Monitor, bool) {
-	if mon.TargetNode == "" || mon.ManagedBy != "" {
+	if mon.TargetNode == "" || !store.MonitorOwnerOf(mon).Authored() {
 		return mon, true
 	}
 	target, reason := t.resolve(mon.Type, mon.TargetNode, mon.Target)

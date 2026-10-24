@@ -125,6 +125,26 @@ func TestDefinitionNamesNoNodeAConfinedReaderCannotRead(t *testing.T) {
 	}
 }
 
+// Design 32 R2: a skipped pair is not a path, so a definition counts the
+// pairs it measures, as the matrix and the dry run do, not every source its
+// monitors name.
+func TestDefinitionCountsOnlyThePairsItMeasures(t *testing.T) {
+	_, handler, st := checkFleet(t)
+	old, _ := st.Node("node-bj")
+	old.ProbeMethods = []string{"tcp"}
+	upsertNodes(t, st, old)
+	c := newCheckClient(t, handler)
+	save := tcpMesh([]string{"node-sh", "node-bj"}, []string{"node-jp"})
+	save.Type = model.MonitorTypeICMP
+	view := c.create(save)
+	if view.Summary.Paths != 1 {
+		t.Fatalf("saved: paths = %d, want 1: node-bj's agent cannot run icmp", view.Summary.Paths)
+	}
+	if got := c.get(view.ID); got.Summary.Paths != 1 {
+		t.Fatalf("read: paths = %d, want 1", got.Summary.Paths)
+	}
+}
+
 // Auto takes target nodes only, and the adoption the migration wrote is
 // never a save's to write: a body that carries one changes nothing.
 func TestAutoDefinitionSaveRules(t *testing.T) {

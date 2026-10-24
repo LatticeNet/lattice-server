@@ -147,7 +147,7 @@ func (s *Server) narrowDefinitionMonitorViews(p principal, monitors []model.Moni
 // checkDefinitionView is def as p reads it: secret values removed, counted
 // against what is stored now, with its monitors when asked, less any
 // monitor that names a node p may not read.
-func (s *Server) checkDefinitionView(p principal, def model.CheckDefinition, plan checkDefinitionPlan, monitors []model.Monitor, runs map[string]int, withMonitors bool) model.CheckDefinitionView {
+func (s *Server) checkDefinitionView(p principal, c *checkPlanContext, def model.CheckDefinition, plan checkDefinitionPlan, monitors []model.Monitor, runs map[string]int, withMonitors bool) model.CheckDefinitionView {
 	view := model.CheckDefinitionView{CheckDefinition: def}
 	view.Headers = redactMonitorHeaders(def.Headers)
 	// measuring are the monitors that measure now; a monitor of a target
@@ -166,10 +166,7 @@ func (s *Server) checkDefinitionView(p principal, def model.CheckDefinition, pla
 		}
 		view.Summary.Monitors++
 		switch {
-		case measuring[mon.ID] && mon.Type == model.MonitorTypeTLS:
-			view.Summary.Paths++
 		case measuring[mon.ID]:
-			view.Summary.Paths += len(mon.NodeIDs)
 		case !inSet[checkMonitorKey(mon)]:
 			view.Summary.PausedTargets++
 			view.Summary.PausedRuns += runs[mon.ID]
@@ -187,6 +184,23 @@ func (s *Server) checkDefinitionView(p principal, def model.CheckDefinition, pla
 	}
 	if withMonitors && view.Monitors == nil {
 		view.Monitors = []model.CheckDefinitionMonitor{}
+	}
+	// Paths are the pairs measured now, judged as the matrix and the dry
+	// run judge them: a skipped or paused pair is not a path (design 32 R2).
+	for _, e := range plan.entries {
+		mon := plan.monitorOf(e)
+		if mon == nil || (restricted && !checkMonitorReadable(p, *mon)) {
+			continue
+		}
+		sources := mon.NodeIDs
+		if mon.Type == model.MonitorTypeTLS {
+			sources = []string{""}
+		}
+		for _, sourceID := range sources {
+			if model.PathMeasurement(model.PathStateUnknown, s.checkPairReason(c, e, mon, sourceID)) == model.PathMeasured {
+				view.Summary.Paths++
+			}
+		}
 	}
 	return view
 }
@@ -247,7 +261,7 @@ func (s *Server) handleCheckDefinitions(w http.ResponseWriter, r *http.Request, 
 		if wanted := strings.TrimSpace(r.URL.Query().Get("id")); wanted != "" {
 			for _, plan := range plans {
 				if plan.def.ID == wanted && checkDefinitionVisible(p, plan.def) {
-					writeJSON(w, http.StatusOK, s.checkDefinitionView(p, plan.def, plan, monitors, runs, true))
+					writeJSON(w, http.StatusOK, s.checkDefinitionView(p, c, plan.def, plan, monitors, runs, true))
 					return
 				}
 			}
@@ -257,7 +271,7 @@ func (s *Server) handleCheckDefinitions(w http.ResponseWriter, r *http.Request, 
 		list := model.CheckDefinitionList{Definitions: []model.CheckDefinitionView{}, FleetMesh: s.checkFleetMesh(p, now)}
 		for _, plan := range plans {
 			if checkDefinitionVisible(p, plan.def) {
-				list.Definitions = append(list.Definitions, s.checkDefinitionView(p, plan.def, plan, monitors, runs, false))
+				list.Definitions = append(list.Definitions, s.checkDefinitionView(p, c, plan.def, plan, monitors, runs, false))
 			}
 		}
 		slices.SortStableFunc(list.Definitions, func(a, b model.CheckDefinitionView) int {
@@ -437,7 +451,7 @@ func (s *Server) saveCheckDefinition(w http.ResponseWriter, p principal, req mod
 			plan = candidate
 		}
 	}
-	writeJSON(w, http.StatusOK, s.checkDefinitionView(p, stored, plan, s.store.Monitors(), s.checkMonitorRuns(), true))
+	writeJSON(w, http.StatusOK, s.checkDefinitionView(p, c, stored, plan, s.store.Monitors(), s.checkMonitorRuns(), true))
 }
 
 // handleCheckDefinitionPreview answers POST /api/monitors/definitions/preview:

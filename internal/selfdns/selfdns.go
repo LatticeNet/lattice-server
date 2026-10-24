@@ -121,6 +121,11 @@ func GenerateConfig(dep model.DNSDeployment, opts RenderOptions) (ConfigBundle, 
 		bindIP = parsed
 	}
 
+	clientNets, err := NormalizeClientNetworks(dep.AllowedClientNetworks)
+	if err != nil {
+		return ConfigBundle{}, err
+	}
+
 	var core strings.Builder
 	zoneFiles := []ZoneFile{}
 	for i, zone := range dep.Zones {
@@ -137,6 +142,15 @@ func GenerateConfig(dep model.DNSDeployment, opts RenderOptions) (ConfigBundle, 
 		fmt.Fprintf(&core, "%s:%d {\n", suffix, dep.ListenPort)
 		if bindIP != "" {
 			fmt.Fprintf(&core, "  bind %s\n", bindIP)
+		}
+		// Every server block shares the deployment's listener, so each one
+		// carries the acl. block answers REFUSED, which is no larger than the
+		// query and so gives a spoofed source nothing to amplify.
+		if len(clientNets) > 0 {
+			core.WriteString("  acl {\n")
+			fmt.Fprintf(&core, "    allow net %s\n", strings.Join(clientNets, " "))
+			core.WriteString("    block\n")
+			core.WriteString("  }\n")
 		}
 		core.WriteString("  errors\n")
 		core.WriteString("  log\n")
@@ -688,7 +702,77 @@ func validateDeployment(dep model.DNSDeployment, opts RenderOptions) error {
 			return fmt.Errorf("zone %d unsupported mode %q", i+1, zone.Mode)
 		}
 	}
+	if _, err := NormalizeClientNetworks(dep.AllowedClientNetworks); err != nil {
+		return err
+	}
+	return RefuseOpenResolver(dep)
+}
+
+// RefuseOpenResolver refuses a public deployment with a forward zone that
+// names no allowed client networks: it would recurse for anyone who reaches
+// the listener, which makes the node an open resolver and a reflection source.
+func RefuseOpenResolver(dep model.DNSDeployment) error {
+	if dep.Exposure != model.DNSExposurePublic || len(dep.AllowedClientNetworks) > 0 {
+		return nil
+	}
+	for _, zone := range dep.Zones {
+		if strings.ToLower(strings.TrimSpace(zone.Mode)) == model.DNSZoneForward {
+			return errors.New("public exposure with a forward zone answers recursive queries from anyone, which makes the node an open resolver; set allowed_client_networks to the networks that should use it")
+		}
+	}
 	return nil
+}
+
+// MaxAllowedClientNetworks bounds the acl so the reviewed Corefile stays
+// readable.
+const MaxAllowedClientNetworks = 64
+
+// NormalizeClientNetworks canonicalizes a deployment's allowed client
+// networks in the order given: a bare address becomes its host prefix and
+// duplicates collapse. A prefix with host bits set is refused rather than
+// silently widened, and so is a /0, which would allow every client and turn
+// the acl back into an open resolver.
+func NormalizeClientNetworks(input []string) ([]string, error) {
+	if len(input) > MaxAllowedClientNetworks {
+		return nil, fmt.Errorf("at most %d allowed client networks", MaxAllowedClientNetworks)
+	}
+	seen := map[netip.Prefix]bool{}
+	out := make([]string, 0, len(input))
+	for _, raw := range input {
+		value := strings.TrimSpace(raw)
+		prefix, err := parseClientNetwork(value)
+		if err != nil {
+			return nil, fmt.Errorf("allowed client network %q: %w", value, err)
+		}
+		if seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		out = append(out, prefix.String())
+	}
+	return out, nil
+}
+
+func parseClientNetwork(value string) (netip.Prefix, error) {
+	if strings.Contains(value, "/") {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return netip.Prefix{}, errors.New("not a CIDR prefix or an IP address")
+		}
+		if prefix != prefix.Masked() {
+			return netip.Prefix{}, fmt.Errorf("has host bits set; the network is %s", prefix.Masked())
+		}
+		if prefix.Bits() == 0 {
+			return netip.Prefix{}, errors.New("allows every client; name the networks that should use this resolver")
+		}
+		return prefix, nil
+	}
+	addr, err := netip.ParseAddr(value)
+	if err != nil || addr.Zone() != "" {
+		return netip.Prefix{}, errors.New("not a CIDR prefix or an IP address")
+	}
+	addr = addr.Unmap()
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
 }
 
 func validateRecordValue(rec model.DNSRecord) error {

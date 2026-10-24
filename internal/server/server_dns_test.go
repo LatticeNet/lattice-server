@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -157,6 +158,56 @@ func TestDNSDeploymentValidatesConfig(t *testing.T) {
 				t.Fatalf("expected 400, got %d", res.StatusCode)
 			}
 		})
+	}
+}
+
+// A public deployment with a forward zone is an open recursive resolver unless
+// it names the client networks it serves. The save is refused so the operator
+// hears it where the exposure is chosen; with networks it saves, canonicalized,
+// and a disabled one saves so an open resolver can be switched off first.
+func TestDNSDeploymentRefusesOpenPublicResolver(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	open := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"public dns","node_id":"n1","exposure":"public",
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	body, _ := io.ReadAll(open.Body)
+	open.Body.Close()
+	if open.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "allowed_client_networks") {
+		t.Fatalf("open public resolver should be refused with a reason, got %d %s", open.StatusCode, body)
+	}
+
+	scoped := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"public dns","node_id":"n1","exposure":"public",
+		"allowed_client_networks":["198.51.100.7"," 2001:db8::/32 ","198.51.100.7/32"],
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	var created struct {
+		ID                    string   `json:"id"`
+		AllowedClientNetworks []string `json:"allowed_client_networks"`
+	}
+	if err := json.NewDecoder(scoped.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	scoped.Body.Close()
+	if scoped.StatusCode != http.StatusOK {
+		t.Fatalf("scoped public resolver should save, got %d", scoped.StatusCode)
+	}
+	if got := strings.Join(created.AllowedClientNetworks, ","); got != "198.51.100.7/32,2001:db8::/32" {
+		t.Fatalf("allowed networks not canonicalized: %q", got)
+	}
+	if dep, ok := st.DNSDeployment(created.ID); !ok || len(dep.AllowedClientNetworks) != 2 {
+		t.Fatalf("stored deployment lost its networks: ok=%v %+v", ok, dep)
+	}
+
+	disabled := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"old public dns","node_id":"n1","exposure":"public","disabled":true,
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	disabled.Body.Close()
+	if disabled.StatusCode != http.StatusOK {
+		t.Fatalf("a disabled deployment should save so it can be switched off, got %d", disabled.StatusCode)
 	}
 }
 

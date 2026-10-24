@@ -96,6 +96,66 @@ func TestGenerateConfigRejectsUnsafeInputs(t *testing.T) {
 	}
 }
 
+// A public listener with a forward zone recurses for anyone who reaches it,
+// which makes the node an open resolver and a reflection source. The plan is
+// refused unless the deployment names the client networks it serves, and those
+// render as a CoreDNS acl that refuses everyone else (design 32 D7).
+func TestGenerateConfigRefusesOpenPublicResolver(t *testing.T) {
+	dep := baseDeployment()
+	dep.Exposure = model.DNSExposurePublic
+	_, err := GenerateConfig(dep, RenderOptions{})
+	if err == nil || !strings.Contains(err.Error(), "allowed_client_networks") {
+		t.Fatalf("public forward deployment without allowed networks must be refused, got %v", err)
+	}
+
+	dep.AllowedClientNetworks = []string{"198.51.100.0/24", "2001:db8::/32", "203.0.113.9"}
+	cfg, err := GenerateConfig(dep, RenderOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "  acl {\n    allow net 198.51.100.0/24 2001:db8::/32 203.0.113.9/32\n    block\n  }\n"
+	if !strings.Contains(cfg.Corefile, want) {
+		t.Fatalf("corefile missing acl block %q:\n%s", want, cfg.Corefile)
+	}
+
+	// A static or block zone answers only for itself, so a public deployment
+	// without a forward zone is not an open resolver and needs no networks.
+	dep.AllowedClientNetworks = nil
+	dep.Zones = []model.DNSZone{{Suffix: "ads.example.", Mode: model.DNSZoneBlock}}
+	if _, err := GenerateConfig(dep, RenderOptions{}); err != nil {
+		t.Fatalf("public block-only deployment should render: %v", err)
+	}
+
+	// Mesh exposure binds the WireGuard address, so it renders no acl unless
+	// the operator narrows it.
+	mesh := baseDeployment()
+	cfg, err = GenerateConfig(mesh, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cfg.Corefile, "acl") {
+		t.Fatalf("mesh deployment without networks should render no acl:\n%s", cfg.Corefile)
+	}
+}
+
+func TestGenerateConfigRejectsUnsafeClientNetworks(t *testing.T) {
+	for _, bad := range []string{
+		"0.0.0.0/0",
+		"::/0",
+		"10.0.0.1/8",
+		"10.0.0.0/8\n    allow net 0.0.0.0/0",
+		"example.com",
+		"",
+	} {
+		dep := baseDeployment()
+		dep.Exposure = model.DNSExposurePublic
+		dep.AllowedClientNetworks = []string{bad}
+		if _, err := GenerateConfig(dep, RenderOptions{}); err == nil {
+			t.Fatalf("allowed client network %q should be refused", bad)
+		}
+	}
+}
+
 func TestComposeFirewallPlan(t *testing.T) {
 	dep := baseDeployment()
 	plan, summary, err := ComposeFirewallPlan(dep, network.NFTPlan{WireGuardUDP: []int{51820}})

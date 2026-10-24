@@ -30,16 +30,19 @@ const (
 )
 
 type dnsDeploymentView struct {
-	ID         string          `json:"id"`
-	Name       string          `json:"name"`
-	NodeID     string          `json:"node_id"`
-	NodeName   string          `json:"node_name,omitempty"`
-	Engine     string          `json:"engine"`
-	ListenPort int             `json:"listen_port"`
-	EnableUDP  bool            `json:"enable_udp"`
-	EnableTCP  bool            `json:"enable_tcp"`
-	Exposure   string          `json:"exposure"`
-	Zones      []model.DNSZone `json:"zones"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	NodeID     string `json:"node_id"`
+	NodeName   string `json:"node_name,omitempty"`
+	Engine     string `json:"engine"`
+	ListenPort int    `json:"listen_port"`
+	EnableUDP  bool   `json:"enable_udp"`
+	EnableTCP  bool   `json:"enable_tcp"`
+	Exposure   string `json:"exposure"`
+	// AllowedClientNetworks are the client prefixes the resolver answers;
+	// empty means it answers every client that reaches the listener.
+	AllowedClientNetworks []string        `json:"allowed_client_networks,omitempty"`
+	Zones                 []model.DNSZone `json:"zones"`
 	// Listeners, CertNotAfter and Drift describe an external (observed) engine
 	// and stay empty for engines Lattice deploys itself.
 	Listeners        []model.DNSListener `json:"listeners,omitempty"`
@@ -660,6 +663,19 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 		return model.DNSDeployment{}, err
 	}
 	req.Zones = zones
+	clientNets, err := selfdns.NormalizeClientNetworks(req.AllowedClientNetworks)
+	if err != nil {
+		return model.DNSDeployment{}, err
+	}
+	req.AllowedClientNetworks = clientNets
+	// Refused at save as well as at plan, so the operator learns it where the
+	// exposure is chosen. A disabled deployment may still be saved, so an open
+	// resolver can be switched off without first being fixed.
+	if !req.Disabled {
+		if err := selfdns.RefuseOpenResolver(req); err != nil {
+			return model.DNSDeployment{}, err
+		}
+	}
 
 	if req.Hostname != "" {
 		host, err := normalizeDNSName(req.Hostname, false, false)
@@ -894,7 +910,8 @@ func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView 
 	v := dnsDeploymentView{
 		ID: dep.ID, Name: dep.Name, NodeID: dep.NodeID, NodeName: nodeName, Engine: dep.Engine,
 		ListenPort: dep.ListenPort, EnableUDP: dep.EnableUDP, EnableTCP: dep.EnableTCP, Exposure: dep.Exposure,
-		Zones: dep.Zones, Hostname: dep.Hostname, PublishIPv4: dep.PublishIPv4, PublishIPv6: dep.PublishIPv6,
+		AllowedClientNetworks: dep.AllowedClientNetworks,
+		Zones:                 dep.Zones, Hostname: dep.Hostname, PublishIPv4: dep.PublishIPv4, PublishIPv6: dep.PublishIPv6,
 		RecordTTL: dep.RecordTTL, DDNSProfileID: dep.DDNSProfileID, HasCredential: dep.CFAPIToken != "" || dep.DDNSProfileID != "",
 		Status: dep.Status, EngineVersion: dep.EngineVersion, LastIPv4: dep.LastIPv4, LastIPv6: dep.LastIPv6,
 		LastAppliedAt: dep.LastAppliedAt, LastError: dep.LastError,

@@ -170,6 +170,20 @@ func TestNetGuardPlanKeepsDNSPortsOfApprovedPlans(t *testing.T) {
 		t.Fatalf("a deployment never approved must not open its port:\n%s", plan)
 	}
 
+	// Approved but never queued: nothing runs, so nothing opens.
+	unqueuedRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+depID+`"}`, cookies, csrf)
+	unqueued := decodeDNSPlan(t, unqueuedRes)
+	unqueuedRes.Body.Close()
+	approveOnly := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": unqueued.ID, "queue_apply": false, "plan_sha256": planSHA256(unqueued.Plan)})), cookies, csrf)
+	approveOnly.Body.Close()
+	if approveOnly.StatusCode != http.StatusOK {
+		t.Fatalf("approve without queue: %d", approveOnly.StatusCode)
+	}
+	if plan := netguardPlan(); strings.Contains(plan, "dport { 53 }") {
+		t.Fatalf("an approval never queued must not open its port:\n%s", plan)
+	}
+
 	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+depID+`"}`, cookies, csrf)
 	dnsApproval := decodeDNSPlan(t, planRes)
 	planRes.Body.Close()
@@ -217,6 +231,20 @@ func TestNetGuardPlanKeepsDNSPortsOfApprovedPlans(t *testing.T) {
 	}
 	if plan := netguardPlan(); !strings.Contains(plan, `ip saddr @wg_peers4 udp dport { 53 }`) {
 		t.Fatalf("an applied plan must keep its ports:\n%s", plan)
+	}
+
+	// Disabling the deployment asks for the resolver to stop serving, so its
+	// ports may close before a DNS plan for the disabled state applies.
+	disable := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"id":"`+depID+`","name":"private dns","node_id":"n1","disabled":true,
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	disable.Body.Close()
+	if disable.StatusCode != http.StatusOK {
+		t.Fatalf("disable deployment: %d", disable.StatusCode)
+	}
+	if plan := netguardPlan(); strings.Contains(plan, "dport { 53 }") {
+		t.Fatalf("a disabled deployment must not hold its ports open:\n%s", plan)
 	}
 }
 

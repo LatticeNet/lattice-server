@@ -4109,6 +4109,44 @@ func (s *Store) ApprovalsByID(ids []string) []model.Approval {
 	return out
 }
 
+// DecidedApproval is an approved or applied approval and whether an apply
+// task was ever queued for it.
+type DecidedApproval struct {
+	Approval model.Approval
+	Queued   bool
+}
+
+// DecidedApprovals returns one plugin's approved and applied approvals on one
+// node, unsorted, with whether each had an apply task queued. It walks the
+// approval and task tables once under the lock and copies only the matches,
+// for callers on the compile path that must not copy and sort every approval
+// the server ever held.
+func (s *Store) DecidedApprovals(plugin, nodeID string) []DecidedApproval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []DecidedApproval
+	index := map[string]int{}
+	for _, a := range s.state.Approvals {
+		if a.Plugin != plugin || a.NodeID != nodeID {
+			continue
+		}
+		if a.Status != model.ApprovalApproved && a.Status != model.ApprovalApplied {
+			continue
+		}
+		index[a.ID] = len(out)
+		out = append(out, DecidedApproval{Approval: a})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	for _, t := range s.state.Tasks {
+		if i, ok := index[t.ApprovalID]; ok {
+			out[i].Queued = true
+		}
+	}
+	return out
+}
+
 func (s *Store) Approvals() []model.Approval {
 	s.mu.Lock()
 	defer s.mu.Unlock()

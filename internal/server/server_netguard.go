@@ -491,35 +491,40 @@ func (s *Server) beaconCompanionFor(nodeID string) *netguard.BeaconCompanion {
 
 // dnsListenersFor is the self-host DNS listener set in force on the node,
 // read from what was approved rather than from the stored deployment: for
-// each CoreDNS deployment the newest selfdns approval on this node that is
-// approved (its apply is in flight) or applied names the listeners its plan
-// opened. An edit to a running deployment changes nothing here until its new
-// plan is approved, and a failed re-apply (rejected) falls back to the plan
-// that last applied, whose resolver the apply script left running. Every
-// NetGuard compile of the node carries the set, so a NetGuard plan keeps a
-// running resolver's ports open, and a deployment never approved opens
-// nothing.
+// each CoreDNS deployment on this node the most recently decided selfdns
+// approval that is applied, or approved with its apply task queued, names
+// the listeners its plan opened. An edit to a running deployment changes
+// nothing here until its new plan is approved and queued, an approval never
+// queued opens nothing, and a failed re-apply (rejected) falls back to the
+// plan that last applied, whose resolver the apply script left running.
+// Every NetGuard compile of the node carries the set, so a NetGuard plan
+// keeps a running resolver's ports open.
+//
+// A disabled deployment, one moved to another node, and a deleted one hold
+// nothing open: the operator asked for the resolver to stop serving there,
+// so the next NetGuard plan may close its ports before a DNS plan does.
 //
 // planned, when set, is the deployment a DNS plan is being rendered for on
 // its node: it contributes its current listeners in place of its approved
 // ones, so the plan opens the ports the plan itself starts. The approve that
-// follows makes that plan the newest approved one, and from then on every
+// follows makes that plan the newest decided one, and from then on every
 // compile agrees.
 func (s *Server) dnsListenersFor(nodeID string, planned *model.DNSDeployment) []netguard.DNSListener {
 	override := planned != nil && planned.NodeID == nodeID
 	newest := map[string]model.Approval{}
-	for _, approval := range s.store.Approvals() {
-		if approval.Plugin != "selfdns" || approval.NodeID != nodeID {
-			continue
-		}
-		if approval.Status != model.ApprovalApproved && approval.Status != model.ApprovalApplied {
+	for _, decided := range s.store.DecidedApprovals("selfdns", nodeID) {
+		approval := decided.Approval
+		if approval.Status == model.ApprovalApproved && !decided.Queued {
 			continue
 		}
 		depID, err := selfDNSApprovalDeploymentID(approval.Action)
 		if err != nil || (override && depID == planned.ID) {
 			continue
 		}
-		if current, ok := newest[depID]; ok && !approval.CreatedAt.After(current.CreatedAt) {
+		// Decision order, not plan order: an older plan approved after a
+		// newer one is what the node ran last.
+		if current, ok := newest[depID]; ok && (approval.UpdatedAt.Before(current.UpdatedAt) ||
+			(approval.UpdatedAt.Equal(current.UpdatedAt) && approval.ID < current.ID)) {
 			continue
 		}
 		newest[depID] = approval
@@ -531,10 +536,8 @@ func (s *Server) dnsListenersFor(nodeID string, planned *model.DNSDeployment) []
 	sort.Strings(depIDs)
 	var listeners []selfdns.Listener
 	for _, depID := range depIDs {
-		// A deleted deployment leaves its resolver on the node, as deleting
-		// any record here leaves config behind, but nothing can plan it any
-		// more, so it stops holding ports open.
-		if dep, ok := s.store.DNSDeployment(depID); !ok || dep.Engine != model.DNSEngineCoreDNS {
+		dep, ok := s.store.DNSDeployment(depID)
+		if !ok || dep.Engine != model.DNSEngineCoreDNS || dep.Disabled || dep.NodeID != nodeID {
 			continue
 		}
 		approval := newest[depID]

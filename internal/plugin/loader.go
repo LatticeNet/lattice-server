@@ -61,6 +61,9 @@ type Loader struct {
 	Platform string
 	Limits   BundleLimits
 	Policy   TrustPolicy
+	// ServerVersion is the running server's semver (ServerSemver). A bundle
+	// whose server floor it does not meet is rejected; empty enforces none.
+	ServerVersion string
 }
 
 // Load scans the plugin directory and verifies each bundle. It returns the
@@ -91,6 +94,10 @@ func (l Loader) Load() ([]Loaded, []LoadOutcome, error) {
 		got, err := l.loadBundle(bundle)
 		if err != nil {
 			outcomes = append(outcomes, LoadOutcome{BundlePath: bundle, Loaded: false, Reason: err.Error()})
+			continue
+		}
+		if err := checkServerFloor(got.Manifest, l.ServerVersion); err != nil {
+			outcomes = append(outcomes, LoadOutcome{BundlePath: bundle, PluginID: got.Manifest.ID, Loaded: false, Reason: err.Error()})
 			continue
 		}
 		outcomes = append(outcomes, LoadOutcome{BundlePath: bundle, PluginID: got.Manifest.ID, Loaded: true})

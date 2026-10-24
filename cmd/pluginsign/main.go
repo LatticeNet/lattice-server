@@ -96,7 +96,8 @@ func main() {
 		fmt.Printf("wrote %s\n", *manifestPath)
 	} else {
 		fmt.Println("--- canonical manifest (not written; pass -write) ---")
-		os.Stdout.Write(out)
+		_, err := os.Stdout.Write(out)
+		must(err, "print manifest")
 	}
 
 	// End-to-end gate: reproduce the server's load-time verification exactly —

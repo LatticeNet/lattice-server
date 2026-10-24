@@ -661,7 +661,12 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 
 	configured := map[string]bool{}
 	var sources []string
+	migrated := cfg.Migrated != nil
 	for _, sourceID := range cfg.Sources {
+		if migrated {
+			// The check definitions run the path set now (design 32 R1).
+			break
+		}
 		if configured[sourceID] {
 			continue
 		}
@@ -733,6 +738,20 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			Region:  region,
 			Source:  configured[n.ID],
 			Target:  model.LatencyTargetNone,
+		}
+		if migrated {
+			// No target, but the node's endpoints are still facts a check
+			// editor shows (what a node target resolves to).
+			pn.TargetReason = model.LatencyReasonMigrated
+			if chosen, note := info.choose(""); chosen != nil {
+				pn.Endpoint, pn.Protocol, pn.LineName = chosen.target, chosen.protocol, chosen.line
+			} else {
+				pn.EndpointNote = note
+			}
+			facts := s.latencyTargetFactsOf(n, out.endpoints, beaconTargets)
+			pn.ICMPTarget, pn.BeaconTarget = facts.icmpTarget, facts.beaconEndpoint
+			out.plan.Nodes = append(out.plan.Nodes, pn)
+			continue
 		}
 		switch {
 		case excluded[n.ID]:
@@ -983,6 +1002,11 @@ func (s *Server) syncLatencyProbes(now time.Time) (model.LatencyProbePlan, store
 	s.latencyEdges.refresh(latencyEdgeNames(s.liveSingBoxInventories(now)), now)
 	planned := s.planLatencyProbes(now)
 	s.monitorPaths.notePlan(planned, now)
+	if planned.plan.Config.Migrated != nil {
+		// The definitions own the path set's monitors now (design 32 R1):
+		// the plan is kept for the node endpoints, and nothing is written.
+		return planned.plan, store.ManagedMonitorChanges{}, nil
+	}
 	changes, err := s.store.SyncManagedMonitors(model.MonitorManagedLatency, planned.desired, now)
 	if err != nil {
 		return planned.plan, changes, err
@@ -1306,6 +1330,10 @@ func (s *Server) handleLatencyProbes(w http.ResponseWriter, r *http.Request, p p
 		}
 		s.monitorSaves.Lock()
 		defer s.monitorSaves.Unlock()
+		if current, stored := s.store.LatencyProbeConfig(); stored && current.Migrated != nil {
+			writeError(w, http.StatusConflict, pathSetMigratedError(current))
+			return
+		}
 		cfg, err := s.normalizeLatencyProbeConfig(req)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -1331,7 +1359,12 @@ func (s *Server) handleLatencyProbes(w http.ResponseWriter, r *http.Request, p p
 		prior, _ := s.store.LatencyProbeConfig()
 		stored, err := s.store.SetLatencyProbeConfig(cfg, req.Version, p.ActorID, now)
 		if errors.Is(err, store.ErrLatencyProbeVersion) {
-			writeError(w, http.StatusConflict, err)
+			writeError(w, http.StatusConflict, versionConflict(err))
+			return
+		}
+		if errors.Is(err, store.ErrPathSetMigrated) {
+			current, _ := s.store.LatencyProbeConfig()
+			writeError(w, http.StatusConflict, pathSetMigratedError(current))
 			return
 		}
 		if err != nil {

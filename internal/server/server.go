@@ -939,6 +939,11 @@ func New(opts Options) (*Server, error) {
 		}
 		s.startShareFetchStatsFlush()
 		s.startLineClientTemplateSync()
+		// Before the sweeps: the path set becomes check definitions once
+		// (design 32 R1), so the first sweep already plans them.
+		if _, err := s.migratePathSet(s.now()); err != nil {
+			s.logger.Printf("latency probes: %v", err)
+		}
 		s.startLatencyProbeSync()
 		s.startMonitorHistoryPrune()
 		s.startPathDegradedEvaluator()

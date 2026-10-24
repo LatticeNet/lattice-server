@@ -45,6 +45,10 @@ func (s *Store) SetLatencyProbeConfig(cfg model.LatencyProbeConfig, expected int
 	var current int64
 	if s.state.LatencyProbes != nil {
 		current = s.state.LatencyProbes.Version
+		if s.state.LatencyProbes.Migrated != nil {
+			// The definitions run it now; a save would also drop the marker.
+			return model.LatencyProbeConfig{}, ErrPathSetMigrated
+		}
 	}
 	if expected != current {
 		return model.LatencyProbeConfig{}, ErrLatencyProbeVersion

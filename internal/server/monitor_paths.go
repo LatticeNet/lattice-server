@@ -904,6 +904,15 @@ func (m *monitorPathState) notePlan(plan latencyPlan, at time.Time) {
 	m.plan, m.planAt = plan, at
 }
 
+// dropPlan forgets the newest plan, so the next reader plans again: after
+// the path set's migration, a plan made before it would still list the path
+// set's pairs beside the definitions that now measure them.
+func (m *monitorPathState) dropPlan() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.plan, m.planAt = latencyPlan{}, time.Time{}
+}
+
 // pathPlan is the latency plan the matrix reads: the newest one if it is
 // younger than pathPlanFresh, else a new one. A plan is never written to
 // after it is made, so readers share it.

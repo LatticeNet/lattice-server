@@ -199,6 +199,11 @@ func (s *Server) checkFleetMesh(p principal, now time.Time) model.CheckFleetMesh
 	if out.Method == "" {
 		out.Method = model.LatencyMethodTCP
 	}
+	if m := plan.Config.Migrated; m != nil {
+		// The definitions in the list are Fleet mesh now (design 32 R1).
+		out.Migrated, out.Definitions = true, slices.Clone(m.Definitions)
+		return out
+	}
 	for _, n := range plan.Nodes {
 		if n.Source {
 			out.Sources++

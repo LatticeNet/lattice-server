@@ -124,6 +124,14 @@ type State struct {
 	// check_definitions.go), by id. Written only on an edit; the monitors
 	// they expand into live in Monitors.
 	CheckDefinitions map[string]model.CheckDefinition `json:"check_definitions,omitempty"`
+	// CheckDefinitionsEnabled is the rollback projection of the definitions
+	// that adopted the path set's monitors (design 32 R1, fleet_mesh.go):
+	// on disk such a definition reads enabled false and its own setting
+	// lives here, so the release before the migration, which knows neither
+	// this map nor the adoption, plans it as a paused definition and
+	// re-owns the path set's ids instead of measuring every pair twice.
+	// Read back into the definitions on load; never set in memory.
+	CheckDefinitionsEnabled map[string]bool `json:"check_definitions_enabled,omitempty"`
 	// MonitorSettings is the operator's monitor history setting
 	// (monitor_settings.go), nil until one is saved. Written only on an edit.
 	MonitorSettings *model.MonitorSettings `json:"monitor_settings,omitempty"`
@@ -523,6 +531,7 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 		return nil, err
 	}
 	migrateSubscriptionSecrets := subscriptionSecretsNeedMigration(s.state, s.cipher)
+	restoreProjection(&s.state)
 	if err := decryptState(&s.state, s.cipher); err != nil {
 		return nil, fmt.Errorf("store: %w", err)
 	}
@@ -1253,7 +1262,7 @@ func (s *Store) persistState(st State) (committed bool, err error) {
 	if err = os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return false, err
 	}
-	persist, err := encryptedState(st, s.cipher)
+	persist, err := encryptedState(projectedState(st), s.cipher)
 	if err != nil {
 		return false, fmt.Errorf("encrypt state: %w", err)
 	}

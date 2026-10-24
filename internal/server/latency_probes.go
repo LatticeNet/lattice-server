@@ -499,6 +499,52 @@ type latencyTargetCaps struct {
 	beaconListening bool
 }
 
+// latencyTargetFacts is what one target offers every source for the auto
+// choice, before the per-source beacon approval (caps): its icmp address and
+// its beacon. The path set planner and auto check definitions share it, so
+// both choose a method by the same facts.
+type latencyTargetFacts struct {
+	icmpTarget string
+	icmpOK     bool
+	// beaconEndpoint is the endpoint the target's enabled beacon
+	// advertises, empty when it has none.
+	beaconEndpoint string
+	bt             store.BeaconTarget
+	// targetGate is why no source may use the beacon (beaconTargetGate,
+	// or not_probeable when the node moved off the advertised address);
+	// listening says the target's agent listens where its plan put it.
+	targetGate string
+	listening  bool
+}
+
+func (s *Server) latencyTargetFactsOf(n model.Node, endpoints map[string]latencyNodeEndpoints, beacons map[string]store.BeaconTarget) latencyTargetFacts {
+	var f latencyTargetFacts
+	f.icmpTarget, f.icmpOK = latencyPublicIPv4(n.PublicIP)
+	bt, btOK := beacons[n.ID]
+	f.bt = bt
+	if btOK && bt.Settings.Enabled {
+		f.beaconEndpoint = bt.Settings.Endpoint
+	}
+	facts := s.beaconFactsOf(n)
+	f.targetGate = beaconTargetGate(bt, btOK, facts)
+	if f.targetGate == "" && !beaconEndpointCurrent(n, f.beaconEndpoint, endpoints) {
+		// The node moved off the address its plan advertises.
+		f.targetGate = model.PathReasonNotProbeable
+	}
+	f.listening = f.targetGate == "" && beaconListening(facts, bt)
+	return f
+}
+
+// caps is what the target offers sourceID, with tcpOK saying whether it has
+// a tcp endpoint.
+func (f latencyTargetFacts) caps(tcpOK bool, sourceID string) latencyTargetCaps {
+	caps := latencyTargetCaps{tcpOK: tcpOK, icmpOK: f.icmpOK, beaconGate: f.targetGate, beaconListening: f.listening}
+	if caps.beaconGate == "" {
+		caps.beaconGate = beaconSourceGate(f.bt, sourceID)
+	}
+	return caps
+}
+
 // latencyPairMethod is the kind a source probes a target with and, when it
 // cannot, why (a model.PathReason* code). auto takes, in D2's order, the
 // beacon when the target's applied plan approved the source and the target
@@ -615,7 +661,12 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 
 	configured := map[string]bool{}
 	var sources []string
+	migrated := cfg.Migrated != nil
 	for _, sourceID := range cfg.Sources {
+		if migrated {
+			// The check definitions run the path set now (design 32 R1).
+			break
+		}
 		if configured[sourceID] {
 			continue
 		}
@@ -688,6 +739,20 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			Source:  configured[n.ID],
 			Target:  model.LatencyTargetNone,
 		}
+		if migrated {
+			// No target, but the node's endpoints are still facts a check
+			// editor shows (what a node target resolves to).
+			pn.TargetReason = model.LatencyReasonMigrated
+			if chosen, note := info.choose(""); chosen != nil {
+				pn.Endpoint, pn.Protocol, pn.LineName = chosen.target, chosen.protocol, chosen.line
+			} else {
+				pn.EndpointNote = note
+			}
+			facts := s.latencyTargetFactsOf(n, out.endpoints, beaconTargets)
+			pn.ICMPTarget, pn.BeaconTarget = facts.icmpTarget, facts.beaconEndpoint
+			out.plan.Nodes = append(out.plan.Nodes, pn)
+			continue
+		}
 		switch {
 		case excluded[n.ID]:
 			pn.TargetReason = model.LatencyReasonExcluded
@@ -708,13 +773,9 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 		priorTCP, hadTCP := existing[tcpID]
 		priorICMP, hadICMP := existing[icmpID]
 		priorBeacon, hadBeacon := existing[beaconID]
-		bt, btOK := beaconTargets[n.ID]
-		beaconEndpoint := ""
-		facts := s.beaconFactsOf(n)
-		if btOK && bt.Settings.Enabled {
-			beaconEndpoint = bt.Settings.Endpoint
-			pn.BeaconTarget = beaconEndpoint
-		}
+		facts := s.latencyTargetFactsOf(n, out.endpoints, beaconTargets)
+		beaconEndpoint := facts.beaconEndpoint
+		pn.BeaconTarget = beaconEndpoint
 		if pn.Target == model.LatencyTargetNone {
 			// Out of the set: the monitors stay, paused, with their history.
 			if hadTCP {
@@ -739,18 +800,10 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 		}
 		chosen, note := info.choose(prior)
 		pn.EndpointNote = note
-		icmpTarget, icmpOK := latencyPublicIPv4(n.PublicIP)
-		if icmpOK {
-			pn.ICMPTarget = icmpTarget
-		}
+		icmpTarget, icmpOK := facts.icmpTarget, facts.icmpOK
+		pn.ICMPTarget = icmpTarget
 		tcpOK := chosen != nil
-		targetGate := beaconTargetGate(bt, btOK, facts)
-		if targetGate == "" && !beaconEndpointCurrent(n, beaconEndpoint, out.endpoints) {
-			// The node moved off the address its plan advertises.
-			targetGate = model.PathReasonNotProbeable
-		}
-		beaconOK := targetGate == ""
-		listening := beaconOK && beaconListening(facts, bt)
+		beaconOK := facts.targetGate == ""
 
 		var activeTCP, activeICMP, activeBeacon []string
 		firstPair := len(out.plan.Pairs)
@@ -761,10 +814,7 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			}
 			enabled := !disabledPairs[latencyPairKey(sourceID, n.ID)]
 			setting := latencySourceMethod(cfg, sourceID)
-			caps := latencyTargetCaps{tcpOK: tcpOK, icmpOK: icmpOK, beaconGate: targetGate, beaconListening: listening}
-			if caps.beaconGate == "" {
-				caps.beaconGate = beaconSourceGate(bt, sourceID)
-			}
+			caps := facts.caps(tcpOK, sourceID)
 			if setting == model.LatencyMethodAuto && icmpOK && hadICMP {
 				caps.icmpFiltered = s.latencyICMPFiltered(icmpID, sourceID, now)
 			}
@@ -952,6 +1002,11 @@ func (s *Server) syncLatencyProbes(now time.Time) (model.LatencyProbePlan, store
 	s.latencyEdges.refresh(latencyEdgeNames(s.liveSingBoxInventories(now)), now)
 	planned := s.planLatencyProbes(now)
 	s.monitorPaths.notePlan(planned, now)
+	if planned.plan.Config.Migrated != nil {
+		// The definitions own the path set's monitors now (design 32 R1):
+		// the plan is kept for the node endpoints, and nothing is written.
+		return planned.plan, store.ManagedMonitorChanges{}, nil
+	}
 	changes, err := s.store.SyncManagedMonitors(model.MonitorManagedLatency, planned.desired, now)
 	if err != nil {
 		return planned.plan, changes, err
@@ -1275,6 +1330,10 @@ func (s *Server) handleLatencyProbes(w http.ResponseWriter, r *http.Request, p p
 		}
 		s.monitorSaves.Lock()
 		defer s.monitorSaves.Unlock()
+		if current, stored := s.store.LatencyProbeConfig(); stored && current.Migrated != nil {
+			writeError(w, http.StatusConflict, pathSetMigratedError(current))
+			return
+		}
 		cfg, err := s.normalizeLatencyProbeConfig(req)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -1300,7 +1359,12 @@ func (s *Server) handleLatencyProbes(w http.ResponseWriter, r *http.Request, p p
 		prior, _ := s.store.LatencyProbeConfig()
 		stored, err := s.store.SetLatencyProbeConfig(cfg, req.Version, p.ActorID, now)
 		if errors.Is(err, store.ErrLatencyProbeVersion) {
-			writeError(w, http.StatusConflict, err)
+			writeError(w, http.StatusConflict, versionConflict(err))
+			return
+		}
+		if errors.Is(err, store.ErrPathSetMigrated) {
+			current, _ := s.store.LatencyProbeConfig()
+			writeError(w, http.StatusConflict, pathSetMigratedError(current))
 			return
 		}
 		if err != nil {

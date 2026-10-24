@@ -209,7 +209,9 @@ func TestCheckDefinitionExpandsSourcesTimesTargets(t *testing.T) {
 		t.Fatalf("created = %+v", view.CheckDefinition)
 	}
 	mons := definitionMonitors(st, view.ID)
-	if len(mons) != 3 || view.Summary.Monitors != 3 || view.Summary.Paths != 6 {
+	// Six pairs, four of them paths: TCP has nothing to dial on the third
+	// target, and a skipped pair is not a path (design 32 R2).
+	if len(mons) != 3 || view.Summary.Monitors != 3 || view.Summary.Paths != 4 {
 		t.Fatalf("monitors = %d, summary = %+v", len(mons), view.Summary)
 	}
 	for _, mon := range mons {
@@ -1143,7 +1145,10 @@ func TestCheckDefinitionBounds(t *testing.T) {
 	plan.desired = nil
 	for i := range 65 {
 		plan.sources = append(plan.sources, "src-"+strconv.Itoa(i))
-		plan.entries = append(plan.entries, checkPlanEntry{key: "t-" + strconv.Itoa(i), targetNode: "t-" + strconv.Itoa(i)})
+	}
+	for i := range 65 {
+		// Each target's entry holds the sources that measure it.
+		plan.entries = append(plan.entries, checkPlanEntry{key: "t-" + strconv.Itoa(i), targetNode: "t-" + strconv.Itoa(i), sources: plan.sources})
 	}
 	if err := checkPlanBounds(plan); err == nil || !strings.Contains(err.Error(), "paths") {
 		t.Fatalf("65 by 65 = %v, want the path bound", err)

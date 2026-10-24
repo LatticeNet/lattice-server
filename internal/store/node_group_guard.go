@@ -199,24 +199,26 @@ func (s *Store) NetGuardRuleRemoteNodes(nodeID string) []string {
 		return nil
 	}
 	set := map[string]bool{}
-	var nodes []model.Node
+	resolved := map[string]bool{}
 	for _, rule := range s.bindingRulesLocked(nodeID, binding) {
 		switch rule.Remote.Kind {
 		case model.NetRefNode:
 			set[rule.Remote.NodeID] = true
 		case model.NetRefGroup:
 			g, ok := s.state.Groups[rule.Remote.GroupID]
-			if !ok {
+			if !ok || resolved[g.ID] {
 				continue
 			}
-			if nodes == nil {
-				nodes = make([]model.Node, 0, len(s.state.Nodes))
-				for _, n := range s.state.Nodes {
-					nodes = append(nodes, n)
-				}
-			}
-			for _, member := range groups.ResolveMembers(g, nodes) {
+			resolved[g.ID] = true
+			for _, member := range g.Members {
 				set[member] = true
+			}
+			if g.Selector != nil {
+				for _, n := range s.state.Nodes {
+					if groups.Contains(g, n) {
+						set[n.ID] = true
+					}
+				}
 			}
 		}
 	}
@@ -330,6 +332,9 @@ func (s *Store) bindingRulesLocked(nodeID string, binding model.NodeGuardBinding
 func (s *Store) invalidateGuardBindingsForNodeGroupLocked(groupID string, members bool) {
 	g, exists := s.state.Groups[groupID]
 	for nodeID, binding := range s.state.GuardBindings {
+		if binding.LastPlanSHA == "" {
+			continue
+		}
 		if exists && members {
 			if node, ok := s.state.Nodes[nodeID]; ok && binding.Managed && groups.Contains(g, node) {
 				s.invalidateGuardBindingLocked(nodeID)
@@ -339,6 +344,27 @@ func (s *Store) invalidateGuardBindingsForNodeGroupLocked(groupID string, member
 		if guardRulesReferenceGroup(s.bindingRulesLocked(nodeID, binding), groupID) {
 			s.invalidateGuardBindingLocked(nodeID)
 		}
+	}
+}
+
+// invalidateGuardBindingsForMembershipLocked runs when a node's fields that
+// selectors read (tags, role, geo) may have changed. For each node group
+// whose membership of the node moves, the node's derived groups change when
+// the group binds any, and every compile naming the group as a remote
+// renders different addresses; both anchors are cleared so the approved
+// plan made for the old membership is withheld at lease.
+func (s *Store) invalidateGuardBindingsForMembershipLocked(previous, next model.Node) {
+	if len(s.state.GuardBindings) == 0 {
+		return
+	}
+	for groupID, g := range s.state.Groups {
+		if g.Selector == nil || groups.Contains(g, previous) == groups.Contains(g, next) {
+			continue
+		}
+		if b, ok := s.state.NodeGroupGuardBindings[groupID]; ok && len(b.SecurityGroupIDs) > 0 {
+			s.invalidateGuardBindingLocked(next.ID)
+		}
+		s.invalidateGuardBindingsForNodeGroupLocked(groupID, false)
 	}
 }
 

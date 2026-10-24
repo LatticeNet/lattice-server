@@ -2,9 +2,9 @@ package store
 
 import (
 	"encoding/json"
-	"fmt"
 	"sort"
 	"time"
+	"unicode/utf8"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/selfdns"
@@ -88,6 +88,29 @@ type GuardWriterTask struct {
 	Kind       string
 	// Leased is true while an agent holds a live lease: it may be running.
 	Leased bool
+	// Rerun is true for a rerun of an approved apply's task.
+	Rerun bool
+}
+
+// guardWriteOfTaskLocked is the guard write a task carries out: its
+// approval's, or for a rerun, which has no approval of its own, the
+// approval of the task it reruns. A first run counts only while its
+// approval is approved; a rerun replays a script whose approval has long
+// been decided, so its approval's status does not matter.
+func guardWriteOfTaskLocked(st State, t model.Task) (model.Approval, GuardWrite, bool, bool) {
+	approvalID, rerun := t.ApprovalID, false
+	if approvalID == "" && t.RerunOfTaskID != "" {
+		approvalID, rerun = st.Tasks[t.RerunOfTaskID].ApprovalID, true
+	}
+	if approvalID == "" {
+		return model.Approval{}, GuardWrite{}, false, false
+	}
+	a, ok := st.Approvals[approvalID]
+	if !ok || (!rerun && a.Status != model.ApprovalApproved) {
+		return model.Approval{}, GuardWrite{}, false, false
+	}
+	w, ok := GuardWriteOf(a)
+	return a, w, rerun, ok
 }
 
 // NetGuardSide is GuardWrite.NetGuardSide for the task's writer.
@@ -105,7 +128,7 @@ func (s *Store) GuardWritersInFlight(nodeID string) []GuardWriterTask {
 func (s *Store) guardWritersInFlightLocked(st State, nodeID string, now time.Time) []GuardWriterTask {
 	var tasks []model.Task
 	for _, t := range st.Tasks {
-		if t.ApprovalID != "" && taskTargetAwaitingResult(t, nodeID, st.Results, st.TaskResultReceipts, st.TaskTargetStates, now, s.taskQueueDeadline) {
+		if (t.ApprovalID != "" || t.RerunOfTaskID != "") && taskTargetAwaitingResult(t, nodeID, st.Results, st.TaskResultReceipts, st.TaskTargetStates, now, s.taskQueueDeadline) {
 			tasks = append(tasks, t)
 		}
 	}
@@ -117,19 +140,15 @@ func (s *Store) guardWritersInFlightLocked(st State, nodeID string, now time.Tim
 	})
 	var out []GuardWriterTask
 	for _, t := range tasks {
-		a, ok := st.Approvals[t.ApprovalID]
-		if !ok || a.NodeID != nodeID || a.Status != model.ApprovalApproved {
-			continue
-		}
-		w, ok := GuardWriteOf(a)
-		if !ok {
+		a, w, rerun, ok := guardWriteOfTaskLocked(st, t)
+		if !ok || (!rerun && a.NodeID != nodeID) {
 			continue
 		}
 		leased := false
 		if start, ok := taskTargetLeaseStart(t, nodeID); ok {
 			leased = !taskLeaseExpiredAt(start, t.TimeoutSec, now)
 		}
-		out = append(out, GuardWriterTask{ApprovalID: a.ID, TaskID: t.ID, Kind: w.Kind, Leased: leased})
+		out = append(out, GuardWriterTask{ApprovalID: a.ID, TaskID: t.ID, Kind: w.Kind, Leased: leased, Rerun: rerun})
 	}
 	return out
 }
@@ -141,11 +160,7 @@ func (s *Store) guardWritersInFlightLocked(st State, nodeID string, now time.Tim
 // writer of the other side is leased on the node and may be running: the
 // task waits for the next poll instead of racing it.
 func (s *Store) guardOwnerAtLeaseLocked(st State, t model.Task, nodeID string, now time.Time) (supersede string, hold bool) {
-	a, ok := st.Approvals[t.ApprovalID]
-	if t.ApprovalID == "" || !ok {
-		return "", false
-	}
-	w, ok := GuardWriteOf(a)
+	_, w, rerun, ok := guardWriteOfTaskLocked(st, t)
 	if !ok {
 		return "", false
 	}
@@ -154,7 +169,11 @@ func (s *Store) guardOwnerAtLeaseLocked(st State, t model.Task, nodeID string, n
 	case !w.NetGuardSide() && managed:
 		return "NetGuard took over this node's firewall after this plan was approved, and it is the only writer of lattice_guard there, so the task was not run; plan the change in NetGuard", false
 	case !w.NetGuardSide() && viaGroup != "":
-		return fmt.Sprintf("this node is in node group %q, whose security groups NetGuard applies, so this plan, approved before that, was not run; adopt the node in NetGuard or take it out of the group, then plan again", viaGroup), false
+		// The group is not named: the sentence outlives the request and is
+		// read by whoever may read the approval, not only by group readers.
+		return "this node joined a node group whose security groups NetGuard applies, so this plan, approved before that, was not run; adopt the node in NetGuard or take it out of the group, then plan again", false
+	case w.NetGuardSide() && rerun:
+		return "a NetGuard apply is not rerun from its stored script, which would replace the table with an old compile; plan the node again", false
 	case w.Kind == GuardWriterBeacon && !managed:
 		return "NetGuard no longer manages this node, so the beacon plan's NetGuard rules were not applied; plan the beacon again", false
 	}
@@ -167,7 +186,10 @@ func (s *Store) guardOwnerAtLeaseLocked(st State, t model.Task, nodeID string, n
 }
 
 // GuardSupersession is one apply the lease superseded, kept until the
-// server records it in the audit log.
+// server records it in the audit log. This outbox is best effort: it lives in
+// memory, so a crash between the lease commit and the server's drain loses
+// the audit line, while the approval's stale code and reason, written in the
+// same commit as the lease, stay.
 type GuardSupersession struct {
 	NodeID     string
 	ApprovalID string
@@ -188,4 +210,16 @@ func (s *Store) TakeGuardSupersessions() []GuardSupersession {
 	out := s.guardSuperseded
 	s.guardSuperseded = nil
 	return out
+}
+
+// truncateRunes cuts s to at most n bytes without splitting a UTF-8
+// sequence.
+func truncateRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

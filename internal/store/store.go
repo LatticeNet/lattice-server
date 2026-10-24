@@ -20,6 +20,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/auth"
 	"github.com/LatticeNet/lattice-server/internal/groups"
 	"github.com/LatticeNet/lattice-server/internal/secret"
+	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/telemetry"
 )
 
@@ -1724,6 +1725,9 @@ func (s *Store) UpsertNode(n model.Node) error {
 	if existed && (previous.PublicIP != n.PublicIP || previous.WireGuardIP != n.WireGuardIP) {
 		s.invalidateGuardBindingsForNodeLocked(n.ID)
 	}
+	if existed {
+		s.invalidateGuardBindingsForMembershipLocked(previous, n)
+	}
 	if !n.LastSeen.IsZero() {
 		if s.metricsPersistedAt == nil {
 			s.metricsPersistedAt = map[string]time.Time{}
@@ -1817,6 +1821,7 @@ func (s *Store) UpdateNodeGeo(nodeID string, geo *model.NodeGeo) (model.Node, bo
 	if !ok {
 		return model.Node{}, false, nil
 	}
+	previous := n
 	if geo != nil {
 		copyGeo := *geo
 		n.Geo = &copyGeo
@@ -1824,6 +1829,7 @@ func (s *Store) UpdateNodeGeo(nodeID string, geo *model.NodeGeo) (model.Node, bo
 		n.Geo = nil
 	}
 	s.state.Nodes[nodeID] = n
+	s.invalidateGuardBindingsForMembershipLocked(previous, n)
 	return cloneNode(n), true, s.Save()
 }
 
@@ -2022,6 +2028,7 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string
 	if !ok {
 		return model.Node{}, false, nil
 	}
+	previous := cloneNode(n)
 	n.Name = name
 	n.Role = role
 	n.Comment = comment
@@ -2044,6 +2051,7 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string
 		n.Inventory = *inventory
 	}
 	s.state.Nodes[nodeID] = n
+	s.invalidateGuardBindingsForMembershipLocked(previous, n)
 	if err := s.Save(); err != nil {
 		return model.Node{}, true, err
 	}
@@ -2343,16 +2351,25 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 	// same commit; the server audits it after the lease.
 	var superseded []GuardSupersession
 	supersedeGuardWriter := func(t model.Task, reason string) {
-		approval := staged.Approvals[t.ApprovalID]
-		approval.Status, approval.Stale, approval.StaleCode = model.ApprovalRejected, true, ApprovalStaleGuardOwnerChanged
-		approval.Reason, approval.UpdatedAt = reason, now
-		if len(approval.Reason) > 240 {
-			approval.Reason = approval.Reason[:240]
+		approval, w, rerun, _ := guardWriteOfTaskLocked(staged, t)
+		// A rerun is cancelled alone: its approval was decided long ago and
+		// says what its first run did. A first run's approval is rejected
+		// with the reason, and a self-host DNS deployment it was applying is
+		// marked failed, as a failed apply marks it.
+		if !rerun {
+			approval.Status, approval.Stale, approval.StaleCode = model.ApprovalRejected, true, ApprovalStaleGuardOwnerChanged
+			approval.Reason, approval.UpdatedAt = truncateRunes(reason, 240), now
+			staged.Approvals[approval.ID] = approval
+			if depID, ok := selfdns.DeploymentIDOf(approval.Action); ok && approval.Plugin == "selfdns" {
+				if dep, ok := staged.DNSDeployments[depID]; ok && dep.Status == model.DNSStatusApplying {
+					staged.DNSDeployments = maps.Clone(staged.DNSDeployments)
+					dep.Status, dep.LastError, dep.UpdatedAt = model.DNSStatusFailed, approval.Reason, now
+					staged.DNSDeployments[depID] = dep
+				}
+			}
 		}
-		staged.Approvals[approval.ID] = approval
 		t.Status, t.FinishedAt = model.TaskCancelled, now
 		staged.Tasks[t.ID] = t
-		w, _ := GuardWriteOf(approval)
 		superseded = append(superseded, GuardSupersession{NodeID: nodeID, ApprovalID: approval.ID, TaskID: t.ID,
 			Kind: w.Kind, Reason: reason, ActorID: t.ActorID, TokenID: t.TokenID, At: now})
 		stateChanged = true
@@ -5034,12 +5051,51 @@ func (s *Store) SecurityGroups() []model.SecurityGroup {
 	return out
 }
 
-// DeleteSecurityGroup removes a stored security group.
+// SecurityGroupInUseError is DeleteSecurityGroup's refusal: node bindings or
+// node-group bindings still attach the group, and deleting it would leave
+// their compiles failing. The ids are sorted.
+type SecurityGroupInUseError struct {
+	ID           string
+	NodeIDs      []string
+	NodeGroupIDs []string
+}
+
+func (e *SecurityGroupInUseError) Error() string {
+	var parts []string
+	if len(e.NodeIDs) > 0 {
+		parts = append(parts, "node "+strings.Join(e.NodeIDs, ", "))
+	}
+	if len(e.NodeGroupIDs) > 0 {
+		parts = append(parts, "node group "+strings.Join(e.NodeGroupIDs, ", "))
+	}
+	return fmt.Sprintf("security group %q is still attached to %s", e.ID, strings.Join(parts, " and "))
+}
+
+// DeleteSecurityGroup removes a stored security group. It refuses with a
+// *SecurityGroupInUseError, under the lock that deletes, while a binding
+// still attaches it, so a binding written between a caller's check and the
+// delete cannot be left naming a group that is gone.
 func (s *Store) DeleteSecurityGroup(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.state.SecurityGroups[id]; !ok {
 		return nil
+	}
+	inUse := &SecurityGroupInUseError{ID: id}
+	for nodeID, binding := range s.state.GuardBindings {
+		if contains(binding.GroupIDs, id) {
+			inUse.NodeIDs = append(inUse.NodeIDs, nodeID)
+		}
+	}
+	for groupID, b := range s.state.NodeGroupGuardBindings {
+		if contains(b.SecurityGroupIDs, id) {
+			inUse.NodeGroupIDs = append(inUse.NodeGroupIDs, groupID)
+		}
+	}
+	if len(inUse.NodeIDs) > 0 || len(inUse.NodeGroupIDs) > 0 {
+		sort.Strings(inUse.NodeIDs)
+		sort.Strings(inUse.NodeGroupIDs)
+		return inUse
 	}
 	delete(s.state.SecurityGroups, id)
 	s.invalidateGuardBindingsForGroupLocked(id)
@@ -5132,6 +5188,9 @@ func (s *Store) invalidateGuardBindingsForGroupLocked(groupID string) {
 
 func (s *Store) invalidateGuardBindingsForZoneLocked(zoneID string) {
 	for nodeID, binding := range s.state.GuardBindings {
+		if binding.LastPlanSHA == "" {
+			continue
+		}
 		if contains(binding.ZoneIDs, zoneID) || guardRulesReferenceZone(s.bindingRulesLocked(nodeID, binding), zoneID) {
 			s.invalidateGuardBindingLocked(nodeID)
 		}
@@ -5144,6 +5203,9 @@ func (s *Store) invalidateGuardBindingsForZoneLocked(zoneID string) {
 func (s *Store) invalidateGuardBindingsForNodeLocked(referencedNodeID string) {
 	referenced, known := s.state.Nodes[referencedNodeID]
 	for nodeID, binding := range s.state.GuardBindings {
+		if binding.LastPlanSHA == "" {
+			continue
+		}
 		rules := s.bindingRulesLocked(nodeID, binding)
 		if guardRulesReferenceNode(rules, referencedNodeID) {
 			s.invalidateGuardBindingLocked(nodeID)
@@ -5330,6 +5392,8 @@ func (s *Store) DeleteGroup(id string) error {
 	}
 	s.invalidateGuardBindingsForGroupEditLocked(id)
 	delete(s.state.Groups, id)
+	// An empty binding is not a use; it goes with its group.
+	delete(s.state.NodeGroupGuardBindings, id)
 	return s.Save()
 }
 

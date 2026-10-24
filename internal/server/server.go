@@ -4125,16 +4125,30 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 	// A rerun copies the script verbatim. A firewall-writing plan applied
 	// before NetGuard adopted a node would rebuild lattice_guard there without
 	// the node's security groups, which the approve refuses for the same plan,
-	// so the rerun refuses too.
-	if src.ApprovalID != "" {
-		if approval, ok := s.store.Approval(src.ApprovalID); ok && approvalWritesLegacyGuard(approval) {
+	// so the rerun refuses too. A rerun of a rerun is judged by the approval
+	// of the task it all started from.
+	guardApprovalID := src.ApprovalID
+	if guardApprovalID == "" && src.RerunOfTaskID != "" {
+		if root, ok := s.store.Task(src.RerunOfTaskID); ok {
+			guardApprovalID = root.ApprovalID
+		}
+	}
+	if approval, ok := s.store.Approval(guardApprovalID); guardApprovalID != "" && ok {
+		if gw, writes := store.GuardWriteOf(approval); writes && gw.NetGuardSide() {
+			writeError(w, http.StatusConflict, errors.New("a NetGuard apply is not rerun from its stored script, which would replace the table with an old compile; plan the node again"))
+			return
+		} else if writes {
 			for _, nodeID := range targets {
 				if s.nodeGuardManaged(nodeID) {
 					writeError(w, http.StatusConflict, fmt.Errorf("node %s is managed by NetGuard, which is the only writer of its lattice_guard table; this task would replace it, so it cannot be rerun there", nodeID))
 					return
 				}
-				if err := s.groupCoverageRefusal(nodeID); err != nil {
+				if err := s.groupCoverageRefusal(p, nodeID); err != nil {
 					writeError(w, http.StatusConflict, fmt.Errorf("node %s: %w; this task would replace its table, so it cannot be rerun there", nodeID, err))
+					return
+				}
+				if err := s.guardWriterInFlightRefusal(nodeID, false, "this task cannot be rerun now"); err != nil {
+					writeError(w, http.StatusConflict, err)
 					return
 				}
 			}
@@ -7399,7 +7413,7 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusConflict, errors.New("node is managed by NetGuard: plan its firewall with /api/netguard/plan; this legacy route would rebuild lattice_guard without the node's security groups"))
 		return
 	}
-	if err := s.groupCoverageRefusal(req.NodeID); err != nil {
+	if err := s.groupCoverageRefusal(p, req.NodeID); err != nil {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
@@ -7770,7 +7784,15 @@ func (s *Server) approvalPlanReach(approval model.Approval) []planReach {
 		}
 		reach := []planReach{{scope: "monitor:read", nodes: sources}}
 		if plan.NetGuard != nil {
-			reach = append(reach, planReach{scope: "netguard:read", nodes: s.store.NetGuardRuleRemoteNodes(approval.NodeID)})
+			// The sources' addresses are in the companion's allow set too;
+			// they are read under monitor:read above, not twice.
+			netguardNodes := []string{}
+			for _, id := range unionNodes(s.store.NetGuardRuleRemoteNodes(approval.NodeID), s.nodesAddressedIn(plan.NetGuard.Ruleset, approval.NodeID)) {
+				if !slices.Contains(sources, id) {
+					netguardNodes = append(netguardNodes, id)
+				}
+			}
+			reach = append(reach, planReach{scope: "netguard:read", nodes: netguardNodes})
 		}
 		return reach
 	case approval.Plugin == "wireguard" && approval.Action == "apply-config":
@@ -7787,17 +7809,17 @@ func (s *Server) approvalPlanReach(approval model.Approval) []planReach {
 	case approval.Plugin == "nftpolicy":
 		// The plan is a compiled ruleset: every remote node named by a rule has
 		// its WireGuard IP and public addresses in the bytes.
-		return []planReach{{scope: "netpolicy:read", nodes: s.netPolicyRemoteNodes(approval.NodeID, "")}}
+		return []planReach{{scope: "netpolicy:read", nodes: unionNodes(s.netPolicyRemoteNodes(approval.NodeID, ""), s.nodesAddressedIn(approval.Plan, approval.NodeID))}}
 	case isNetGuardApproval(approval):
 		// A NetGuard ruleset pins every node remote, and every member of a
 		// node group remote, to its addresses (compileInputSnapshotFor
 		// refuses the plan to a caller who cannot read them).
-		return []planReach{{scope: "netguard:read", nodes: s.store.NetGuardRuleRemoteNodes(approval.NodeID)}}
+		return []planReach{{scope: "netguard:read", nodes: unionNodes(s.store.NetGuardRuleRemoteNodes(approval.NodeID), s.nodesAddressedIn(approval.Plan, approval.NodeID))}}
 	case approvalWritesLegacyGuard(approval):
 		// The legacy firewall route and a self-host DNS ruleset fold the
 		// node's outbound document's ingress rules into the table, remote
 		// addresses included (composeNFTIngressPolicy).
-		return []planReach{{scope: "netpolicy:read", nodes: s.netPolicyRemoteNodes(approval.NodeID, model.NetDirIngress)}}
+		return []planReach{{scope: "netpolicy:read", nodes: unionNodes(s.netPolicyRemoteNodes(approval.NodeID, model.NetDirIngress), s.nodesAddressedIn(approval.Plan, approval.NodeID))}}
 	case isLineChainApproval(approval):
 		// The plan names the target node's line: host, port, SNI and key
 		// fingerprints.
@@ -7815,6 +7837,64 @@ func (s *Server) approvalPlanReach(approval model.Approval) []planReach {
 type planReach struct {
 	scope string
 	nodes []string
+}
+
+// planAddressRe finds the IPv4 and IPv6 literals in a plan's text, with an
+// optional prefix length.
+var planAddressRe = regexp.MustCompile(`[0-9A-Fa-f:.]*[0-9A-Fa-f][0-9A-Fa-f:.]*(?:/[0-9]{1,3})?`)
+
+// nodesAddressedIn lists the nodes other than self whose own address, public
+// or WireGuard, the plan's text pins as a host (bare, /32 or /128). A
+// firewall plan's reach is what its bytes carry, which can outlive the rule
+// that put an address there: a node that left a group remote after the plan
+// was made is still in it. Current state alone would miss that node.
+func (s *Server) nodesAddressedIn(plan, self string) []string {
+	byAddr := map[netip.Addr][]string{}
+	for _, n := range s.store.Nodes() {
+		if n.ID == self {
+			continue
+		}
+		for _, raw := range []string{n.PublicIP, n.WireGuardIP} {
+			raw = strings.TrimSpace(raw)
+			if prefix, err := netip.ParsePrefix(raw); err == nil {
+				raw = prefix.Addr().String()
+			}
+			if addr, err := netip.ParseAddr(raw); err == nil {
+				byAddr[addr.Unmap()] = append(byAddr[addr.Unmap()], n.ID)
+			}
+		}
+	}
+	if len(byAddr) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, token := range planAddressRe.FindAllString(plan, -1) {
+		host, bits, hasBits := strings.Cut(token, "/")
+		addr, err := netip.ParseAddr(host)
+		if err != nil || (hasBits && bits != strconv.Itoa(addr.BitLen())) {
+			continue
+		}
+		for _, id := range byAddr[addr.Unmap()] {
+			if !seen[id] {
+				seen[id] = true
+				out = append(out, id)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// unionNodes is a and b without repeats, a's order first.
+func unionNodes(a, b []string) []string {
+	out := append([]string(nil), a...)
+	for _, id := range b {
+		if !slices.Contains(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // netPolicyRemoteNodes is every node other than nodeID that a rule of its
@@ -9016,12 +9096,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		if s.nodeGuardManaged(approval.NodeID) {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "node is managed by NetGuard, which is the only writer of its lattice_guard table; plan its firewall with /api/netguard/plan")}
 		}
-		if err := s.groupCoverageRefusal(approval.NodeID); err != nil {
+		if err := s.groupCoverageRefusal(p, approval.NodeID); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}
 	if approval.Plugin == "selfdns" {
-		if err := s.requireSelfDNSFirewallOwner(approval); err != nil {
+		if err := s.requireSelfDNSFirewallOwner(p, approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}

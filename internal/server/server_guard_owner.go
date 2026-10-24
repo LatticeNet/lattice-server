@@ -5,6 +5,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/id"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -52,11 +53,17 @@ func (s *Server) guardWriterInFlightRefusal(nodeID string, netGuardSide bool, wh
 // group whose security groups it applies (design 32 D7 with S4). Callers
 // test a managed binding first, with their own sentence. A covered node
 // NetGuard does not manage can use neither route until it is adopted.
-func (s *Server) groupCoverageRefusal(nodeID string) error {
-	if managed, viaGroup := s.store.NetGuardCoverage(nodeID); !managed && viaGroup != "" {
-		return fmt.Errorf("node is in node group %q, whose security groups NetGuard applies, so its firewall is NetGuard's to write; adopt the node in NetGuard, or take it out of the group, before planning its firewall outside NetGuard", viaGroup)
+// The group is named only to a caller who may read node groups.
+func (s *Server) groupCoverageRefusal(p principal, nodeID string) error {
+	managed, viaGroup := s.store.NetGuardCoverage(nodeID)
+	if managed || viaGroup == "" {
+		return nil
 	}
-	return nil
+	group := "a node group"
+	if rbac.Allows(p.Principal, "group:read", "") {
+		group = fmt.Sprintf("node group %q", viaGroup)
+	}
+	return fmt.Errorf("node is in %s whose security groups NetGuard applies, so its firewall is NetGuard's to write; adopt the node in NetGuard, or take it out of the group, before planning its firewall outside NetGuard", group)
 }
 
 // auditGuardSupersessions records the applies the last lease superseded.

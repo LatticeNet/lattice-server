@@ -2,7 +2,6 @@ package server
 
 import (
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"net/http"
@@ -403,14 +402,16 @@ func (s *Server) nodeNetworkInbound(p principal, node model.Node, binding model.
 		}
 		in.DriftState = netGuardDriftState(binding, reality)
 	}
-	showGroupName := rbac.Allows(p.Principal, "group:read", "")
+	// The node group is named, and given at all, only to a reader of node
+	// groups; without it the derived group still shows, with its state.
+	groupReader := rbac.Allows(p.Principal, "group:read", "")
 	for _, d := range s.store.NodeDerivedGuardGroups(node.ID) {
-		sg := nodeNetworkSecurityGroup{ID: d.SecurityGroupID, Via: &nodeNetworkRef{ID: d.NodeGroupID}}
+		sg := nodeNetworkSecurityGroup{ID: d.SecurityGroupID}
 		if group, ok := s.store.SecurityGroup(d.SecurityGroupID); ok {
 			sg.Name, sg.Rules = group.Name, len(group.Rules)
 		}
-		if showGroupName {
-			sg.Via.Name = d.NodeGroupName
+		if groupReader {
+			sg.Via = &nodeNetworkRef{ID: d.NodeGroupID, Name: d.NodeGroupName}
 		}
 		if !hasBinding || !binding.Managed {
 			sg.State, sg.Reason = "inactive", nodeGroupBindingInactive
@@ -709,15 +710,8 @@ func guardWriteOf(a model.Approval) (kind, ruleset, deploymentID string, ok bool
 
 // selfDNSDeploymentOf reads the deployment id selfDNSApprovalAction encoded.
 func selfDNSDeploymentOf(action string) string {
-	encoded, ok := strings.CutPrefix(action, selfDNSApplyActionPrefix)
-	if !ok {
-		return ""
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
-	if err != nil {
-		return ""
-	}
-	return string(raw)
+	id, _ := selfdns.DeploymentIDOf(action)
+	return id
 }
 
 // rulesetDigest hashes a ruleset as text, trimmed, so the copy a self-host

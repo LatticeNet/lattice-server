@@ -26,8 +26,8 @@ import (
 var dnsLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 
 const (
-	selfDNSApplyAction       = "apply-config"
-	selfDNSApplyActionPrefix = selfDNSApplyAction + ":"
+	selfDNSApplyAction       = selfdns.ApplyAction
+	selfDNSApplyActionPrefix = selfdns.ApplyActionPrefix
 )
 
 type dnsDeploymentView struct {
@@ -225,7 +225,7 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 	}
 	// The legacy path below writes a ruleset, which a node NetGuard covers
 	// through a node group refuses until NetGuard adopts it.
-	if err := s.groupCoverageRefusal(dep.NodeID); err != nil {
+	if err := s.groupCoverageRefusal(p, dep.NodeID); err != nil {
 		writeError(w, http.StatusConflict, err)
 		return
 	}
@@ -484,7 +484,7 @@ func dnsListenerRefusal(findings []netguard.Finding) error {
 //     plan is refused when NetGuard no longer admits its listeners;
 //   - on a node NetGuard does not manage, a CoreDNS-only plan (made while it
 //     did) is refused, since nothing would open its ports.
-func (s *Server) requireSelfDNSFirewallOwner(approval model.Approval) error {
+func (s *Server) requireSelfDNSFirewallOwner(p principal, approval model.Approval) error {
 	artifacts, err := selfdns.ParseApprovalPlan(approval.Plan)
 	if err != nil {
 		return fmt.Errorf("selfdns plan is no longer applyable: %w", err)
@@ -499,7 +499,7 @@ func (s *Server) requireSelfDNSFirewallOwner(approval model.Approval) error {
 	case managed && artifacts.NFTRuleset != "":
 		return errors.New("node is managed by NetGuard, which is the only writer of its lattice_guard table, and this DNS plan would replace it; plan the deployment again")
 	case !managed && artifacts.NFTRuleset != "":
-		if err := s.groupCoverageRefusal(approval.NodeID); err != nil {
+		if err := s.groupCoverageRefusal(p, approval.NodeID); err != nil {
 			return err
 		}
 	case !managed && artifacts.NFTRuleset == "":

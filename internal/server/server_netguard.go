@@ -41,6 +41,8 @@ type securityGroupView struct {
 	ViaNodeGroup *nodeNetworkRef `json:"via_node_group,omitempty"`
 	// Inactive marks a derived group on a node NetGuard does not manage.
 	Inactive bool `json:"inactive,omitempty"`
+	// RuleCount stands in for Rules where the caller may not read them.
+	RuleCount int `json:"rule_count,omitempty"`
 }
 
 type nodeGuardView struct {
@@ -56,20 +58,29 @@ type nodeGuardView struct {
 }
 
 // derivedGroupViews renders a node's derived groups for p: active ones as
-// compiled, inactive ones marked with why.
+// compiled, inactive ones marked with why. An unrestricted administrator
+// attached them through a global binding, and their rules can name other
+// nodes, so a caller confined to some nodes gets the name and the rule count
+// only, as the global catalogue would refuse it the rules; the node group is
+// named, and given at all, only to a caller who may read node groups.
 func (s *Server) derivedGroupViews(p principal, derived []store.DerivedGuardGroup, active bool) []securityGroupView {
-	showName := rbac.Allows(p.Principal, "group:read", "")
+	groupReader := rbac.Allows(p.Principal, "group:read", "")
+	confined := principalHasNodeRestriction(p)
 	out := make([]securityGroupView, 0, len(derived))
 	for _, d := range derived {
 		group, ok := s.store.SecurityGroup(d.SecurityGroupID)
 		if !ok {
 			group = model.SecurityGroup{ID: d.SecurityGroupID}
 		}
-		via := &nodeNetworkRef{ID: d.NodeGroupID}
-		if showName {
-			via.Name = d.NodeGroupName
+		view := securityGroupView{SecurityGroup: group, Source: netGuardSourceStored, Inactive: !active}
+		if confined {
+			view.SecurityGroup = model.SecurityGroup{ID: group.ID, Name: group.Name, Version: group.Version, Rules: []model.GuardRule{}}
+			view.RuleCount = len(group.Rules)
 		}
-		out = append(out, securityGroupView{SecurityGroup: group, Source: netGuardSourceStored, ViaNodeGroup: via, Inactive: !active})
+		if groupReader {
+			view.ViaNodeGroup = &nodeNetworkRef{ID: d.NodeGroupID, Name: d.NodeGroupName}
+		}
+		out = append(out, view)
 	}
 	return out
 }
@@ -693,6 +704,12 @@ func (s *Server) handleDeleteSecurityGroup(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := s.store.DeleteSecurityGroup(req.ID); err != nil {
+		// A binding written since the checks above.
+		var inUse *store.SecurityGroupInUseError
+		if errors.As(err, &inUse) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}

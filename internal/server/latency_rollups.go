@@ -255,7 +255,7 @@ func (s *Server) handleLatencySeries(w http.ResponseWriter, r *http.Request, p p
 		}
 	}
 	mon, ok := s.store.Monitor(monitorID)
-	if !ok || mon.ManagedBy != model.MonitorManagedLatency {
+	if !ok || store.MonitorOwnerOf(mon) != store.MonitorOwnerPathSet {
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "no latency probe targets that node"))
 		return
 	}

@@ -355,7 +355,7 @@ func (s *Server) beaconCurrentSources(target string, planned latencyPlan, monito
 	}
 	targets := monitorTargets{nodes: nodes}
 	for _, mon := range monitors {
-		if mon.ManagedBy != "" || !mon.Enabled || mon.Type != model.MonitorTypeBeacon || mon.TargetNode != target {
+		if !store.MonitorOwnerOf(mon).Authored() || !mon.Enabled || mon.Type != model.MonitorTypeBeacon || mon.TargetNode != target {
 			continue
 		}
 		for _, sourceID := range targets.monitorSources(mon) {

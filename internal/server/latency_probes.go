@@ -644,7 +644,7 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 	}
 	existing := map[string]model.Monitor{}
 	for _, mon := range s.store.Monitors() {
-		if mon.ManagedBy == model.MonitorManagedLatency {
+		if store.MonitorOwnerOf(mon) == store.MonitorOwnerPathSet {
 			existing[mon.ID] = mon
 		}
 	}

@@ -28,7 +28,7 @@ func TestLineMetaSyncRefusesAPlanThatLosesTheDownstreamNode(t *testing.T) {
 	}
 	srv := newLinemetaTestServer(t, st)
 	now := time.Date(2026, 9, 3, 11, 2, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	seedLinemetaNodes(t, srv)
 
 	out, err := srv.vpnCoreLinesSyncMetadata(lineUserTestPrincipal(), json.RawMessage(`{"node_id":"node-a"}`))
@@ -56,6 +56,7 @@ func TestLineMetaSyncRefusesAPlanThatLosesTheDownstreamNode(t *testing.T) {
 	// what triggers the sync; node-b has not posted yet, so the hub's downstream
 	// resolves to no owner and the plan comes out without downstream_node.
 	now = now.Add(3 * time.Hour)
+	serverClock(t, srv).set(now)
 	srv.linemetaSyncFP = nil
 	srv.singboxInvMu.Lock()
 	invA := srv.singboxInv["node-a"]

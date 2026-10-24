@@ -35,7 +35,7 @@ func newWitnessCipherFixture(t *testing.T) (witnessFixture, string) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PublicURL: witnessTestPublic})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PublicURL: witnessTestPublic})
 	if err != nil {
 		t.Fatal(err)
 	}

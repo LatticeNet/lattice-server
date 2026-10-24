@@ -249,7 +249,7 @@ func newBarkPresentationServer(t *testing.T, publicURL string) (*Server, http.Ha
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, PublicURL: publicURL, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, PublicURL: publicURL, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}

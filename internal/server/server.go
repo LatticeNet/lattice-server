@@ -167,6 +167,10 @@ type Options struct {
 	RenewalReminderInterval time.Duration
 	DisableRenewalScheduler bool
 	Logger                  *log.Logger
+	// Now replaces the clock (UTC time.Now) for tests. It is installed
+	// before any background loop starts, which reads it from then on; a
+	// test that assigned the clock after New would race those loops.
+	Now func() time.Time
 }
 
 type BuildInfo struct {
@@ -815,6 +819,9 @@ func New(opts Options) (*Server, error) {
 		tlsMonitorTargets:     defaultTLSMonitorTargets,
 		userLoginFail:         make(map[string]*loginFailBucket),
 		proxyDrift:            make(map[string]proxyDriftState),
+	}
+	if opts.Now != nil {
+		s.now = opts.Now
 	}
 	if s.reminderInterval <= 0 {
 		s.reminderInterval = time.Hour

@@ -30,7 +30,7 @@ func newAgentArtifactServer(t *testing.T) (*Server, http.Handler, *store.Store) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:                   st,
 		AdminPassword:           testAdminPass,
 		PublicURL:               artifactTestPublicURL,
@@ -587,7 +587,7 @@ func TestAgentArtifactListingSaysWhenItCannotServeWhatItHolds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}

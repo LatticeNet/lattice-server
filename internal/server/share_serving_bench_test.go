@@ -34,7 +34,7 @@ func benchDiskShareServer(b *testing.B, shares int) (*Server, string) {
 		b.Fatal(err)
 	}
 	b.Cleanup(func() { _ = st.Close() })
-	s, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	s, err := newClockedServer(b, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		b.Fatal(err)
 	}

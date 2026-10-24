@@ -63,7 +63,7 @@ func newTestServer(t *testing.T) (http.Handler, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,7 @@ func TestBootstrapAdminUsernameIsConfigurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminUsername: "root@example.com", AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminUsername: "root@example.com", AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,10 +101,10 @@ func TestBootstrapAdminUsernameIsOnlyUsedOnEmptyState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(Options{Store: st, AdminUsername: "first", AdminPassword: testAdminPass}); err != nil {
+	if _, err := newClockedServer(t, Options{Store: st, AdminUsername: "first", AdminPassword: testAdminPass}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(Options{Store: st, AdminUsername: "second", AdminPassword: "another passphrase"}); err != nil {
+	if _, err := newClockedServer(t, Options{Store: st, AdminUsername: "second", AdminPassword: "another passphrase"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := st.UserByUsername("first"); !ok {
@@ -120,7 +120,7 @@ func TestVersionEndpointExposesBuildInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:         st,
 		AdminPassword: testAdminPass,
 		Build: BuildInfo{
@@ -933,11 +933,11 @@ func TestSessionSurvivesServerRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv1, _ := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv1, _ := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	h1 := srv1.Handler()
 	cookies, _ := loginSession(t, h1)
 
-	srv2, _ := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv2, _ := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	h2 := srv2.Handler()
 	res := doJSON(t, h2, http.MethodGet, "/api/me", "", cookies, "")
 	defer res.Body.Close()

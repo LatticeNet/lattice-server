@@ -74,15 +74,15 @@ func newGuardRealityServerForTest(t *testing.T, clock *guardRealityTestClock) (*
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:                   st,
 		AdminPassword:           testAdminPass,
 		DisableRenewalScheduler: true,
+		Now:                     clock.Now,
 	})
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
-	srv.now = clock.Now
 	handler := srv.Handler()
 	cookies, csrf := loginSession(t, handler)
 	return srv, handler, st, cookies, csrf

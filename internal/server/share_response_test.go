@@ -17,11 +17,11 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
-func responseShareServer(t *testing.T, body string, userinfo *string) (*Server, *store.Store, string, *time.Time) {
+func responseShareServer(t *testing.T, body string, userinfo *string) (*Server, *store.Store, string, *testClock) {
 	t.Helper()
 	s, st := newShareTestServer(t)
 	now := time.Date(2026, 10, 2, 10, 15, 0, 0, time.UTC)
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	token := strings.Repeat("r", 32)
 	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true,
 		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "rec"}})
@@ -36,7 +36,7 @@ func responseShareServer(t *testing.T, body string, userinfo *string) (*Server, 
 		return renderedSubscription{Body: []byte(body), Userinfo: *userinfo, RevalidationVersion: subscriptionRevalidationVersion(snap),
 			SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
 	}
-	return s, st, "/sub/team/" + token, &now
+	return s, st, "/sub/team/" + token, serverClock(t, s)
 }
 
 func TestShareResponseCarriesLengthAndAValidatorAndAnswers304(t *testing.T) {
@@ -253,13 +253,13 @@ func TestShareFetchesAreSummarizedPerHour(t *testing.T) {
 
 	// The fetch that opens the next hour queues the closed one; the flush
 	// writes it, never the request path.
-	*now = now.Add(time.Hour)
+	now.advance(time.Hour)
 	fetch("Surge/5")
 	s.shareFetchAudits.Wait()
 	if got := len(countEvents(shareFetchSummaryReason)); got != 0 {
 		t.Fatalf("a closed hour was written on the request path")
 	}
-	s.flushShareFetchStats(*now, false)
+	s.flushShareFetchStats(now.now(), false)
 	summaries := countEvents(shareFetchSummaryReason)
 	if len(summaries) != 1 {
 		t.Fatalf("summaries = %d after the hour closed", len(summaries))
@@ -274,10 +274,10 @@ func TestShareFetchesAreSummarizedPerHour(t *testing.T) {
 
 	// An hour nobody fetched in again is closed by the periodic flush, and a
 	// shutdown writes the open hour as partial.
-	*now = now.Add(time.Hour)
-	s.flushShareFetchStats(*now, false)
+	now.advance(time.Hour)
+	s.flushShareFetchStats(now.now(), false)
 	fetch("Surge/5")
-	s.flushShareFetchStats(*now, true)
+	s.flushShareFetchStats(now.now(), true)
 	summaries = countEvents(shareFetchSummaryReason)
 	if len(summaries) != 3 {
 		t.Fatalf("summaries = %d, want the flushed hour and the partial one", len(summaries))

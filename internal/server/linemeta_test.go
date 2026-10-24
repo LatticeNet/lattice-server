@@ -17,7 +17,7 @@ import (
 
 func newLinemetaTestServer(t *testing.T, st *store.Store) *Server {
 	t.Helper()
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +513,7 @@ func TestRenderLineMetadataJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := newLinemetaTestServer(t, st)
-	srv.now = func() time.Time { return time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC) }
+	serverClock(t, srv).set(time.Date(2026, 7, 17, 4, 0, 0, 0, time.UTC))
 	seedLinemetaNodes(t, srv)
 
 	raw, err := srv.renderLineMetadataJSON("node-a")
@@ -908,7 +908,7 @@ func TestRenderLineMetadataChainIgnoresRealityPublicKeyOutbound(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := newLinemetaTestServer(t, st)
-	srv.now = func() time.Time { return time.Date(2026, 8, 27, 4, 0, 0, 0, time.UTC) }
+	serverClock(t, srv).set(time.Date(2026, 8, 27, 4, 0, 0, 0, time.UTC))
 	if err := srv.store.UpsertNode(model.Node{ID: "node-a", LatticeIdentityUUID: "node-uuid-a", Name: "Node A", PublicIP: "203.0.113.5"}); err != nil {
 		t.Fatal(err)
 	}
@@ -977,7 +977,7 @@ func TestRenderLineMetadataChainKeptForResolvedRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv := newLinemetaTestServer(t, st)
-	srv.now = func() time.Time { return time.Date(2026, 8, 27, 4, 0, 0, 0, time.UTC) }
+	serverClock(t, srv).set(time.Date(2026, 8, 27, 4, 0, 0, 0, time.UTC))
 	seedLinemetaNodes(t, srv)
 	raw, err := srv.renderLineMetadataJSON("node-a")
 	if err != nil {

@@ -303,7 +303,7 @@ func TestCollectorStripsControlCharactersAndClampsClocks(t *testing.T) {
 	traceNode(t, f.st, "node-a")
 	cookies, csrf := loginSession(t, f.handler)
 
-	ahead := clock.at.Add(time.Hour)
+	ahead := clock.now().Add(time.Hour)
 	status, err := json.Marshal(map[string]any{
 		"state":          "stream_failing",
 		"detail":         "dial\x00 tcp\t127.0.0.1:9090:\x1b[31m refused\x7f",
@@ -328,8 +328,8 @@ func TestCollectorStripsControlCharactersAndClampsClocks(t *testing.T) {
 	if c.Detail != "dial tcp127.0.0.1:9090:[31m refused" || c.ClashAPIAddr != "127.0.0.1:9090[0m" {
 		t.Fatalf("stripped detail %q, address %q", c.Detail, c.ClashAPIAddr)
 	}
-	if !c.Since.Equal(c.ReceivedAt) || !c.CountersSince.Equal(c.ReceivedAt) || !c.ReceivedAt.Equal(clock.at) {
-		t.Fatalf("clocks: since %s counters_since %s received %s, server now %s", c.Since, c.CountersSince, c.ReceivedAt, clock.at)
+	if !c.Since.Equal(c.ReceivedAt) || !c.CountersSince.Equal(c.ReceivedAt) || !c.ReceivedAt.Equal(clock.now()) {
+		t.Fatalf("clocks: since %s counters_since %s received %s, server now %s", c.Since, c.CountersSince, c.ReceivedAt, clock.now())
 	}
 }
 

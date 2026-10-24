@@ -137,7 +137,7 @@ func TestDecoyIsConfigurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass,
 		SubscriptionDecoy: subscriptionDecoyOptions{
 			Status: http.StatusForbidden, Body: "nope", ContentType: "text/plain",

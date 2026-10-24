@@ -378,7 +378,7 @@ func TestPathDegradedSurvivesARestartWithoutRealerting(t *testing.T) {
 	f.close()
 
 	g := openDegradedFixture(t, dir, nil)
-	g.clock.at = at
+	g.clock.set(at)
 	m := g.matrix()
 	if m.DegradedAt != nil {
 		t.Fatalf("degraded_at before the new server's first run = %v", m.DegradedAt)

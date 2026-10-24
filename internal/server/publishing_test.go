@@ -52,7 +52,7 @@ func TestPublishingScopesAreUnchangedPerOrigin(t *testing.T) {
 func TestShareProjectsOntoTheReservedMountOnAnyHost(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	mustUpsertShare(t, st, model.SubscriptionShare{
 		ID: "share_1", Slug: "cd-self", Token: strings.Repeat("a", 32), Enabled: true,
 		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "sub"},
@@ -85,7 +85,7 @@ func TestShareProjectsOntoTheReservedMountOnAnyHost(t *testing.T) {
 func TestDisabledAndExpiredSharesLeaveThePlane(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	past := now.Add(-time.Hour)
 	future := now.Add(time.Hour)
 	token := strings.Repeat("a", 32)
@@ -114,7 +114,7 @@ func TestDisabledAndExpiredSharesLeaveThePlane(t *testing.T) {
 func TestPublishingRecordsListFiltersByOriginScope(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 
 	mustUpsertShare(t, st, model.SubscriptionShare{
 		ID: "share_1", Slug: "cd-self", Token: strings.Repeat("a", 32), Enabled: true,
@@ -188,7 +188,7 @@ func TestPublishingRecordsListFiltersByOriginScope(t *testing.T) {
 func TestPublishingLongestPrefixStillWins(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 
 	for _, b := range []model.StorageBinding{
 		{ID: "bind_root", Kind: originStatic, Bucket: "root", Hostname: "site.example", Enabled: true},
@@ -229,7 +229,7 @@ func TestPublishingLongestPrefixStillWins(t *testing.T) {
 func TestBlankHostnameIsNotAWildcard(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 
 	if err := st.UpsertStorageBinding(model.StorageBinding{
 		ID: "bind_blank", Kind: originStatic, Bucket: "secret", Hostname: "", Enabled: true,

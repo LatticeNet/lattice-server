@@ -18,7 +18,7 @@ func userinfoShareServer(t *testing.T, userinfo string) (*Server, string) {
 	t.Helper()
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	token := strings.Repeat("a", 32)
 
 	mustUpsertShare(t, st, model.SubscriptionShare{

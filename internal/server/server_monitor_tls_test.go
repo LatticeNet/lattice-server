@@ -80,13 +80,15 @@ func (n *notifyRecorder) all() []string {
 // host the monitor names, with a clock the test drives.
 //
 // The background loops stay off. Every field below is installed after New()
-// returns, so a sweeper goroutine started inside New() would read s.now while
-// the test writes it and the race detector would (correctly) fail the test.
+// returns, so a sweeper goroutine started inside New() would read them while
+// the test writes them and the race detector would (correctly) fail the test.
 // These tests drive sweepTLSMonitorsOnce themselves and need no loop running.
-func newTLSMonitorServer(t *testing.T, addr *string, now *time.Time) (*Server, http.Handler, *notifyRecorder) {
+// The clock is the exception: the terminal reaper reads it, so it starts at
+// now and a test moves it through serverClock.
+func newTLSMonitorServer(t *testing.T, addr *string, now time.Time) (*Server, http.Handler, *notifyRecorder) {
 	t.Helper()
 	srv, handler, _ := newDNSServerWithOptions(t, Options{DisableRenewalScheduler: true})
-	srv.now = func() time.Time { return *now }
+	serverClock(t, srv).set(now)
 	srv.tlsMonitorTargets = func(ctx context.Context, host, port string) ([]string, error) {
 		if *addr == "" {
 			return nil, errors.New("no listener")
@@ -125,7 +127,7 @@ func createTLSMonitor(t *testing.T, handler http.Handler, cookies []*http.Cookie
 func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	addr := ""
-	srv, handler, rec := newTLSMonitorServer(t, &addr, &now)
+	srv, handler, rec := newTLSMonitorServer(t, &addr, now)
 	cookies, csrf := loginSession(t, handler)
 
 	addr = tlsTestListener(t, now.Add(60*24*time.Hour))
@@ -182,6 +184,7 @@ func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 	// The certificate is replaced by one inside the threshold: the watch fails.
 	// One failure is held; the second in a row sends monitor.down.
 	now = now.Add(2 * time.Hour)
+	serverClock(t, srv).set(now)
 	addr = tlsTestListener(t, now.Add(5*24*time.Hour))
 	if probed := sweepAndFlush(srv); probed != 1 {
 		t.Fatalf("second sweep probed = %d, want 1", probed)
@@ -204,6 +207,7 @@ func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 		t.Fatalf("a single failed probe must not page: %+v", sent)
 	}
 	now = now.Add(2 * time.Hour)
+	serverClock(t, srv).set(now)
 	if probed := sweepAndFlush(srv); probed != 1 {
 		t.Fatalf("third sweep probed = %d, want 1", probed)
 	}
@@ -217,6 +221,7 @@ func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 
 	// Back to a healthy certificate: the recovery notification fires.
 	now = now.Add(2 * time.Hour)
+	serverClock(t, srv).set(now)
 	addr = tlsTestListener(t, now.Add(90*24*time.Hour))
 	if probed := sweepAndFlush(srv); probed != 1 {
 		t.Fatalf("fourth sweep probed = %d, want 1", probed)
@@ -230,7 +235,7 @@ func TestTLSMonitorWatchesCertificateExpiry(t *testing.T) {
 func TestTLSMonitorSkipsUntilIntervalElapses(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	addr := ""
-	srv, handler, _ := newTLSMonitorServer(t, &addr, &now)
+	srv, handler, _ := newTLSMonitorServer(t, &addr, now)
 	cookies, csrf := loginSession(t, handler)
 	addr = tlsTestListener(t, now.Add(60*24*time.Hour))
 	mon := createTLSMonitor(t, handler, cookies, csrf,
@@ -240,6 +245,7 @@ func TestTLSMonitorSkipsUntilIntervalElapses(t *testing.T) {
 	}
 	srv.sweepTLSMonitorsOnce(context.Background())
 	now = now.Add(10 * time.Minute)
+	serverClock(t, srv).set(now)
 	if probed := srv.sweepTLSMonitorsOnce(context.Background()); probed != 0 {
 		t.Fatalf("probed = %d before the interval elapsed, want 0", probed)
 	}
@@ -251,7 +257,7 @@ func TestTLSMonitorSkipsUntilIntervalElapses(t *testing.T) {
 func TestTLSMonitorUnreachableTargetFails(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	addr := ""
-	srv, handler, rec := newTLSMonitorServer(t, &addr, &now)
+	srv, handler, rec := newTLSMonitorServer(t, &addr, now)
 	cookies, csrf := loginSession(t, handler)
 	// A listener that is closed before the probe runs: the handshake never
 	// completes, so there is no expiry to record.
@@ -276,6 +282,7 @@ func TestTLSMonitorUnreachableTargetFails(t *testing.T) {
 		t.Fatalf("a first failing probe is held: %+v", sent)
 	}
 	now = now.Add(tlsMonitorDefaultInterval)
+	serverClock(t, srv).set(now)
 	sweepAndFlush(srv)
 	sent := rec.all()
 	if len(sent) != 1 || !strings.HasPrefix(sent[0], "[monitor.down] Monitor down: cert on dns.test.invalid:8443") {
@@ -286,7 +293,7 @@ func TestTLSMonitorUnreachableTargetFails(t *testing.T) {
 func TestTLSMonitorCreateValidation(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	addr := ""
-	_, handler, _ := newTLSMonitorServer(t, &addr, &now)
+	_, handler, _ := newTLSMonitorServer(t, &addr, now)
 	cookies, csrf := loginSession(t, handler)
 	cases := map[string]string{
 		"assigned to nodes": `{"name":"c","type":"tls","target":"dns.test.invalid:8443","assign_all":true}`,
@@ -309,7 +316,7 @@ func TestTLSMonitorCreateValidation(t *testing.T) {
 func TestTLSMonitorIsDeletable(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	addr := ""
-	srv, handler, _ := newTLSMonitorServer(t, &addr, &now)
+	srv, handler, _ := newTLSMonitorServer(t, &addr, now)
 	cookies, csrf := loginSession(t, handler)
 	mon := createTLSMonitor(t, handler, cookies, csrf,
 		`{"name":"cert","type":"tls","target":"dns.test.invalid:8443"}`)

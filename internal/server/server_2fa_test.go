@@ -219,7 +219,7 @@ func TestRequireTOTPPolicyGatesInteractiveSessionsUntilEnrollment(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, RequireTOTP: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, RequireTOTP: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -306,7 +306,7 @@ func TestRequireTOTPPolicyDoesNotGateBearerTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, RequireTOTP: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, RequireTOTP: true})
 	if err != nil {
 		t.Fatal(err)
 	}

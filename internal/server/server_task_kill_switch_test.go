@@ -16,7 +16,7 @@ func newTaskExecutionDisabledTestServer(t *testing.T) (http.Handler, *store.Stor
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:                 st,
 		AdminPassword:         testAdminPass,
 		TaskExecutionDisabled: true,

@@ -103,7 +103,7 @@ func TestDDNSRunNowRewritesCommentButSweepDoesNot(t *testing.T) {
 	srv, handler, st, fake := newDDNSServerWithCloudflare(t)
 	cookies, csrf := loginSession(t, handler)
 	clock := time.Date(2026, 10, 8, 9, 30, 0, 0, time.UTC)
-	srv.now = func() time.Time { return clock }
+	serverClock(t, srv).set(clock)
 	if err := st.UpsertNode(model.Node{ID: "n1", Name: "tokyo-1", PublicIP: "203.0.113.40"}); err != nil {
 		t.Fatal(err)
 	}

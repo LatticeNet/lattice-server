@@ -175,7 +175,7 @@ func TestParseTrustedProxies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(Options{Store: st, AdminPassword: testAdminPass, TrustProxy: true, TrustedProxies: []string{"nope"}}); err == nil || !strings.Contains(err.Error(), "trusted proxy") {
+	if _, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, TrustProxy: true, TrustedProxies: []string{"nope"}}); err == nil || !strings.Contains(err.Error(), "trusted proxy") {
 		t.Fatalf("New must refuse a malformed trusted proxy, got %v", err)
 	}
 }
@@ -189,7 +189,7 @@ func TestClientIPSpoofedHeadersDoNotWidenSubLimiter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TrustProxy: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, TrustProxy: true})
 	if err != nil {
 		t.Fatal(err)
 	}

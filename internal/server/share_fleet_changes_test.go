@@ -13,11 +13,11 @@ import (
 
 // fleetLinkServer is a plugin link whose provider returns *content (or
 // fails while *fail is set) and whose render echoes the snapshot.
-func fleetLinkServer(t *testing.T, content *string, fail *bool) (*Server, string, *time.Time, *atomic.Int64, *atomic.Int64) {
+func fleetLinkServer(t *testing.T, content *string, fail *bool) (*Server, string, *testClock, *atomic.Int64, *atomic.Int64) {
 	t.Helper()
 	s, _, path := flightShareServer(t)
 	now := s.now()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	var renders, fetches atomic.Int64
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
 		fetches.Add(1)
@@ -32,7 +32,7 @@ func fleetLinkServer(t *testing.T, content *string, fail *bool) (*Server, string
 		return renderedSubscription{Body: []byte("render of " + snap.Raw), Stale: snap.Stale, RevalidationVersion: subscriptionRevalidationVersion(snap),
 			SourceEpoch: epoch, FetchedAt: snap.FetchedAt}, nil
 	}
-	return s, path, &now, &renders, &fetches
+	return s, path, serverClock(t, s), &renders, &fetches
 }
 
 func fleetFetch(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
@@ -64,7 +64,7 @@ func TestABurstOfVPNCoreChangesRefreshesASourceOncePerInterval(t *testing.T) {
 	}
 
 	for i := 0; i < 20; i++ {
-		*now = now.Add(time.Second)
+		now.advance(time.Second)
 		content = "nodes after the whole burst"
 		s.triggerVPNCoreMutation()
 		if got := fleetFetch(t, s, path).Body.String(); got != "render of nodes after the first write" {
@@ -75,7 +75,7 @@ func TestABurstOfVPNCoreChangesRefreshesASourceOncePerInterval(t *testing.T) {
 		t.Fatalf("provider fetches = %d during the burst, want none past the first", fetches.Load())
 	}
 
-	*now = now.Add(vpnCoreLinkChangeInterval)
+	now.advance(vpnCoreLinkChangeInterval)
 	if got := fleetFetch(t, s, path).Body.String(); got != "render of nodes after the whole burst" || fetches.Load() != 2 {
 		t.Fatalf("the held writes did not land after the interval: %q after %d provider fetches", got, fetches.Load())
 	}
@@ -101,7 +101,7 @@ func TestAFailedRevalidationAfterAVPNCoreChangeKeepsTheSnapshotFresh(t *testing.
 			rec.Body.String(), rec.Header().Get("X-Lattice-Subscription-Stale"), fetches.Load(), renders.Load())
 	}
 	for i := 0; i < 3; i++ {
-		*now = now.Add(subscriptionStaleRetryInterval + time.Second)
+		now.advance(subscriptionStaleRetryInterval + time.Second)
 		fleetFetch(t, s, path)
 	}
 	if fetches.Load() != 1 {
@@ -122,7 +122,7 @@ func TestAFailedRevalidationAfterAVPNCoreChangeKeepsTheSnapshotFresh(t *testing.
 	// The next change tries again, and the provider being back serves it.
 	fail = false
 	content = "nodes once the provider is back"
-	*now = now.Add(vpnCoreLinkChangeInterval)
+	now.advance(vpnCoreLinkChangeInterval)
 	s.triggerVPNCoreMutation()
 	if got := fleetFetch(t, s, path).Body.String(); got != "render of nodes once the provider is back" || fetches.Load() != 2 {
 		t.Fatalf("the next change was not served: %q after %d fetches", got, fetches.Load())
@@ -130,7 +130,7 @@ func TestAFailedRevalidationAfterAVPNCoreChangeKeepsTheSnapshotFresh(t *testing.
 
 	// A snapshot past its refresh interval still turns stale on failure.
 	fail = true
-	*now = now.Add(subscriptionRefreshInterval + time.Minute)
+	now.advance(subscriptionRefreshInterval + time.Minute)
 	if rec := fleetFetch(t, s, path); rec.Header().Get("X-Lattice-Subscription-Stale") != "true" {
 		t.Fatalf("an aged snapshot's failed refresh was not marked stale")
 	}

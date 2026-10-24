@@ -109,7 +109,7 @@ func newBenchFleet(b *testing.B) *benchFleet {
 	if err := st.EnableRuntimeBoltHotStore(hotPath); err != nil {
 		b.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(b, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		b.Fatal(err)
 	}

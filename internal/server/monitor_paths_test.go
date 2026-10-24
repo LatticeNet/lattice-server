@@ -32,7 +32,7 @@ func newPathsServerAt(t testing.TB, dir string) (*Server, http.Handler, *store.S
 	if err := st.EnableRuntimeBoltHotStore(filepath.Join(dir, "state-hot.db")); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,7 +288,7 @@ func pathCellTo(t *testing.T, m model.PathMatrix, source, targetNode string) mod
 func TestPathMatrixGapsAndUnknownReasons(t *testing.T) {
 	srv, _, st := newPathsServer(t)
 	now := time.Now().UTC()
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	upsertNodes(t, st,
 		model.Node{ID: "node-sh", Name: "sh", Online: true, Geo: &model.NodeGeo{Country: "CN"}},
 		model.Node{ID: "node-off", Name: "off", Online: false, Geo: &model.NodeGeo{Country: "CN"}},
@@ -364,7 +364,7 @@ func TestPathMatrixGapsAndUnknownReasons(t *testing.T) {
 	}
 	// A stale latest record reads as no data once three intervals pass.
 	later := now.Add(4 * time.Minute)
-	srv.now = func() time.Time { return later }
+	serverClock(t, srv).set(later)
 	m, err = srv.pathMatrixFor(principal{Principal: adminPrincipalForTest()}, model.PathWindowDay, later)
 	if err != nil {
 		t.Fatal(err)

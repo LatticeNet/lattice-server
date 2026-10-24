@@ -76,7 +76,7 @@ func newShareTestServer(t *testing.T) (*Server, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestSubscriptionShareAuditNeverCarriesTheRawToken(t *testing.T) {
 func TestSubscriptionShareStaleCacheHitSetsHeaderAndSafeAudit(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	token := strings.Repeat("a", 32)
 	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true, DefaultFormat: "plain",
 		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}})
@@ -293,7 +293,7 @@ func TestSubscriptionShareStaleCacheHitSetsHeaderAndSafeAudit(t *testing.T) {
 func TestSubscriptionShareStaleCacheHitRevalidatesAndClearsHeaderOnRecovery(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	token := strings.Repeat("a", 32)
 	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true, DefaultFormat: "plain",
 		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}})
@@ -357,7 +357,7 @@ func TestSubscriptionShareExpiredCacheRevalidationRefreshesUserinfo(t *testing.T
 func TestSubscriptionSharePropagatesStaleAndRecoveryAcrossSiblingShares(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	tokenA, tokenB := strings.Repeat("a", 32), strings.Repeat("b", 32)
 	for _, share := range []model.SubscriptionShare{
 		{ID: "s1", Slug: "one", Token: tokenA, Enabled: true, DefaultFormat: "plain", Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}},
@@ -412,6 +412,7 @@ func TestSubscriptionSharePropagatesStaleAndRecoveryAcrossSiblingShares(t *testi
 		return model.SubscriptionSnapshot{Raw: "last-good", Userinfo: "upload=2"}, nil
 	}
 	now = now.Add(subscriptionStaleRetryInterval + time.Second)
+	serverClock(t, s).set(now)
 	recoveredA := httptest.NewRecorder()
 	s.handleSubscriptionShare(recoveredA, shareRequest("/sub/one/"+tokenA+"?format=plain", "Surge/2000"))
 	recoveredB := httptest.NewRecorder()
@@ -860,7 +861,7 @@ func TestSubscriptionFailureDiagnosticsDoNotReachPersistentJSONOrBolt(t *testing
 				}
 			}
 			var runtimeLogs bytes.Buffer
-			s, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, Logger: log.New(&runtimeLogs, "", 0)})
+			s, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, Logger: log.New(&runtimeLogs, "", 0)})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -947,7 +948,7 @@ func stripRequestID(body string) string {
 func TestSubscriptionShareExplicitTargetParameter(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	token := strings.Repeat("a", 32)
 	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true, DefaultFormat: "plain",
 		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}})

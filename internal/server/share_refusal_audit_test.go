@@ -24,16 +24,16 @@ func shareDenyEvents(st *store.Store) []model.AuditEvent {
 
 // refusalServer is a share server on a frozen clock with one real share, so
 // the flood below mixes refusals before and after a token resolves.
-func refusalServer(t *testing.T) (*Server, *store.Store, *time.Time) {
+func refusalServer(t *testing.T) (*Server, *store.Store, *testClock) {
 	t.Helper()
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	mustUpsertShare(t, st, model.SubscriptionShare{
 		ID: "share_team", Slug: "team", Token: strings.Repeat("a", 32), Enabled: true,
 		Source: model.ShareSource{Kind: model.ShareSourceCoreProxyUser, ProxyUserID: "nobody"},
 	})
-	return s, st, &now
+	return s, st, serverClock(t, s)
 }
 
 // floodShapes are the refusals an unauthenticated caller can send without a
@@ -82,12 +82,12 @@ func TestShareRefusalFloodFromOneSourceWritesOneEventAndASummary(t *testing.T) {
 
 	// Nothing more is written while the window is open, and the flush after
 	// it closes reports what was folded in one record.
-	s.flushShareRefusalAudit(*now)
+	s.flushShareRefusalAudit(now.now())
 	if got := len(shareDenyEvents(st)) - before; got != 1 {
 		t.Fatalf("a flush inside the window wrote a summary: %d events", got)
 	}
-	*now = now.Add(shareRefusalAuditWindow)
-	s.flushShareRefusalAudit(*now)
+	now.advance(shareRefusalAuditWindow)
+	s.flushShareRefusalAudit(now.now())
 	all := shareDenyEvents(st)
 	var summary *model.AuditEvent
 	for i := range all {
@@ -101,7 +101,7 @@ func TestShareRefusalFloodFromOneSourceWritesOneEventAndASummary(t *testing.T) {
 	if summary.Metadata["suppressed_repeats"] != fmt.Sprint(flood-1) || summary.Metadata["sources"] != "1" {
 		t.Fatalf("summary does not count the folded refusals: %+v", summary.Metadata)
 	}
-	s.flushShareRefusalAudit(now.Add(time.Hour))
+	s.flushShareRefusalAudit(now.now().Add(time.Hour))
 	if got := len(shareDenyEvents(st)) - before; got != 2 {
 		t.Fatalf("a flush with nothing to report wrote an event: %d events", got)
 	}
@@ -123,8 +123,8 @@ func TestShareRefusalFloodFromRotatingSourcesIsCapped(t *testing.T) {
 	if written > shareRefusalAuditBurst {
 		t.Fatalf("%d rotating sources wrote %d audit events, want at most the global burst %d", flood, written, shareRefusalAuditBurst)
 	}
-	*now = now.Add(shareRefusalAuditWindow)
-	s.flushShareRefusalAudit(*now)
+	now.advance(shareRefusalAuditWindow)
+	s.flushShareRefusalAudit(now.now())
 	var dropped string
 	for _, ev := range shareDenyEvents(st) {
 		if ev.Reason == shareRefusalSummaryReason {
@@ -137,7 +137,7 @@ func TestShareRefusalFloodFromRotatingSourcesIsCapped(t *testing.T) {
 
 	// Hopping inside one IPv6 /64 is one source.
 	before = len(shareDenyEvents(st))
-	*now = now.Add(time.Hour)
+	now.advance(time.Hour)
 	for i := 0; i < 200; i++ {
 		req := httptest.NewRequest(http.MethodGet, "/sub/team/"+strings.Repeat("z", 32), nil)
 		req.RemoteAddr = fmt.Sprintf("[2001:db8:1:2::%x]:5000", i+1)
@@ -262,8 +262,8 @@ func TestShareRefusalAfterAValidTokenSurvivesAProbeFlood(t *testing.T) {
 		handler.ServeHTTP(httptest.NewRecorder(), again)
 	}
 	s.shareRefusalAudits.Wait()
-	*now = now.Add(shareRefusalAuditWindow)
-	s.flushShareRefusalAudit(*now)
+	now.advance(shareRefusalAuditWindow)
+	s.flushShareRefusalAudit(now.now())
 	var summary map[string]string
 	for _, ev := range shareDenyEvents(st) {
 		if ev.Reason == shareRefusalSummaryReason {

@@ -20,7 +20,7 @@ func newWaitingTestServer(t *testing.T) (*Server, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, Logger: log.New(io.Discard, "", 0)})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, Logger: log.New(io.Discard, "", 0)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestApprovalWaitTaskExecutionDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TaskExecutionDisabled: true, Logger: log.New(io.Discard, "", 0)})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, TaskExecutionDisabled: true, Logger: log.New(io.Discard, "", 0)})
 	if err != nil {
 		t.Fatal(err)
 	}

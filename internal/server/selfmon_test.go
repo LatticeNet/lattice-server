@@ -30,7 +30,10 @@ type selfMonFixture struct {
 	st      *store.Store
 	db      *metricsdb.DB
 	dataDir string
-	now     time.Time
+	// now is the test's own reading of clock, which the server and the
+	// metrics database read; advance moves both.
+	now   time.Time
+	clock *testClock
 }
 
 func newSelfMonFixture(t *testing.T) *selfMonFixture {
@@ -45,18 +48,20 @@ func newSelfMonFixture(t *testing.T) *selfMonFixture {
 	if err := os.WriteFile(stateFile, make([]byte, 4096), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	f := &selfMonFixture{st: st, dataDir: dir, now: time.Date(2026, 10, 4, 12, 0, 30, 0, time.UTC)}
-	db, err := metricsdb.Open(filepath.Join(dir, "metrics.db"), metricsdb.Options{Now: func() time.Time { return f.now }})
+	start := time.Date(2026, 10, 4, 12, 0, 30, 0, time.UTC)
+	f := &selfMonFixture{st: st, dataDir: dir, now: start, clock: &testClock{at: start}}
+	db, err := metricsdb.Open(filepath.Join(dir, "metrics.db"), metricsdb.Options{Now: f.clock.now})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
 	f.db = db
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:                   st,
 		AdminPassword:           testAdminPass,
 		DisableRenewalScheduler: true,
 		Logger:                  log.New(io.Discard, "", 0),
+		Now:                     f.clock.now,
 		SelfMonitor: SelfMonitorOptions{
 			DB:      db,
 			DataDir: dir,
@@ -66,15 +71,15 @@ func newSelfMonFixture(t *testing.T) *selfMonFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv.now = func() time.Time { return f.now }
-	srv.selfmon.now = srv.now
-	srv.selfmon.minute = f.now.Truncate(time.Minute)
 	f.srv = srv
 	f.handler = srv.Handler()
 	return f
 }
 
-func (f *selfMonFixture) advance(d time.Duration) { f.now = f.now.Add(d) }
+func (f *selfMonFixture) advance(d time.Duration) {
+	f.now = f.now.Add(d)
+	f.clock.set(f.now)
+}
 
 func TestSelfMonitorRecordsBeatsAsNodeHistory(t *testing.T) {
 	f := newSelfMonFixture(t)
@@ -606,7 +611,7 @@ func TestSelfMonitorUnavailableAnswersWithItsCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	const reason = "metrics.db could not be opened, so this server keeps no history until it restarts with a usable file: boom"
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:                   st,
 		AdminPassword:           testAdminPass,
 		DisableRenewalScheduler: true,

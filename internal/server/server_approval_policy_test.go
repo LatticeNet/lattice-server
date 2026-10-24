@@ -58,7 +58,7 @@ func TestNewServerIgnoresInvalidApprovalAutoRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:             st,
 		AdminPassword:     testAdminPass,
 		ApprovalAutoRules: `[{"plugin":"nft"}]`,
@@ -112,7 +112,7 @@ func newTestServerWithApprovalRules(t *testing.T, rulesJSON string) (*Server, *s
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:             st,
 		AdminPassword:     testAdminPass,
 		ApprovalAutoRules: rulesJSON,
@@ -317,7 +317,7 @@ func TestApprovalAutoApproveLeavesPendingOnDecisionFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:                 st,
 		AdminPassword:         testAdminPass,
 		ApprovalAutoRules:     `[{"name":"q","writer":"lattice-server","plugin":"nft","queue":true}]`,

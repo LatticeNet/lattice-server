@@ -119,7 +119,7 @@ func newPluginAssetTestServerWithUI(t *testing.T, ui map[string][]byte) (*Server
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		PluginDir: pluginRoot, PluginBundleCacheDir: t.TempDir(),
 		PluginRuntimeDir: t.TempDir(),

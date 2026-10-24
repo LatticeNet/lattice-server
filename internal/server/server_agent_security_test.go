@@ -167,14 +167,14 @@ func TestAgentBearerAuthDoesNotRewriteTokenTouchInsideDurableWindow(t *testing.T
 	if err := st.UpsertNode(model.Node{ID: "node-a", Name: "Node A", TokenHash: hash}); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	handler := srv.Handler()
 	base := time.Unix(1_700_000_000, 0).UTC()
 
-	srv.now = func() time.Time { return base }
+	serverClock(t, srv).set(base)
 	first := httptest.NewRequest(http.MethodGet, "/api/agent/config?node_id=node-a", nil)
 	first.Header.Set("Authorization", "Bearer "+token)
 	if rec := serveReq(handler, first); rec.Code != http.StatusOK {
@@ -185,7 +185,7 @@ func TestAgentBearerAuthDoesNotRewriteTokenTouchInsideDurableWindow(t *testing.T
 		t.Fatal(err)
 	}
 
-	srv.now = func() time.Time { return base.Add(10 * time.Minute) }
+	serverClock(t, srv).set(base.Add(10 * time.Minute))
 	second := httptest.NewRequest(http.MethodGet, "/api/agent/config?node_id=node-a", nil)
 	second.Header.Set("Authorization", "Bearer "+token)
 	if rec := serveReq(handler, second); rec.Code != http.StatusOK {
@@ -199,7 +199,7 @@ func TestAgentBearerAuthDoesNotRewriteTokenTouchInsideDurableWindow(t *testing.T
 		t.Fatalf("agent token touch rewrote state inside durable window")
 	}
 
-	srv.now = func() time.Time { return base.Add(16 * time.Minute) }
+	serverClock(t, srv).set(base.Add(16 * time.Minute))
 	third := httptest.NewRequest(http.MethodGet, "/api/agent/config?node_id=node-a", nil)
 	third.Header.Set("Authorization", "Bearer "+token)
 	if rec := serveReq(handler, third); rec.Code != http.StatusOK {
@@ -321,7 +321,7 @@ func TestAgentSourceAllowlistHonorsTrustedProxyHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TrustProxy: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, TrustProxy: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -17,7 +17,7 @@ func TestNewRefusesPluginUIDsWithoutARuntimeDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		PluginUIDs: &plugin.PluginUIDRange{Base: 300000, Size: 8},
 	})

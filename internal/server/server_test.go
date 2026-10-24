@@ -16,7 +16,7 @@ func TestLoginAndCSRFProtectedEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: "correct horse battery staple"})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: "correct horse battery staple"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestStaticHandlerCacheHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:         st,
 		AdminPassword: "correct horse battery staple",
 		WebFS: fstest.MapFS{

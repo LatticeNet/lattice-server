@@ -88,7 +88,14 @@ func (src CoreDNSBinarySource) Normalize() (CoreDNSBinarySource, error) {
 
 type ApprovalPlanOptions struct {
 	CoreDNSBinary CoreDNSBinarySource
+	// NetGuardOwnsFirewall renders a plan for a node NetGuard manages: it
+	// carries no lattice_guard candidate, and its apply script installs
+	// CoreDNS only and never touches the table (design 32 D7). NetGuard
+	// stays the one writer of lattice_guard on such a node.
+	NetGuardOwnsFirewall bool
 }
+
+const netGuardFirewallHeading = "## lattice_guard"
 
 type ZoneFile struct {
 	Path    string
@@ -226,15 +233,18 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 	}
 	var b strings.Builder
 	b.WriteString("# Lattice Self-host DNS plan\n\n")
-	fmt.Fprintf(&b, "deployment_id: %s\n", dep.ID)
-	fmt.Fprintf(&b, "name: %s\n", dep.Name)
-	fmt.Fprintf(&b, "node_id: %s\n", dep.NodeID)
+	fmt.Fprintf(&b, "deployment_id: %s\n", planField(dep.ID))
+	fmt.Fprintf(&b, "name: %s\n", planField(dep.Name))
+	fmt.Fprintf(&b, "node_id: %s\n", planField(dep.NodeID))
 	if nodeName != "" {
-		fmt.Fprintf(&b, "node_name: %s\n", nodeName)
+		fmt.Fprintf(&b, "node_name: %s\n", planField(nodeName))
 	}
 	fmt.Fprintf(&b, "engine: %s\n", dep.Engine)
 	fmt.Fprintf(&b, "exposure: %s\n", dep.Exposure)
 	fmt.Fprintf(&b, "listen: udp=%t tcp=%t port=%d\n", dep.EnableUDP, dep.EnableTCP, dep.ListenPort)
+	if dep.Disabled {
+		b.WriteString("disabled: true\n")
+	}
 	if dep.Hostname != "" {
 		fmt.Fprintf(&b, "hostname: %s\n", dep.Hostname)
 		fmt.Fprintf(&b, "publish: ipv4=%t ipv6=%t ttl=%d credential=%t\n", dep.PublishIPv4, dep.PublishIPv6, dep.RecordTTL, dep.CFAPIToken != "" || dep.DDNSProfileID != "")
@@ -243,7 +253,7 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 	}
 	b.WriteString("\n## Firewall delta\n")
 	for _, line := range firewallSummary {
-		fmt.Fprintf(&b, "- %s\n", line)
+		fmt.Fprintf(&b, "- %s\n", planField(line))
 	}
 	if binary.Enabled() {
 		b.WriteString("\n## CoreDNS binary\n")
@@ -270,13 +280,21 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 		}
 		b.WriteString("```\n")
 	}
-	b.WriteString("\n## nftables lattice_guard candidate\n")
-	b.WriteString("```nft\n")
-	b.WriteString(nftRuleset)
-	if !strings.HasSuffix(nftRuleset, "\n") {
-		b.WriteByte('\n')
+	if opts.NetGuardOwnsFirewall {
+		if strings.TrimSpace(nftRuleset) != "" {
+			return "", errors.New("a plan for a node NetGuard manages carries no lattice_guard candidate")
+		}
+		b.WriteString("\n" + netGuardFirewallHeading + "\n")
+		b.WriteString("NetGuard manages this table on the node. This plan does not change it.\n")
+	} else {
+		b.WriteString("\n## nftables lattice_guard candidate\n")
+		b.WriteString("```nft\n")
+		b.WriteString(nftRuleset)
+		if !strings.HasSuffix(nftRuleset, "\n") {
+			b.WriteByte('\n')
+		}
+		b.WriteString("```\n")
 	}
-	b.WriteString("```\n")
 	if dep.Hostname != "" {
 		b.WriteString("\n## Cloudflare action\n")
 		fmt.Fprintf(&b, "- publish %s A=%t AAAA=%t via server-side DDNS/Cloudflare credential; token is not included in this plan\n", dep.Hostname, dep.PublishIPv4, dep.PublishIPv6)
@@ -292,9 +310,14 @@ func ParseApprovalPlan(plan string) (ApplyArtifacts, error) {
 	if err != nil {
 		return ApplyArtifacts{}, err
 	}
-	nft, err := fencedSection(plan, "## nftables lattice_guard candidate", "nft")
+	// A plan for a node NetGuard manages carries no candidate, and its apply
+	// leaves lattice_guard alone; any other plan must carry one.
+	nft, hasNFT, err := optionalFencedSection(plan, "## nftables lattice_guard candidate", "nft")
 	if err != nil {
 		return ApplyArtifacts{}, err
+	}
+	if !hasNFT && !strings.Contains(plan, "\n"+netGuardFirewallHeading+"\n") {
+		return ApplyArtifacts{}, errors.New(`missing section "## nftables lattice_guard candidate"`)
 	}
 	zones, err := zoneSections(plan)
 	if err != nil {
@@ -315,28 +338,42 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Without a candidate the plan is for a node NetGuard manages: the script
+	// installs CoreDNS and rolls back its config only, and never reads or
+	// writes lattice_guard.
+	firewall := artifacts.NFTRuleset != ""
+	rollbackWhat := "config"
+	if firewall {
+		rollbackWhat = "config and firewall"
+	}
 	var b strings.Builder
 	b.WriteString("set -e\n")
 	b.WriteString("umask 077\n")
 	b.WriteString("SELF_DNS_DIR=/etc/lattice/selfdns\n")
 	b.WriteString("ZONE_DIR=/etc/lattice/selfdns/zones\n")
 	b.WriteString("CORE_CANDIDATE=/etc/lattice/selfdns/Corefile.new\n")
-	b.WriteString("NFT_CANDIDATE=/etc/lattice/guard.nft.new\n")
-	b.WriteString("NFT_ROLLBACK=/etc/lattice/guard.rollback.nft\n")
+	if firewall {
+		b.WriteString("NFT_CANDIDATE=/etc/lattice/guard.nft.new\n")
+		b.WriteString("NFT_ROLLBACK=/etc/lattice/guard.rollback.nft\n")
+	}
 	b.WriteString("CONFIG_BACKUP=/etc/lattice/selfdns.rollback.$$\n")
 	b.WriteString("WATCHDOG=\n")
 	b.WriteString("WATCHDOG_FIRED=/tmp/lattice-selfdns-watchdog.$$\n")
 	b.WriteString("UNIT=/etc/systemd/system/lattice-selfdns.service\n")
 	writeCoreDNSBootstrap(&b, artifacts.CoreDNSBinary)
-	b.WriteString("command -v nft >/dev/null || { echo 'lattice selfdns: nft binary not found in PATH' >&2; exit 1; }\n")
+	if firewall {
+		b.WriteString("command -v nft >/dev/null || { echo 'lattice selfdns: nft binary not found in PATH' >&2; exit 1; }\n")
+	}
 	b.WriteString("command -v systemctl >/dev/null || { echo 'lattice selfdns: systemd is required for this apply slice' >&2; exit 1; }\n")
 	b.WriteString("mkdir -p \"$SELF_DNS_DIR\" \"$ZONE_DIR\" /etc/lattice\n")
 	b.WriteString("rm -rf \"$CONFIG_BACKUP\"\n")
 	b.WriteString("if [ -d \"$SELF_DNS_DIR\" ]; then cp -a \"$SELF_DNS_DIR\" \"$CONFIG_BACKUP\"; else mkdir -p \"$CONFIG_BACKUP\"; fi\n")
 	b.WriteString("rollback() {\n")
 	b.WriteString("  set +e\n")
-	b.WriteString("  echo 'lattice selfdns: rolling back config and firewall' >&2\n")
-	b.WriteString("  nft -f \"$NFT_ROLLBACK\" 2>/dev/null || true\n")
+	b.WriteString("  echo 'lattice selfdns: rolling back " + rollbackWhat + "' >&2\n")
+	if firewall {
+		b.WriteString("  nft -f \"$NFT_ROLLBACK\" 2>/dev/null || true\n")
+	}
 	b.WriteString("  if [ -d \"$CONFIG_BACKUP\" ]; then rm -rf \"$SELF_DNS_DIR\"; mv \"$CONFIG_BACKUP\" \"$SELF_DNS_DIR\"; fi\n")
 	b.WriteString("  systemctl restart lattice-selfdns.service 2>/dev/null || true\n")
 	b.WriteString("}\n")
@@ -349,7 +386,11 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	b.WriteString("}\n")
 	b.WriteString("start_watchdog() {\n")
 	b.WriteString("  if command -v setsid >/dev/null 2>&1; then\n")
-	b.WriteString("    setsid sh -c 'sleep 60; echo \"lattice selfdns: watchdog rollback fired\" >&2; touch \"$1\" 2>/dev/null || true; echo \"lattice selfdns: rolling back config and firewall\" >&2; nft -f \"$2\" 2>/dev/null || true; if [ -d \"$3\" ]; then rm -rf \"$4\"; mv \"$3\" \"$4\"; fi; systemctl restart lattice-selfdns.service 2>/dev/null || true' sh \"$WATCHDOG_FIRED\" \"$NFT_ROLLBACK\" \"$CONFIG_BACKUP\" \"$SELF_DNS_DIR\" &\n")
+	if firewall {
+		b.WriteString("    setsid sh -c 'sleep 60; echo \"lattice selfdns: watchdog rollback fired\" >&2; touch \"$1\" 2>/dev/null || true; echo \"lattice selfdns: rolling back config and firewall\" >&2; nft -f \"$2\" 2>/dev/null || true; if [ -d \"$3\" ]; then rm -rf \"$4\"; mv \"$3\" \"$4\"; fi; systemctl restart lattice-selfdns.service 2>/dev/null || true' sh \"$WATCHDOG_FIRED\" \"$NFT_ROLLBACK\" \"$CONFIG_BACKUP\" \"$SELF_DNS_DIR\" &\n")
+	} else {
+		b.WriteString("    setsid sh -c 'sleep 60; echo \"lattice selfdns: watchdog rollback fired\" >&2; touch \"$1\" 2>/dev/null || true; echo \"lattice selfdns: rolling back config\" >&2; if [ -d \"$2\" ]; then rm -rf \"$3\"; mv \"$2\" \"$3\"; fi; systemctl restart lattice-selfdns.service 2>/dev/null || true' sh \"$WATCHDOG_FIRED\" \"$CONFIG_BACKUP\" \"$SELF_DNS_DIR\" &\n")
+	}
 	b.WriteString("  else\n")
 	b.WriteString("    ( sleep 60; echo 'lattice selfdns: watchdog rollback fired' >&2; touch \"$WATCHDOG_FIRED\" 2>/dev/null || true; rollback ) &\n")
 	b.WriteString("  fi\n")
@@ -369,14 +410,18 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	b.WriteString(heredocWrite(CorefilePath+".new", "LATTICE_SELF_DNS_CORE_EOF", artifacts.Corefile))
 	b.WriteString("mv \"$CORE_CANDIDATE\" " + shellQuote(CorefilePath) + "\n")
 	b.WriteString("\"$COREDNS_BIN\" -conf " + shellQuote(CorefilePath) + " -plugins >/dev/null\n")
-	b.WriteString(heredocWrite(NFTGuardPath+".new", "LATTICE_SELF_DNS_NFT_EOF", artifacts.NFTRuleset))
-	b.WriteString("nft -c -f \"$NFT_CANDIDATE\"\n")
-	// One table only: a `flush ruleset` snapshot would take Docker's tables,
-	// SSH Guard's lattice_knock and every other tenant with it on rollback.
-	b.WriteString("{ echo 'add table inet lattice_guard'; echo 'delete table inet lattice_guard'; nft list table inet lattice_guard 2>/dev/null || true; } > \"$NFT_ROLLBACK\"\n")
-	b.WriteString("start_watchdog\n")
-	b.WriteString("nft -f \"$NFT_CANDIDATE\"\n")
-	b.WriteString("mv \"$NFT_CANDIDATE\" " + shellQuote(NFTGuardPath) + "\n")
+	if firewall {
+		b.WriteString(heredocWrite(NFTGuardPath+".new", "LATTICE_SELF_DNS_NFT_EOF", artifacts.NFTRuleset))
+		b.WriteString("nft -c -f \"$NFT_CANDIDATE\"\n")
+		// One table only: a `flush ruleset` snapshot would take Docker's tables,
+		// SSH Guard's lattice_knock and every other tenant with it on rollback.
+		b.WriteString("{ echo 'add table inet lattice_guard'; echo 'delete table inet lattice_guard'; nft list table inet lattice_guard 2>/dev/null || true; } > \"$NFT_ROLLBACK\"\n")
+		b.WriteString("start_watchdog\n")
+		b.WriteString("nft -f \"$NFT_CANDIDATE\"\n")
+		b.WriteString("mv \"$NFT_CANDIDATE\" " + shellQuote(NFTGuardPath) + "\n")
+	} else {
+		b.WriteString("start_watchdog\n")
+	}
 	serviceExec := "/usr/bin/env coredns"
 	if artifacts.CoreDNSBinary != nil && artifacts.CoreDNSBinary.Enabled() {
 		serviceExec = CoreDNSPath
@@ -447,12 +492,15 @@ func renderStaticZoneFile(dep model.DNSDeployment, zone model.DNSZone, index int
 	return ZoneFile{Path: filePath, Content: b.String()}, nil
 }
 
+// fencedSection returns the fenced body under heading. The heading matches
+// only as a whole line, the way the renderer writes it, so header text that
+// merely contains it cannot stand in for the section.
 func fencedSection(plan, heading, language string) (string, error) {
-	start := strings.Index(plan, heading)
+	start := strings.Index(plan, "\n"+heading+"\n")
 	if start < 0 {
 		return "", fmt.Errorf("missing section %q", heading)
 	}
-	rest := plan[start+len(heading):]
+	rest := plan[start+1+len(heading):]
 	fence := "```" + language + "\n"
 	fenceStart := strings.Index(rest, fence)
 	if fenceStart < 0 {
@@ -474,11 +522,11 @@ func zoneSections(plan string) ([]ZoneFile, error) {
 	zones := []ZoneFile{}
 	rest := plan
 	for {
-		idx := strings.Index(rest, "## Zone file: ")
+		idx := strings.Index(rest, "\n## Zone file: ")
 		if idx < 0 {
 			break
 		}
-		rest = rest[idx+len("## Zone file: "):]
+		rest = rest[idx+len("\n## Zone file: "):]
 		lineEnd := strings.IndexByte(rest, '\n')
 		if lineEnd < 0 {
 			return nil, errors.New("zone file heading missing newline")
@@ -530,8 +578,7 @@ func coreDNSBinarySection(plan string) (*CoreDNSBinarySource, error) {
 }
 
 func optionalFencedSection(plan, heading, language string) (string, bool, error) {
-	start := strings.Index(plan, heading)
-	if start < 0 {
+	if !strings.Contains(plan, "\n"+heading+"\n") {
 		return "", false, nil
 	}
 	section, err := fencedSection(plan, heading, language)
@@ -606,6 +653,19 @@ func writeCoreDNSBootstrap(b *strings.Builder, binary *CoreDNSBinarySource) {
 	b.WriteString("  rm -rf \"$tmpdir\"\n")
 	b.WriteString("}\n")
 	b.WriteString("if [ -x \"$COREDNS_BIN\" ] && verify_coredns_sha256 \"$COREDNS_BIN\"; then echo 'lattice selfdns: pinned CoreDNS already installed'; else install_pinned_coredns; fi\n")
+}
+
+// planField keeps a free-text value on its one header line. Deployment and
+// node names are operator text rendered above the sections the apply script
+// reads by heading, so a line break in one could plant a fenced Corefile or a
+// lattice_guard candidate ahead of the reviewed one.
+func planField(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, value)
 }
 
 func shellQuote(value string) string {
@@ -687,6 +747,86 @@ func validateDeployment(dep model.DNSDeployment, opts RenderOptions) error {
 		default:
 			return fmt.Errorf("zone %d unsupported mode %q", i+1, zone.Mode)
 		}
+	}
+	return RefuseOpenResolver(dep)
+}
+
+// IsOpenResolver reports whether a deployment Lattice renders would recurse
+// for anyone who reaches it: public exposure with a forward zone. Such a
+// resolver is an open resolver and a reflection source (design 32 D7).
+func IsOpenResolver(dep model.DNSDeployment) bool {
+	if dep.Engine != model.DNSEngineCoreDNS || dep.Exposure != model.DNSExposurePublic {
+		return false
+	}
+	for _, zone := range dep.Zones {
+		if strings.ToLower(strings.TrimSpace(zone.Mode)) == model.DNSZoneForward {
+			return true
+		}
+	}
+	return false
+}
+
+// PlanHeader is what a DNS plan's header says about the deployment it serves.
+// The header fields after the names are rendered from enums and numbers, and
+// the names cannot break a line (planField), so they parse as written.
+type PlanHeader struct {
+	Exposure string
+	UDP      bool
+	TCP      bool
+	Port     int
+	Disabled bool
+}
+
+// ParsePlanHeader reads the exposure, listen and disabled lines of a DNS
+// plan's header, the part above its first section.
+func ParsePlanHeader(plan string) (PlanHeader, error) {
+	header := plan
+	if i := strings.Index(plan, "\n## "); i >= 0 {
+		header = plan[:i]
+	}
+	var out PlanHeader
+	listen := ""
+	for _, line := range strings.Split(header, "\n") {
+		switch {
+		case strings.HasPrefix(line, "exposure: "):
+			out.Exposure = strings.TrimSpace(strings.TrimPrefix(line, "exposure: "))
+		case strings.HasPrefix(line, "listen: "):
+			listen = strings.TrimSpace(strings.TrimPrefix(line, "listen: "))
+		case line == "disabled: true":
+			out.Disabled = true
+		}
+	}
+	if _, err := fmt.Sscanf(listen, "udp=%t tcp=%t port=%d", &out.UDP, &out.TCP, &out.Port); err != nil {
+		return PlanHeader{}, fmt.Errorf("dns plan header has no listen line: %w", err)
+	}
+	return out, nil
+}
+
+// PlanIsOpenResolver reports whether a reviewed DNS plan would install an
+// open resolver: public exposure and a Corefile that forwards. It judges the
+// plan rather than the stored deployment, so a plan made before the refusal
+// is caught at approve even after the record changed.
+func PlanIsOpenResolver(plan string) (bool, error) {
+	header, err := ParsePlanHeader(plan)
+	if err != nil {
+		return false, err
+	}
+	artifacts, err := ParseApprovalPlan(plan)
+	if err != nil {
+		return false, err
+	}
+	return header.Exposure == model.DNSExposurePublic && strings.Contains("\n"+artifacts.Corefile, "\n  forward . "), nil
+}
+
+// ErrOpenResolver is the refusal for a deployment IsOpenResolver reports.
+var ErrOpenResolver = errors.New("public exposure with a forward zone would answer recursive queries from anyone, an open resolver; use mesh exposure, or expose only static and block zones publicly")
+
+// RefuseOpenResolver refuses a deployment that would be an open resolver.
+// Naming allowed client networks is design 32 D8 work and not an exception
+// here.
+func RefuseOpenResolver(dep model.DNSDeployment) error {
+	if IsOpenResolver(dep) {
+		return ErrOpenResolver
 	}
 	return nil
 }

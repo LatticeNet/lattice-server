@@ -4094,6 +4094,20 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	// A rerun copies the script verbatim. A firewall-writing plan applied
+	// before NetGuard adopted a node would rebuild lattice_guard there without
+	// the node's security groups, which the approve refuses for the same plan,
+	// so the rerun refuses too.
+	if src.ApprovalID != "" {
+		if approval, ok := s.store.Approval(src.ApprovalID); ok && approvalWritesLegacyGuard(approval) {
+			for _, nodeID := range targets {
+				if s.nodeGuardManaged(nodeID) {
+					writeError(w, http.StatusConflict, fmt.Errorf("node %s is managed by NetGuard, which is the only writer of its lattice_guard table; this task would replace it, so it cannot be rerun there", nodeID))
+					return
+				}
+			}
+		}
+	}
 	// The rerun re-answers admission with the same capability the original
 	// was gated by: the persisted confinement when it has one, otherwise the
 	// approval that authorized it, resolved now rather than copied, because
@@ -7342,6 +7356,16 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 		return
 	}
+	// This route composes lattice_guard from NFTInputs and the request, and
+	// knows nothing of security groups. On a node NetGuard has adopted, the
+	// plan would replace the node's firewall with the legacy baseline and
+	// drop every bound group, so it is refused. An observe-only binding is
+	// only the record the port plan wrote; the legacy path still owns that
+	// node's table.
+	if s.nodeGuardManaged(req.NodeID) {
+		writeError(w, http.StatusConflict, errors.New("node is managed by NetGuard: plan its firewall with /api/netguard/plan; this legacy route would rebuild lattice_guard without the node's security groups"))
+		return
+	}
 	planInput := req.NFTPlan
 	source := "request"
 	if !nftPlanRequestHasInputs(planInput) {
@@ -8906,6 +8930,19 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	}
 	if isNetGuardApproval(approval) {
 		if err := s.requireCurrentNetGuardApproval(approval); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+	}
+	// NetGuard is the only writer of lattice_guard on a node it manages. A
+	// legacy Network Guard plan made before the node was adopted, or one an
+	// auto-approve rule decides, would replace the adopted firewall with the
+	// legacy baseline; this path serves both, so it refuses here as well as
+	// at the plan route.
+	if approval.Plugin == "nft" && approvalWritesLegacyGuard(approval) && s.nodeGuardManaged(approval.NodeID) {
+		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "node is managed by NetGuard, which is the only writer of its lattice_guard table; plan its firewall with /api/netguard/plan")}
+	}
+	if approval.Plugin == "selfdns" {
+		if err := s.requireSelfDNSFirewallOwner(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}

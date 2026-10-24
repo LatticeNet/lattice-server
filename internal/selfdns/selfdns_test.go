@@ -96,6 +96,28 @@ func TestGenerateConfigRejectsUnsafeInputs(t *testing.T) {
 	}
 }
 
+// A public listener with a forward zone recurses for anyone who reaches it,
+// which makes the node an open resolver and a reflection source. Design 32
+// D7 refuses it outright; a public deployment of static or block zones only
+// answers for itself and still renders.
+func TestGenerateConfigRefusesOpenPublicResolver(t *testing.T) {
+	dep := baseDeployment()
+	dep.Exposure = model.DNSExposurePublic
+	if _, err := GenerateConfig(dep, RenderOptions{}); err == nil || !strings.Contains(err.Error(), "open resolver") {
+		t.Fatalf("public forward deployment must be refused, got %v", err)
+	}
+	dep.Zones = []model.DNSZone{{Suffix: "ads.example.", Mode: model.DNSZoneBlock}}
+	if _, err := GenerateConfig(dep, RenderOptions{}); err != nil {
+		t.Fatalf("public block-only deployment should render: %v", err)
+	}
+	if !IsOpenResolver(model.DNSDeployment{Engine: model.DNSEngineCoreDNS, Exposure: model.DNSExposurePublic, Zones: []model.DNSZone{{Mode: " Forward "}}}) {
+		t.Fatal("mode is matched case and space insensitively")
+	}
+	if IsOpenResolver(model.DNSDeployment{Engine: model.DNSEngineExternal, Exposure: model.DNSExposurePublic, Zones: []model.DNSZone{{Mode: model.DNSZoneForward}}}) {
+		t.Fatal("an observed engine is never rendered, so it is not flagged")
+	}
+}
+
 func TestComposeFirewallPlan(t *testing.T) {
 	dep := baseDeployment()
 	plan, summary, err := ComposeFirewallPlan(dep, network.NFTPlan{WireGuardUDP: []int{51820}})
@@ -349,4 +371,96 @@ func ints(values []int) []string {
 		out = append(out, strconv.Itoa(value))
 	}
 	return out
+}
+
+// A plan for a node NetGuard manages carries no lattice_guard candidate and
+// its apply script never reads or writes the table; a plan with neither the
+// candidate nor the NetGuard section is refused rather than read as one.
+func TestNetGuardOwnedPlanAppliesCoreDNSOnly(t *testing.T) {
+	dep := baseDeployment()
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RenderApprovalPlanWithOptions(dep, "tokyo-1", cfg, "table inet lattice_guard {}\n", nil, ApprovalPlanOptions{NetGuardOwnsFirewall: true}); err == nil {
+		t.Fatal("a NetGuard-owned plan must refuse a ruleset")
+	}
+	plan, err := RenderApprovalPlanWithOptions(dep, "tokyo-1", cfg, "", []string{"firewall: NetGuard manages lattice_guard on this node; this plan does not change it"}, ApprovalPlanOptions{NetGuardOwnsFirewall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := ParseApprovalPlan(plan)
+	if err != nil || artifacts.NFTRuleset != "" {
+		t.Fatalf("NetGuard-owned plan should parse with no ruleset: %+v %v", artifacts, err)
+	}
+	script, err := ApplyScriptFromPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(script, "nft") || strings.Contains(script, "lattice_guard") {
+		t.Fatalf("NetGuard-owned apply script touches the firewall:\n%s", script)
+	}
+	stripped := strings.Replace(plan, "\n## lattice_guard\n", "\n", 1)
+	if _, err := ParseApprovalPlan(stripped); err == nil {
+		t.Fatal("a plan with neither a ruleset nor the NetGuard section must not parse")
+	}
+}
+
+// Deployment and node names are operator text rendered above the sections the
+// apply script reads by heading. On bd335aa a node name holding a fenced
+// Corefile replaced the reviewed one; a name could equally plant a ruleset
+// into a plan for a node NetGuard manages.
+func TestApprovalPlanKeepsNamesOnOneLine(t *testing.T) {
+	dep := baseDeployment()
+	dep.Name = "evil\n## nftables lattice_guard candidate\n```nft\ntable inet lattice_guard {}\n```"
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := RenderApprovalPlanWithOptions(dep, "node\n## CoreDNS Corefile\n```coredns\n.:53 {\n  forward . 192.0.2.66\n}\n```", cfg, "", nil, ApprovalPlanOptions{NetGuardOwnsFirewall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := ParseApprovalPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(artifacts.Corefile, "192.0.2.66") {
+		t.Fatalf("a node name planted a Corefile:\n%s", artifacts.Corefile)
+	}
+	if artifacts.NFTRuleset != "" {
+		t.Fatalf("a deployment name planted a ruleset into a NetGuard-owned plan:\n%s", artifacts.NFTRuleset)
+	}
+}
+
+// The approve judges a pending plan by its own text: the header names the
+// listeners it opens and whether the deployment was disabled, and a public
+// plan whose Corefile forwards is an open resolver whatever the stored record
+// says now.
+func TestPlanHeaderAndOpenResolverAreReadFromThePlan(t *testing.T) {
+	dep := baseDeployment()
+	dep.Disabled = true
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := RenderApprovalPlanWithOptions(dep, "tokyo-1", cfg, "", nil, ApprovalPlanOptions{NetGuardOwnsFirewall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := ParsePlanHeader(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header != (PlanHeader{Exposure: "mesh", UDP: true, TCP: true, Port: 53, Disabled: true}) {
+		t.Fatalf("header misread: %+v", header)
+	}
+	if open, err := PlanIsOpenResolver(plan); err != nil || open {
+		t.Fatalf("a mesh plan is not an open resolver: %v %v", open, err)
+	}
+	// A public forwarding plan rendered before the refusal existed.
+	public := strings.Replace(plan, "exposure: mesh\n", "exposure: public\n", 1)
+	if open, err := PlanIsOpenResolver(public); err != nil || !open {
+		t.Fatalf("a public forwarding plan is an open resolver: %v %v", open, err)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -157,6 +158,68 @@ func TestDNSDeploymentValidatesConfig(t *testing.T) {
 				t.Fatalf("expected 400, got %d", res.StatusCode)
 			}
 		})
+	}
+}
+
+// Design 32 D7 refuses a public deployment with a forward zone at save and
+// at plan. One stored before the refusal stays readable and is flagged, and
+// a disabled one saves so it can be switched off.
+func TestDNSDeploymentRefusesOpenPublicResolver(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	open := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"public dns","node_id":"n1","exposure":"public",
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	body, _ := io.ReadAll(open.Body)
+	open.Body.Close()
+	if open.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "open resolver") {
+		t.Fatalf("open public resolver should be refused with a reason, got %d %s", open.StatusCode, body)
+	}
+
+	disabled := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"name":"old public dns","node_id":"n1","exposure":"public","disabled":true,
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	disabled.Body.Close()
+	if disabled.StatusCode != http.StatusOK {
+		t.Fatalf("a disabled deployment should save so it can be switched off, got %d", disabled.StatusCode)
+	}
+
+	// A deployment stored before the refusal existed.
+	if err := st.UpsertDNSDeployment(model.DNSDeployment{
+		ID: "dns_legacy_open", Name: "legacy open", NodeID: "n1", Engine: model.DNSEngineCoreDNS,
+		ListenPort: 53, EnableUDP: true, Exposure: model.DNSExposurePublic, Status: model.DNSStatusRunning,
+		Zones: []model.DNSZone{{Suffix: ".", Mode: model.DNSZoneForward, Upstreams: []string{"1.1.1.1"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	list := doJSON(t, handler, http.MethodGet, "/api/dns/deployments", "", cookies, csrf)
+	var listed struct {
+		Deployments []struct {
+			ID           string `json:"id"`
+			OpenResolver bool   `json:"open_resolver"`
+		} `json:"deployments"`
+	}
+	if err := json.NewDecoder(list.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	list.Body.Close()
+	views := listed.Deployments
+	flagged := false
+	for _, v := range views {
+		if v.ID == "dns_legacy_open" {
+			flagged = v.OpenResolver
+		}
+	}
+	if list.StatusCode != http.StatusOK || !flagged {
+		t.Fatalf("a stored open resolver must stay readable and flagged: %d %+v", list.StatusCode, views)
+	}
+	plan := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"dns_legacy_open","accept_lockout_risk":true}`, cookies, csrf)
+	planBody, _ := io.ReadAll(plan.Body)
+	plan.Body.Close()
+	if plan.StatusCode != http.StatusBadRequest || !strings.Contains(string(planBody), "open resolver") {
+		t.Fatalf("planning a stored open resolver = %d %s, want 400", plan.StatusCode, planBody)
 	}
 }
 

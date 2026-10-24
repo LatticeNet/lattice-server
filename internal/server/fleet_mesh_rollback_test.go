@@ -18,7 +18,8 @@ import (
 // The rollback proof of design 32 R1, run by hand across two releases:
 //
 //	LATTICE_ROLLBACK_DIR=<dir> LATTICE_ROLLBACK_STEP=produce go test -run TestFleetMeshRollbackHarness ./internal/server/
-//	(LATTICE_ROLLBACK_SHAPE=auto produces an auto path set with a pinned source)
+//	(LATTICE_ROLLBACK_SHAPE=auto produces an auto path set with a pinned source;
+//	auto-split adds an auto source that shares the pin's tcp monitors)
 //	(in a checkout of the release before the migration, the resume step of
 //	the same harness over <dir>)
 //	LATTICE_ROLLBACK_DIR=<dir> LATTICE_ROLLBACK_STEP=forward go test -run TestFleetMeshRollbackHarness ./internal/server/
@@ -140,16 +141,23 @@ func rollbackProduce(t *testing.T, dir string) {
 	}
 	srv, _, st := meshFleet(t, dir)
 	cfg := meshConfig()
-	if os.Getenv("LATTICE_ROLLBACK_SHAPE") == "auto" {
+	switch shape := os.Getenv("LATTICE_ROLLBACK_SHAPE"); shape {
+	case "auto", "auto-split":
 		// The other shape a path set takes: method auto with a source
 		// pinned to tcp, which migrates to an auto chk_fleet_mesh, a type
-		// the older release does not know, and chk_fleet_mesh_tcp.
-		old, _ := st.Node("node-bj")
-		old.ProbeMethods = []string{"tcp"}
-		upsertNodes(t, st, old)
+		// the older release does not know, and chk_fleet_mesh_tcp. The
+		// auto sources choose icmp, so the pin's tcp monitors are its own.
 		cfg.Method = model.LatencyMethodAuto
 		cfg.Sources = []string{"cd-hs-sh", "node-bj", "node-jp"}
 		cfg.SourceMethods = map[string]string{"node-jp": model.LatencyMethodTCP}
+		if shape == "auto-split" {
+			// An auto source whose agent runs tcp only shares the pin's
+			// tcp monitors, which one definition adopts and the other
+			// cannot.
+			old, _ := st.Node("node-bj")
+			old.ProbeMethods = []string{"tcp"}
+			upsertNodes(t, st, old)
+		}
 	}
 	storePathSet(t, st, cfg)
 	if _, _, err := srv.syncLatencyProbes(meshT0); err != nil {

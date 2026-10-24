@@ -21,7 +21,7 @@ import (
 )
 
 // Release is the lattice-knock tag the embedded files were copied from.
-const Release = "v0.1.0-alpha.1"
+const Release = "v0.1.0-alpha.2"
 
 // Repo is where the client is developed and released.
 const Repo = "LatticeNet/lattice-knock"

@@ -971,7 +971,8 @@ func New(opts Options) (*Server, error) {
 // Verification failures are audited and skipped — one bad or untrusted bundle
 // never blocks boot. Execution (host-API binding) is a later milestone.
 func (s *Server) loadPlugins(dir, cacheDir string, policy plugin.TrustPolicy) {
-	loaded, outcomes, err := plugin.Loader{Dir: dir, CacheDir: cacheDir, Policy: policy}.Load()
+	serverVersion, _ := plugin.ServerSemver(s.build.ServerVersion)
+	loaded, outcomes, err := plugin.Loader{Dir: dir, CacheDir: cacheDir, Policy: policy, ServerVersion: serverVersion}.Load()
 	if err != nil {
 		s.logger.Printf("plugin loader: %v", err)
 		return

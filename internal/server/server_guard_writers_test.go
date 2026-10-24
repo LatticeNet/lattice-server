@@ -90,14 +90,7 @@ func TestDNSPlanOnManagedNodeInstallsCoreDNSOnly(t *testing.T) {
 		t.Fatalf("a refused dns plan must not record an approval: %+v", st.Approvals())
 	}
 
-	group, _ := st.SecurityGroup("sg-web")
-	wireguard := model.NetEndpoint{Kind: model.NetRefZone, ZoneID: model.GuardZoneWireGuard}
-	for _, proto := range []string{model.NetProtoUDP, model.NetProtoTCP} {
-		group.Rules = append(group.Rules, model.GuardRule{ID: "dns-" + proto, Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: proto, Ports: []model.GuardPortRange{{From: 53, To: 53}}, Remote: wireguard})
-	}
-	if _, err := st.UpsertSecurityGroup(group); err != nil {
-		t.Fatal(err)
-	}
+	openDNSPortsOnWebGroup(t, st)
 	open := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+depID+`"}`, cookies, csrf)
 	defer open.Body.Close()
 	if open.StatusCode != http.StatusOK {
@@ -168,5 +161,130 @@ func TestDNSApproveRefusesFirewallPlanOnManagedNode(t *testing.T) {
 	}
 	if len(st.Tasks()) != 0 {
 		t.Fatalf("a refused approval must queue nothing: %+v", st.Tasks())
+	}
+}
+
+// openDNSPortsOnWebGroup lets n1's web group admit udp/53 and tcp/53 from the
+// WireGuard range, so a mesh DNS plan under NetGuard passes its port check.
+func openDNSPortsOnWebGroup(t *testing.T, st *store.Store) {
+	t.Helper()
+	group, _ := st.SecurityGroup("sg-web")
+	wireguard := model.NetEndpoint{Kind: model.NetRefZone, ZoneID: model.GuardZoneWireGuard}
+	for _, proto := range []string{model.NetProtoUDP, model.NetProtoTCP} {
+		group.Rules = append(group.Rules, model.GuardRule{ID: "dns-" + proto, Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: proto, Ports: []model.GuardPortRange{{From: 53, To: 53}}, Remote: wireguard})
+	}
+	if _, err := st.UpsertSecurityGroup(group); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func approveStatus(t *testing.T, handler http.Handler, cookies []*http.Cookie, csrf string, a model.Approval) (int, string) {
+	t.Helper()
+	res := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": a.ID, "queue_apply": true, "plan_sha256": planSHA256(a.Plan)})), cookies, csrf)
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	return res.StatusCode, string(body)
+}
+
+// A CoreDNS-only plan is approved against the firewall owner of the moment:
+// refused when NetGuard closed one of its ports since the plan, and refused
+// when the node left NetGuard, since nothing would then open its ports.
+func TestDNSApproveUnderNetGuardRechecksOwnerAndPorts(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	adoptNodeWithWebGroup(t, handler, st, cookies, csrf)
+	openDNSPortsOnWebGroup(t, st)
+	depID := createDNSDeployment(t, handler, cookies, csrf)
+	plan := func() model.Approval {
+		t.Helper()
+		res := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+depID+`"}`, cookies, csrf)
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("dns plan: %d", res.StatusCode)
+		}
+		return decodeDNSPlan(t, res)
+	}
+
+	closedSince := plan()
+	group, _ := st.SecurityGroup("sg-web")
+	group.Rules = group.Rules[:len(group.Rules)-1] // drop the tcp/53 allow
+	if _, err := st.UpsertSecurityGroup(group); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := approveStatus(t, handler, cookies, csrf, closedSince); code != http.StatusConflict || !strings.Contains(body, "open tcp/53 from the WireGuard range") {
+		t.Fatalf("approving after NetGuard closed tcp/53 = %d %s, want 409 saying what to open", code, body)
+	}
+	openDNSPortsOnWebGroup(t, st)
+
+	unadopted := plan()
+	binding, _ := st.NodeGuardBinding("n1")
+	binding.Managed = false
+	if _, err := st.UpsertNodeGuardBinding(binding); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := approveStatus(t, handler, cookies, csrf, unadopted); code != http.StatusConflict || !strings.Contains(body, "no longer") {
+		t.Fatalf("approving a CoreDNS-only plan after un-adoption = %d %s, want 409", code, body)
+	}
+	if len(st.Tasks()) != 0 {
+		t.Fatalf("refused approvals must queue nothing: %+v", st.Tasks())
+	}
+}
+
+// A plan rendered before the open-resolver refusal is judged by its own text
+// at approve, so it cannot install a public forwarding resolver.
+func TestDNSApproveRefusesPendingOpenResolverPlan(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs", `{
+		"node_id":"n1","interface_name":"ens3","wireguard_cidr":"10.66.0.0/24","public_tcp":[22]
+	}`, cookies, csrf)
+	save.Body.Close()
+	seedNodeReality(t, st, "n1", 22, "ens3")
+	depID := createDNSDeployment(t, handler, cookies, csrf)
+	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+depID+`"}`, cookies, csrf)
+	approval := decodeDNSPlan(t, planRes)
+	planRes.Body.Close()
+	// What a public forwarding plan from before the refusal looks like.
+	approval.Plan = strings.Replace(approval.Plan, "exposure: mesh\n", "exposure: public\n", 1)
+	if err := st.UpsertApproval(approval); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := approveStatus(t, handler, cookies, csrf, approval); code != http.StatusConflict || !strings.Contains(body, "open resolver") {
+		t.Fatalf("approving a pending open-resolver plan = %d %s, want 409", code, body)
+	}
+}
+
+// A rerun copies the task's script verbatim, so a legacy firewall task from
+// before adoption must not be replayed onto a node NetGuard now manages.
+func TestRerunRefusesLegacyFirewallTaskOnManagedNode(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	save := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs", `{
+		"node_id":"n1","interface_name":"ens3","wireguard_cidr":"10.66.0.0/24","public_tcp":[22]
+	}`, cookies, csrf)
+	save.Body.Close()
+	seedNodeReality(t, st, "n1", 22, "ens3")
+	planRes := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"n1"}`, cookies, csrf)
+	approval := decodeNFTPlan(t, planRes)
+	planRes.Body.Close()
+	if code, body := approveStatus(t, handler, cookies, csrf, approval); code != http.StatusOK {
+		t.Fatalf("approve legacy plan before adoption: %d %s", code, body)
+	}
+	tasks := st.Tasks()
+	if len(tasks) != 1 {
+		t.Fatalf("expected the legacy apply task: %+v", tasks)
+	}
+	if _, err := st.UpsertNodeGuardBinding(model.NodeGuardBinding{NodeID: "n1", Managed: true}); err != nil {
+		t.Fatal(err)
+	}
+	rerun := doJSON(t, handler, http.MethodPost, "/api/tasks/rerun", `{"id":"`+tasks[0].ID+`"}`, cookies, csrf)
+	body, _ := io.ReadAll(rerun.Body)
+	rerun.Body.Close()
+	if rerun.StatusCode != http.StatusConflict || !strings.Contains(string(body), "NetGuard") {
+		t.Fatalf("rerun of a legacy firewall task on a managed node = %d %s, want 409", rerun.StatusCode, body)
+	}
+	if len(st.Tasks()) != 1 {
+		t.Fatalf("a refused rerun must queue nothing: %+v", st.Tasks())
 	}
 }

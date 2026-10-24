@@ -432,3 +432,35 @@ func TestApprovalPlanKeepsNamesOnOneLine(t *testing.T) {
 		t.Fatalf("a deployment name planted a ruleset into a NetGuard-owned plan:\n%s", artifacts.NFTRuleset)
 	}
 }
+
+// The approve judges a pending plan by its own text: the header names the
+// listeners it opens and whether the deployment was disabled, and a public
+// plan whose Corefile forwards is an open resolver whatever the stored record
+// says now.
+func TestPlanHeaderAndOpenResolverAreReadFromThePlan(t *testing.T) {
+	dep := baseDeployment()
+	dep.Disabled = true
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := RenderApprovalPlanWithOptions(dep, "tokyo-1", cfg, "", nil, ApprovalPlanOptions{NetGuardOwnsFirewall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := ParsePlanHeader(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header != (PlanHeader{Exposure: "mesh", UDP: true, TCP: true, Port: 53, Disabled: true}) {
+		t.Fatalf("header misread: %+v", header)
+	}
+	if open, err := PlanIsOpenResolver(plan); err != nil || open {
+		t.Fatalf("a mesh plan is not an open resolver: %v %v", open, err)
+	}
+	// A public forwarding plan rendered before the refusal existed.
+	public := strings.Replace(plan, "exposure: mesh\n", "exposure: public\n", 1)
+	if open, err := PlanIsOpenResolver(public); err != nil || !open {
+		t.Fatalf("a public forwarding plan is an open resolver: %v %v", open, err)
+	}
+}

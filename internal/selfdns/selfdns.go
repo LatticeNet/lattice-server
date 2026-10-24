@@ -242,6 +242,9 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 	fmt.Fprintf(&b, "engine: %s\n", dep.Engine)
 	fmt.Fprintf(&b, "exposure: %s\n", dep.Exposure)
 	fmt.Fprintf(&b, "listen: udp=%t tcp=%t port=%d\n", dep.EnableUDP, dep.EnableTCP, dep.ListenPort)
+	if dep.Disabled {
+		b.WriteString("disabled: true\n")
+	}
 	if dep.Hostname != "" {
 		fmt.Fprintf(&b, "hostname: %s\n", dep.Hostname)
 		fmt.Fprintf(&b, "publish: ipv4=%t ipv6=%t ttl=%d credential=%t\n", dep.PublishIPv4, dep.PublishIPv6, dep.RecordTTL, dep.CFAPIToken != "" || dep.DDNSProfileID != "")
@@ -761,6 +764,58 @@ func IsOpenResolver(dep model.DNSDeployment) bool {
 		}
 	}
 	return false
+}
+
+// PlanHeader is what a DNS plan's header says about the deployment it serves.
+// The header fields after the names are rendered from enums and numbers, and
+// the names cannot break a line (planField), so they parse as written.
+type PlanHeader struct {
+	Exposure string
+	UDP      bool
+	TCP      bool
+	Port     int
+	Disabled bool
+}
+
+// ParsePlanHeader reads the exposure, listen and disabled lines of a DNS
+// plan's header, the part above its first section.
+func ParsePlanHeader(plan string) (PlanHeader, error) {
+	header := plan
+	if i := strings.Index(plan, "\n## "); i >= 0 {
+		header = plan[:i]
+	}
+	var out PlanHeader
+	listen := ""
+	for _, line := range strings.Split(header, "\n") {
+		switch {
+		case strings.HasPrefix(line, "exposure: "):
+			out.Exposure = strings.TrimSpace(strings.TrimPrefix(line, "exposure: "))
+		case strings.HasPrefix(line, "listen: "):
+			listen = strings.TrimSpace(strings.TrimPrefix(line, "listen: "))
+		case line == "disabled: true":
+			out.Disabled = true
+		}
+	}
+	if _, err := fmt.Sscanf(listen, "udp=%t tcp=%t port=%d", &out.UDP, &out.TCP, &out.Port); err != nil {
+		return PlanHeader{}, fmt.Errorf("dns plan header has no listen line: %w", err)
+	}
+	return out, nil
+}
+
+// PlanIsOpenResolver reports whether a reviewed DNS plan would install an
+// open resolver: public exposure and a Corefile that forwards. It judges the
+// plan rather than the stored deployment, so a plan made before the refusal
+// is caught at approve even after the record changed.
+func PlanIsOpenResolver(plan string) (bool, error) {
+	header, err := ParsePlanHeader(plan)
+	if err != nil {
+		return false, err
+	}
+	artifacts, err := ParseApprovalPlan(plan)
+	if err != nil {
+		return false, err
+	}
+	return header.Exposure == model.DNSExposurePublic && strings.Contains("\n"+artifacts.Corefile, "\n  forward . "), nil
 }
 
 // ErrOpenResolver is the refusal for a deployment IsOpenResolver reports.

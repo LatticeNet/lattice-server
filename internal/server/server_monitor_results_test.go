@@ -111,17 +111,29 @@ func (l *lockedLog) linesWith(substr string) []string {
 // drops held back since, naming the node, and saying how far off a stamp
 // outside the window was, which is how a broken agent clock shows.
 func TestAgentMonitorResultDropsAreLoggedOncePerInterval(t *testing.T) {
-	srv, handler, _ := newInventoryServer(t)
+	// The clock and the logger go in through Options: the server's
+	// background loops read both from New on.
+	base := time.Now().UTC().Truncate(time.Second)
+	var clock atomic.Int64
+	clock.Store(base.UnixNano())
 	logs := &lockedLog{}
-	srv.logger = log.New(logs, "", 0)
+	st, err := store.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Options{
+		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
+		Logger: log.New(logs, "", 0),
+		Now:    func() time.Time { return time.Unix(0, clock.Load()).UTC() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := srv.Handler()
 	cookies, csrf := loginSession(t, handler)
 	slow := enrollAndBeat(t, handler, cookies, csrf, "n-web", "tokyo-edge")
 	fast := enrollAndBeat(t, handler, cookies, csrf, "n-fast", "osaka-edge")
 	monID := createAllNodesMonitor(t, handler, cookies, csrf, "web")
-	base := time.Now().UTC().Truncate(time.Second)
-	var clock atomic.Int64
-	clock.Store(base.UnixNano())
-	srv.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
 	post := func(nodeID, token string, results ...string) {
 		t.Helper()
 		body := `{"node_id":"` + nodeID + `","results":[` + strings.Join(results, ",") + `]}`

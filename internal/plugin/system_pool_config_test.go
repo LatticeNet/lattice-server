@@ -157,9 +157,17 @@ func TestSystemRunnerPoolSizeTwoPrepareThenActivate(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("second persistent worker did not become ready")
 	}
-	p.mu.Lock()
-	workers, starting = len(p.workers), p.starting
-	p.mu.Unlock()
+	// The pool records a start's success before the worker joins it (a worker
+	// is never leased ahead of its success accounting), so the count can lag
+	// successFn by one lock; wait for it instead of reading it at once.
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(5 * time.Millisecond) {
+		p.mu.Lock()
+		workers, starting = len(p.workers), p.starting
+		p.mu.Unlock()
+		if (workers == 2 && starting == 0) || time.Now().After(deadline) {
+			break
+		}
+	}
 	if workers != 2 || starting != 0 {
 		t.Fatalf("activated pool workers=%d starting=%d, want 2/0", workers, starting)
 	}

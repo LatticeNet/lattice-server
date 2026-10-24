@@ -19,7 +19,7 @@ func trustView(t *testing.T, policy plugin.TrustPolicy) (pluginTrustView, string
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PluginTrust: policy})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PluginTrust: policy})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

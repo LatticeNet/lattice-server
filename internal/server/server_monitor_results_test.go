@@ -121,7 +121,7 @@ func TestAgentMonitorResultDropsAreLoggedOncePerInterval(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		Logger: log.New(logs, "", 0),
 		Now:    func() time.Time { return time.Unix(0, clock.Load()).UTC() },

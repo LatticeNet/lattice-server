@@ -45,12 +45,12 @@ func catalogueFixture(t testing.TB, nodes, perNode int) *catalogueEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	inventories := map[string]model.SingBoxInventory{}
 	for n := 0; n < nodes; n++ {
 		nodeID := fmt.Sprintf("node-%03d", n)

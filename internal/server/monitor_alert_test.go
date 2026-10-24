@@ -14,7 +14,7 @@ import (
 func TestMonitorAlertAfterDecidesThePageAndTheState(t *testing.T) {
 	srv, _, st := newPathsServer(t)
 	now := time.Now().UTC()
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	upsertNodes(t, st, model.Node{ID: "node-a", Name: "a", Online: true, LastSeen: now})
 	if err := st.UpsertMonitor(model.Monitor{ID: "mon-3", Name: "three", Type: model.MonitorTypeTCP, Target: "203.0.113.4:443", IntervalSec: 60, TimeoutSec: 5, NodeIDs: []string{"node-a"}, Enabled: true, AlertAfter: 3}); err != nil {
 		t.Fatal(err)
@@ -101,7 +101,7 @@ func TestMonitorAlertAfterIsValidated(t *testing.T) {
 func TestDisabledCheckClosesItsIncident(t *testing.T) {
 	srv, _, st := newPathsServer(t)
 	now := time.Now().UTC()
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	upsertNodes(t, st, model.Node{ID: "node-a", Name: "a", Online: true, LastSeen: now})
 	if err := st.UpsertMonitor(model.Monitor{ID: "mon-x", Name: "x", Type: model.MonitorTypeTCP, Target: "203.0.113.4:443", IntervalSec: 60, TimeoutSec: 5, NodeIDs: []string{"node-a"}, Enabled: true}); err != nil {
 		t.Fatal(err)

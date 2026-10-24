@@ -36,7 +36,7 @@ func TestPluginVerifyEndpointAcceptsTrustedSignedHostRiskManifest(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:         st,
 		AdminPassword: testAdminPass,
 		PluginTrust:   plugin.TrustPolicy{TrustedPublishers: map[string]ed25519.PublicKey{"latticenet": pub}},

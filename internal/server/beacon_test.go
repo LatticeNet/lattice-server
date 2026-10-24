@@ -41,7 +41,7 @@ func beaconFleet(t *testing.T) (*Server, http.Handler, *store.Store) {
 // server's store.
 func seedBeaconFleet(t *testing.T, srv *Server, st *store.Store) {
 	t.Helper()
-	srv.now = func() time.Time { return beaconT0 }
+	serverClock(t, srv).set(beaconT0)
 	all := []string{"beacon", "http", "icmp", "tcp"}
 	upsertNodes(t, st,
 		model.Node{ID: "node-t", Name: "target", PublicIP: "198.51.100.30", InternalIP: "10.1.0.5", WireGuardIP: "10.66.0.30", WireGuardPort: 51820, Online: true, ProbeMethods: all,

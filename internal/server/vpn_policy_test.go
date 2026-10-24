@@ -106,7 +106,7 @@ func TestDisablingAnIdentityRecordsWhoDidIt(t *testing.T) {
 	}
 	srv := newLinemetaTestServer(t, st)
 	t0 := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return t0 }
+	serverClock(t, srv).set(t0)
 	ctx := context.WithValue(context.Background(), pluginOperatorPrincipalKey{}, principal{Principal: rbac.Principal{ActorID: "op-7"}})
 	raw, err := srv.vpnCoreUsersAdminDispatch(ctx, "create", mustJSON(t, map[string]any{"email": "dora@example.com"}))
 	if err != nil {
@@ -126,7 +126,7 @@ func TestDisablingAnIdentityRecordsWhoDidIt(t *testing.T) {
 		}
 	}
 	update("op-7", map[string]any{"email": "dora@example.com", "enabled": false})
-	srv.now = func() time.Time { return t0.Add(time.Hour) }
+	serverClock(t, srv).set(t0.Add(time.Hour))
 	update("op-8", map[string]any{"email": "dora@example.com", "enabled": false, "comment": "still off"})
 	u, _ := srv.getVpnUser(userID)
 	if u.Suspension == nil || u.Suspension.Reason != vpnSuspendReasonDisabled || u.Suspension.By != "op-7" || !u.Suspension.Since.Equal(t0) {

@@ -1189,7 +1189,7 @@ func (f *s2ExpiryFixture) write(t *testing.T) {
 	t.Helper()
 	f.writes++
 	at := f.env.now.Add(time.Duration(f.writes) * (vpnCoreLinkChangeInterval + time.Second))
-	f.env.srv.now = func() time.Time { return at }
+	serverClock(t, f.env.srv).set(at)
 	u, _ := f.env.srv.getVpnUser(e2eBobID)
 	u.Name = u.Name + "+"
 	if err := f.env.srv.putVpnUser(u); err != nil {

@@ -78,7 +78,7 @@ func BenchmarkTraceRollups90DayWindow(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(b, Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts, DisableRenewalScheduler: true})
 	if err != nil {
 		b.Fatal(err)
 	}

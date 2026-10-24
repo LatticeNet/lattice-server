@@ -60,7 +60,7 @@ func TestDDNSCNAMERunKeepsAnEditSavedWhileItRan(t *testing.T) {
 	cookies, csrf := loginSession(t, handler)
 	seedFrontierNode(t, srv)
 	clock := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return clock }
+	serverClock(t, srv).set(clock)
 	_, _, raw := saveDDNS(t, handler, frontierCNAMEBody(`,"comment_mode":"none"`), cookies, csrf)
 	made := decodeCNAMEView(t, raw)
 	entered, release := gateDDNSProvider(srv)
@@ -88,6 +88,7 @@ func TestDDNSCNAMERunKeepsAnEditSavedWhileItRan(t *testing.T) {
 	}
 
 	clock = clock.Add(10 * time.Minute)
+	serverClock(t, srv).set(clock)
 	if n := srv.sweepDDNSOnce(); n != 1 {
 		t.Fatalf("the check after the edit ran %d profiles, want 1", n)
 	}

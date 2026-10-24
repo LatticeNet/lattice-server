@@ -113,12 +113,12 @@ func TestNodeStatusHistoryEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	handler := srv.Handler()
 	cookies, csrf := loginSession(t, handler)
 

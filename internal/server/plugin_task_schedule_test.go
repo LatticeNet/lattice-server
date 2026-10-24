@@ -40,7 +40,7 @@ func schedManifest() plugin.Manifest {
 // with the background loops off so only the test drives the scheduler.
 func schedServer(t *testing.T, st *store.Store) *Server {
 	t.Helper()
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +287,7 @@ func TestTaskSchedulesSurviveARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	restarted, err := New(Options{Store: reopened, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	restarted, err := newClockedServer(t, Options{Store: reopened, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +428,7 @@ func TestTaskScheduleStopsWhenTheManifestNoLongerGrantsTheCapability(t *testing.
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = reopened.Close() })
-	restarted, err := New(Options{Store: reopened, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	restarted, err := newClockedServer(t, Options{Store: reopened, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}

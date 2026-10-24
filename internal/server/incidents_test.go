@@ -31,8 +31,8 @@ var incidentBase = time.Date(2026, 10, 3, 3, 0, 0, 0, time.UTC)
 func newIncidentHarness(t *testing.T, nodeIDs ...string) *incidentHarness {
 	t.Helper()
 	f := openNotifyFixture(t, t.TempDir())
-	h := &incidentHarness{t: t, f: f, clock: &testClock{at: incidentBase}}
-	f.srv.now = h.clock.now
+	h := &incidentHarness{t: t, f: f, clock: serverClock(t, f.srv)}
+	h.clock.set(incidentBase)
 	h.sent = captureTypedNotices(f.srv)
 	for _, nodeID := range nodeIDs {
 		if err := f.st.UpsertNode(model.Node{ID: nodeID, Name: "name-" + nodeID}); err != nil {
@@ -399,8 +399,8 @@ func TestQuietHoursHoldNonCriticalDeliveries(t *testing.T) {
 	dir := t.TempDir()
 	f := openNotifyFixture(t, dir)
 	now := time.Now().UTC().Truncate(time.Minute)
-	clock := &testClock{at: now}
-	f.srv.now = clock.now
+	clock := serverClock(t, f.srv)
+	clock.set(now)
 	installFakeNotifySender(f.srv, nil)
 	addNotifyChannel(t, f.st, "nc-a", "Bark")
 	quiet := &store.NotifyQuietHours{Start: now.Add(-time.Hour).Format("15:04"), End: now.Add(2 * time.Hour).Format("15:04"), TimeZone: "UTC"}
@@ -422,7 +422,7 @@ func TestQuietHoursHoldNonCriticalDeliveries(t *testing.T) {
 
 	// A restart inside the window leaves the held row waiting, not failed.
 	f.srv.stopNotifyOutbox()
-	if _, err := New(Options{Store: f.st, AdminPassword: testAdminPass, DisableRenewalScheduler: true}); err != nil {
+	if _, err := newClockedServer(t, Options{Store: f.st, AdminPassword: testAdminPass, DisableRenewalScheduler: true}); err != nil {
 		t.Fatal(err)
 	}
 	row, _ := f.st.NotifyDelivery(held[0].ID)
@@ -469,8 +469,8 @@ func TestQuietHoursWindowArithmetic(t *testing.T) {
 func TestOpenIncidentsKeepTheirStateAcrossARestart(t *testing.T) {
 	dir := t.TempDir()
 	f1 := openIngestFixture(t, dir)
-	clock := &testClock{at: incidentBase}
-	f1.srv.now = clock.now
+	clock := serverClock(t, f1.srv)
+	clock.set(incidentBase)
 	sent1 := captureTypedNotices(f1.srv)
 	for _, id := range []string{"a", "b"} {
 		if err := f1.st.UpsertNode(model.Node{ID: id, Name: "name-" + id}); err != nil {
@@ -496,7 +496,10 @@ func TestOpenIncidentsKeepTheirStateAcrossARestart(t *testing.T) {
 
 	f2 := openIngestFixture(t, dir)
 	t.Cleanup(func() { _ = f2.st.Close() })
-	f2.srv.now = clock.now
+	// The restarted server reads the clock from where the first one left it.
+	restartAt := clock.now()
+	clock = serverClock(t, f2.srv)
+	clock.set(restartAt)
 	sent2 := captureTypedNotices(f2.srv)
 	cookies, csrf = loginSession(t, f2.handler)
 	res = doJSON(t, f2.handler, http.MethodGet, "/api/incidents?state=open,acknowledged", "", cookies, csrf)
@@ -717,8 +720,8 @@ func TestPendingIncidentsAreListed(t *testing.T) {
 // and a moving loop resolves it with agent.recovered.
 func TestAgentLoopHealthOpensAndResolvesAgentStalled(t *testing.T) {
 	h := newIncidentHarness(t)
-	clock := &testClock{at: time.Now().UTC()}
-	h.f.srv.now = clock.now
+	clock := serverClock(t, h.f.srv)
+	clock.set(time.Now().UTC())
 	cookies, csrf := loginSession(t, h.f.handler)
 	token := enrollNamedNodeToken(t, h.f.handler, cookies, csrf, "n-loop", "loop")
 	agentNow := clock.now().Add(-time.Hour)
@@ -763,7 +766,7 @@ func TestLegacyOfflinePageIsAdoptedAndAnswered(t *testing.T) {
 	if err := st.SetNodeOfflineAlerts(map[string]time.Time{"n-old": lastSeen}); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -935,7 +938,7 @@ func TestQuietHoursReleaseIncidentMessagesInOrderAndWithdrawTheSettled(t *testin
 		}
 	}
 
-	h.clock.at = start.Add(2*time.Hour + time.Minute)
+	h.clock.set(start.Add(2*time.Hour + time.Minute))
 	h.f.srv.wakeNotifyOutbox()
 	waitOutboxSettled(t, h.f.srv)
 	want := []string{

@@ -104,7 +104,7 @@ func newE5PluginServerFixture(t *testing.T, root string) e5PluginServerFixture {
 	if err := st.EnableRuntimeBoltHotStore(hotPath); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		PluginDir: pluginDir, PluginBundleCacheDir: cacheDir, PluginRuntimeDir: runtimeDir,
 		PluginTrust: policy,
@@ -618,7 +618,7 @@ func (fixture e5PluginServerFixture) reopen(t *testing.T, beforeStoreClose func(
 	if err := st.EnableRuntimeBoltHotStore(fixture.hotPath); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		PluginDir: fixture.pluginDir, PluginBundleCacheDir: fixture.cacheDir, PluginRuntimeDir: fixture.runtimeDir, PluginTrust: fixture.trust,
 		PublicURL: "https://lattice.e5.invalid"})
 	if err != nil {

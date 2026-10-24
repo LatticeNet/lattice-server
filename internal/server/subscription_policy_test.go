@@ -105,12 +105,12 @@ func TestCoreShareServesWhatTheIdentityPolicyAllows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	handler := srv.Handler()
 	cookies, csrf := loginSession(t, handler)
 	enrollNamedNode(t, handler, cookies, csrf, "node-a", "Node A")
@@ -170,6 +170,7 @@ func TestCoreShareServesWhatTheIdentityPolicyAllows(t *testing.T) {
 		t.Fatalf("re-enabled before its expiry: %d", rec.Code)
 	}
 	now = expiry
+	serverClock(t, srv).set(now)
 	if rec := fetch(); rec.Code != http.StatusNotFound {
 		t.Fatalf("expired from a warm cache: %d %q, want the decoy", rec.Code, rec.Body.String())
 	}

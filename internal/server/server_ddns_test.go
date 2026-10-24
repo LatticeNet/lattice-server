@@ -40,7 +40,7 @@ func newDDNSServerWithCloudflare(t *testing.T) (*Server, http.Handler, *store.St
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,8 +267,8 @@ func TestDDNSSweepPublishesOnlyChanges(t *testing.T) {
 	// Sweeps are spaced by each profile's interval, so drive the clock rather
 	// than calling back to back.
 	clock := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return clock }
-	tick := func() { clock = clock.Add(10 * time.Minute) }
+	serverClock(t, srv).set(clock)
+	tick := func() { clock = clock.Add(10 * time.Minute); serverClock(t, srv).set(clock) }
 
 	create := doJSON(t, handler, http.MethodPost, "/api/ddns",
 		`{"name":"cf","node_id":"n1","provider":"webhook","webhook_url":"https://example.com/h","domains":["a.example.com"],"enable_ipv4":true}`, cookies, csrf)
@@ -344,7 +344,7 @@ func TestDDNSFailedRunKeepsPreviousIP(t *testing.T) {
 	fake := &failingProvider{}
 	srv.ddnsProvider = func(model.DDNSProfile) (ddns.Provider, error) { return fake, nil }
 	clock := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return clock }
+	serverClock(t, srv).set(clock)
 
 	create := doJSON(t, handler, http.MethodPost, "/api/ddns",
 		`{"name":"x","node_id":"n1","provider":"webhook","webhook_url":"https://example.com/h","domains":["a.example.com"],"enable_ipv4":true}`, cookies, csrf)
@@ -376,6 +376,7 @@ func TestDDNSFailedRunKeepsPreviousIP(t *testing.T) {
 	// retries and records for real.
 	fake.ok = true
 	clock = clock.Add(10 * time.Minute)
+	serverClock(t, srv).set(clock)
 	if n := srv.sweepDDNSOnce(); n != 1 {
 		t.Fatalf("recovered profile was not retried: %d", n)
 	}
@@ -509,7 +510,7 @@ func TestDDNSSweepRetryOfTheSameFailureDoesNotRewriteState(t *testing.T) {
 	}
 	srv.ddnsProvider = func(model.DDNSProfile) (ddns.Provider, error) { return failingDDNS{}, nil }
 	clock := time.Date(2026, 10, 4, 1, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return clock }
+	serverClock(t, srv).set(clock)
 	create := doJSON(t, handler, http.MethodPost, "/api/ddns",
 		`{"name":"cf","node_id":"n1","provider":"webhook","webhook_url":"https://example.com/h","domains":["a.example.com"],"enable_ipv4":true}`, cookies, csrf)
 	create.Body.Close()
@@ -525,6 +526,7 @@ func TestDDNSSweepRetryOfTheSameFailureDoesNotRewriteState(t *testing.T) {
 	}
 	for i := 0; i < 3; i++ {
 		clock = clock.Add(10 * time.Minute)
+		serverClock(t, srv).set(clock)
 		before = writes("RecordDDNSRun")
 		srv.sweepDDNSOnce()
 		if got := writes("RecordDDNSRun") - before; got != 0 {

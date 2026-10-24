@@ -24,7 +24,7 @@ func TestLineMetaDiscoveryRefusalLogsOnceAnHourAndOnRecovery(t *testing.T) {
 	}
 	srv := newLinemetaTestServer(t, st)
 	now := time.Date(2026, 10, 3, 4, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	seedLinemetaNodes(t, srv)
 
 	out, err := srv.vpnCoreLinesSyncMetadata(lineUserTestPrincipal(), json.RawMessage(`{"node_id":"node-a"}`))
@@ -49,6 +49,7 @@ func TestLineMetaDiscoveryRefusalLogsOnceAnHourAndOnRecovery(t *testing.T) {
 	logs := &lockedLog{}
 	srv.logger = log.New(logs, "", 0)
 	now = now.Add(3 * time.Hour)
+	serverClock(t, srv).set(now)
 	srv.linemetaSyncFP = nil
 	srv.singboxInvMu.Lock()
 	invA := srv.singboxInv["node-a"]
@@ -76,6 +77,7 @@ func TestLineMetaDiscoveryRefusalLogsOnceAnHourAndOnRecovery(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		post()
 		now = now.Add(10 * time.Second)
+		serverClock(t, srv).set(now)
 	}
 	if got := refusals(); len(got) != 1 {
 		t.Fatalf("60 identical refusals logged %d lines, want 1: %q", len(got), got)
@@ -97,12 +99,14 @@ func TestLineMetaDiscoveryRefusalLogsOnceAnHourAndOnRecovery(t *testing.T) {
 	// Still refused an hour after the line was logged: one reminder, counting
 	// what it held back.
 	now = now.Add(time.Hour)
+	serverClock(t, srv).set(now)
 	post()
 	got := refusals()
 	if len(got) != 2 || !strings.Contains(got[1], "(59 more since 2026-10-03T07:00:00Z)") {
 		t.Fatalf("hourly reminder = %q", got)
 	}
 	now = now.Add(10 * time.Second)
+	serverClock(t, srv).set(now)
 	post()
 	if n := len(refusals()); n != 2 {
 		t.Fatalf("a post after the reminder logged again: %d lines", n)
@@ -121,6 +125,7 @@ func TestLineMetaDiscoveryRefusalLogsOnceAnHourAndOnRecovery(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		post()
 		now = now.Add(10 * time.Second)
+		serverClock(t, srv).set(now)
 	}
 	if got := logs.linesWith("no longer refused"); len(got) != 1 || got[0] != "linemeta: queue sync for node-a: no longer refused" {
 		t.Fatalf("recovery lines = %q, want one", got)
@@ -148,7 +153,7 @@ func TestLineMetaRefusalLogDecision(t *testing.T) {
 	}
 	srv := newLinemetaTestServer(t, st)
 	now := time.Date(2026, 10, 3, 4, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	logs := &lockedLog{}
 	srv.logger = log.New(logs, "", 0)
 	refuse := func(nodeID, lost string) {
@@ -177,17 +182,20 @@ func TestLineMetaRefusalLogDecision(t *testing.T) {
 	}
 
 	now = now.Add(lineMetaRefusalRelog - time.Second)
+	serverClock(t, srv).set(now)
 	refuse("node-a", "chain.downstream_node on hub.json")
 	if n := count("node-a would drop chain.downstream_node"); n != 2 {
 		t.Fatalf("logged again before the hour: %d", n)
 	}
 	now = now.Add(time.Second)
+	serverClock(t, srv).set(now)
 	refuse("node-a", "chain.downstream_node on hub.json")
 	if got := logs.linesWith("node-a would drop chain.downstream_node"); len(got) != 3 || !strings.Contains(got[2], "(1 more since 2026-10-03T04:00:00Z)") {
 		t.Fatalf("hourly line = %q", got)
 	}
 	// Quiet again for the next hour, measured from that line.
 	now = now.Add(30 * time.Minute)
+	serverClock(t, srv).set(now)
 	refuse("node-a", "chain.downstream_node on hub.json")
 	if n := count("node-a would drop chain.downstream_node"); n != 3 {
 		t.Fatalf("logged again within the new hour: %d", n)
@@ -200,7 +208,7 @@ func TestNodeDeleteForgetsLineMetaSyncState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}

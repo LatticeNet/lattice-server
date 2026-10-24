@@ -207,7 +207,7 @@ func TestSubstoreBindShareServesTheBoundPlan(t *testing.T) {
 	// A body revalidated against an unmoved snapshot is extended, and its
 	// quota header is still the identity's, not the snapshot's.
 	later := env.now.Add(subscriptionCacheTTL + time.Minute)
-	env.srv.now = func() time.Time { return later }
+	serverClock(t, env.srv).set(later)
 	env.srv.singboxInvMu.Lock()
 	for nodeID, inv := range env.srv.singboxInv {
 		inv.At = later

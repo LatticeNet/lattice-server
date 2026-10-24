@@ -29,7 +29,7 @@ func TestNewRejectsInvalidPluginRuntimePoolBeforePluginArtifacts(t *testing.T) {
 	cacheDir := t.TempDir()
 	runtimeDir := filepath.Join(t.TempDir(), "runtime-not-created")
 	bad := &plugin.SystemPoolConfig{Size: 0, MaxOverflow: 0, StartTimeout: time.Second, MaxUses: 1, MaxAge: time.Minute}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		PluginDir: pluginDir, PluginBundleCacheDir: cacheDir, PluginRuntimeDir: runtimeDir, PluginRuntimePool: bad,
 	})

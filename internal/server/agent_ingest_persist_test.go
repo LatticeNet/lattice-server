@@ -35,7 +35,7 @@ func openIngestFixture(t *testing.T, dir string) ingestFixture {
 	if err := st.EnableRuntimeBoltHotStore(filepath.Join(dir, "state-hot.db")); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func singBoxLivenessEpisodeAcrossRestart(t *testing.T, crash bool) {
 
 	base := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
 	at := base
-	f.srv.now = func() time.Time { return at }
+	serverClock(t, f.srv).set(at)
 	notices := captureTypedNotices(f.srv)
 	writes := watchStateFile(t, f.statePath())
 
@@ -230,6 +230,7 @@ func singBoxLivenessEpisodeAcrossRestart(t *testing.T, crash bool) {
 	expectWrites("first report", 1)
 	for i := 1; i <= 30; i++ {
 		at = base.Add(time.Duration(i) * 10 * time.Second)
+		serverClock(t, f.srv).set(at)
 		report(f.handler, true)
 	}
 	expectWrites("30 identical running reports", 0)
@@ -237,9 +238,11 @@ func singBoxLivenessEpisodeAcrossRestart(t *testing.T, crash bool) {
 	// Down: the transition is written at once, the notice waits for the hold.
 	downAt := base.Add(310 * time.Second)
 	at = downAt
+	serverClock(t, f.srv).set(at)
 	report(f.handler, false)
 	expectWrites("running to down", 1)
 	for at = downAt.Add(10 * time.Second); at.Sub(downAt) < serviceDownHold; at = at.Add(10 * time.Second) {
+		serverClock(t, f.srv).set(at)
 		report(f.handler, false)
 	}
 	expectWrites("down inside the hold", 0)
@@ -248,11 +251,13 @@ func singBoxLivenessEpisodeAcrossRestart(t *testing.T, crash bool) {
 	// The hold elapses: one notice, and its bookkeeping is written.
 	notifiedAt := downAt.Add(serviceDownHold)
 	at = notifiedAt
+	serverClock(t, f.srv).set(at)
 	report(f.handler, false)
 	expectWrites("hold elapsed", 1)
 	expectNotices("hold elapsed", EventServiceDown)
 	for i := 1; i <= 6; i++ {
 		at = notifiedAt.Add(time.Duration(i) * 10 * time.Second)
+		serverClock(t, f.srv).set(at)
 		report(f.handler, false)
 	}
 	expectWrites("still down after the notice", 0)
@@ -279,7 +284,8 @@ func singBoxLivenessEpisodeAcrossRestart(t *testing.T, crash bool) {
 		t.Fatalf("received_at after restart is %s, want %s", rec.ReceivedAt, wantReceivedAt)
 	}
 	at = lastSeenDown.Add(10 * time.Second)
-	restarted.srv.now = func() time.Time { return at }
+	serverClock(t, f.srv).set(at)
+	serverClock(t, restarted.srv).set(at)
 	notices = captureTypedNotices(restarted.srv)
 	current = restarted.srv
 	writes = watchStateFile(t, restarted.statePath())
@@ -289,6 +295,8 @@ func singBoxLivenessEpisodeAcrossRestart(t *testing.T, crash bool) {
 	expectNotices("first down report after restart")
 
 	at = at.Add(10 * time.Second)
+	serverClock(t, f.srv).set(at)
+	serverClock(t, restarted.srv).set(at)
 	report(restarted.handler, true)
 	expectWrites("down to running", 1)
 	expectNotices("down to running", EventServiceRecovered)
@@ -345,13 +353,15 @@ func TestReenrolledNodeDoesNotInheritLivenessEpisode(t *testing.T) {
 	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
 	base := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
 	at := base
-	f.srv.now = func() time.Time { return at }
+	serverClock(t, f.srv).set(at)
 	notices := captureTypedNotices(f.srv)
 
 	postLiveness(t, f.handler, token, true, at)
 	at = base.Add(10 * time.Second)
+	serverClock(t, f.srv).set(at)
 	postLiveness(t, f.handler, token, false, at)
 	at = base.Add(10*time.Second + serviceDownHold)
+	serverClock(t, f.srv).set(at)
 	postLiveness(t, f.handler, token, false, at)
 	f.srv.sendOwedAlerts(f.srv.now())
 	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceDown {
@@ -366,6 +376,7 @@ func TestReenrolledNodeDoesNotInheritLivenessEpisode(t *testing.T) {
 
 	reenrolledAt := base.Add(time.Hour)
 	at = reenrolledAt
+	serverClock(t, f.srv).set(at)
 	postLiveness(t, f.handler, token, false, at)
 	rec, ok := f.st.SingBoxLivenessRecord("node-a")
 	if !ok || !rec.StateSince.Equal(reenrolledAt) || !rec.ProblemSince.Equal(reenrolledAt) || !rec.NotifiedDownAt.IsZero() {
@@ -376,6 +387,7 @@ func TestReenrolledNodeDoesNotInheritLivenessEpisode(t *testing.T) {
 		t.Fatalf("a fresh outage was announced before the hold: %+v", *notices)
 	}
 	at = reenrolledAt.Add(serviceDownHold)
+	serverClock(t, f.srv).set(at)
 	postLiveness(t, f.handler, token, false, at)
 	f.srv.sendOwedAlerts(f.srv.now())
 	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceDown {
@@ -383,6 +395,7 @@ func TestReenrolledNodeDoesNotInheritLivenessEpisode(t *testing.T) {
 	}
 	*notices = nil
 	at = at.Add(10 * time.Second)
+	serverClock(t, f.srv).set(at)
 	postLiveness(t, f.handler, token, true, at)
 	f.srv.sendOwedAlerts(f.srv.now())
 	if len(*notices) != 1 || (*notices)[0].eventType != EventServiceRecovered {
@@ -403,7 +416,7 @@ func TestCrashRestartKeepsLivenessAsFreshAsTheLastBeat(t *testing.T) {
 	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
 	base := time.Date(2026, 10, 1, 17, 0, 0, 0, time.UTC)
 	at := base
-	f.srv.now = func() time.Time { return at }
+	serverClock(t, f.srv).set(at)
 
 	postLiveness(t, f.handler, token, false, at)
 	// Twelve minutes of down reports: past the evidence window, inside the
@@ -411,6 +424,7 @@ func TestCrashRestartKeepsLivenessAsFreshAsTheLastBeat(t *testing.T) {
 	// once the hold elapses; everything after it stays in memory.
 	writes := watchStateFile(t, f.statePath())
 	for at = base.Add(10 * time.Second); at.Sub(base) <= 12*time.Minute; at = at.Add(10 * time.Second) {
+		serverClock(t, f.srv).set(at)
 		postLiveness(t, f.handler, token, false, at)
 		writes.check()
 	}

@@ -75,7 +75,7 @@ func TestTaskViewExposesAttemptsAndLeaseAge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestTaskViewExposesAttemptsAndLeaseAge(t *testing.T) {
 	}
 
 	// 41 minutes into a one-hour lease the task is running on its first try.
-	srv.now = func() time.Time { return time.Now().UTC().Add(41 * time.Minute) }
+	serverClock(t, srv).runAhead(41 * time.Minute)
 	cases := []struct {
 		id             string
 		wantStatus     string
@@ -139,7 +139,7 @@ func TestTaskViewExposesAttemptsAndLeaseAge(t *testing.T) {
 	}
 
 	// Two hours in, the lease is past timeout and margin: nothing is running.
-	srv.now = func() time.Time { return time.Now().UTC().Add(2 * time.Hour) }
+	serverClock(t, srv).runAhead(2 * time.Hour)
 	view := views()["task-leased"]
 	if view.Status != store.TaskStalled || view.TargetStates["n1"].Status != store.TaskStalled {
 		t.Fatalf("dead lease should read stalled: %+v", view)

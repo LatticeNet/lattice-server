@@ -283,7 +283,7 @@ func TestSyncLineClientTemplatesFromTheReadModel(t *testing.T) {
 	srv := newLinemetaTestServer(t, st)
 	t0 := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
 	now := t0
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	if err := st.UpsertNode(model.Node{ID: "node-t", Name: "Node T"}); err != nil {
 		t.Fatal(err)
 	}
@@ -328,6 +328,7 @@ func TestSyncLineClientTemplatesFromTheReadModel(t *testing.T) {
 
 	// An identical report a minute later writes nothing.
 	now = t0.Add(time.Minute)
+	serverClock(t, srv).set(now)
 	inv.At = now
 	report(inv)
 	if err := srv.syncLineClientTemplates(now); err != nil {
@@ -339,6 +340,7 @@ func TestSyncLineClientTemplatesFromTheReadModel(t *testing.T) {
 
 	// The node goes quiet: its inventory ages out, its templates stay.
 	now = t0.Add(time.Hour)
+	serverClock(t, srv).set(now)
 	if err := srv.syncLineClientTemplates(now); err != nil {
 		t.Fatal(err)
 	}
@@ -354,7 +356,7 @@ func TestSyncLineClientTemplatesFromTheReadModel(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv = newLinemetaTestServer(t, reopened)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	if len(reopened.LineClientTemplates()) != 2 {
 		t.Fatal("templates must survive a restart")
 	}
@@ -380,25 +382,25 @@ func TestSyncLineClientTemplatesFromTheReadModel(t *testing.T) {
 
 // templateSyncFixture is a server with one live node, node-t, whose sing-box
 // inventory the test sets with report.
-func templateSyncFixture(t *testing.T) (srv *Server, st *store.Store, now *time.Time, report func(...model.SingBoxNode)) {
+func templateSyncFixture(t *testing.T) (srv *Server, st *store.Store, now *testClock, report func(...model.SingBoxNode)) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "state.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	srv = newLinemetaTestServer(t, st)
-	clock := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return clock }
+	now = serverClock(t, srv)
+	now.set(time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC))
 	if err := st.UpsertNode(model.Node{ID: "node-t", Name: "Node T"}); err != nil {
 		t.Fatal(err)
 	}
 	report = func(nodes ...model.SingBoxNode) {
 		srv.singboxInvMu.Lock()
-		srv.singboxInv = map[string]model.SingBoxInventory{"node-t": templateInventory(clock, nodes...)}
+		srv.singboxInv = map[string]model.SingBoxInventory{"node-t": templateInventory(now.now(), nodes...)}
 		srv.singboxInvMu.Unlock()
 		srv.invalidateLineReadModel()
 	}
-	return srv, st, &clock, report
+	return srv, st, now, report
 }
 
 func realityTemplateNode(host string) model.SingBoxNode {
@@ -417,7 +419,7 @@ func TestSyncLineClientTemplatesKeepsALineItCannotRebuild(t *testing.T) {
 	srv, st, now, report := templateSyncFixture(t)
 	good := realityTemplateNode("203.0.113.5")
 	report(good)
-	if err := srv.syncLineClientTemplates(*now); err != nil {
+	if err := srv.syncLineClientTemplates(now.now()); err != nil {
 		t.Fatal(err)
 	}
 	line := findLine(t, srv.buildLineGroups(), "node-t", "reality-443")
@@ -431,20 +433,20 @@ func TestSyncLineClientTemplatesKeepsALineItCannotRebuild(t *testing.T) {
 		"unparseable":        "vless://%zz",
 		"credential in path": "vless://" + tmplOwnerUUID + "@203.0.113.5:443?security=tls&type=ws&path=/" + tmplOwnerUUID,
 	} {
-		*now = now.Add(time.Minute)
+		now.advance(time.Minute)
 		broken := good
 		broken.ShareURL = shareURL
 		report(broken)
-		if err := srv.syncLineClientTemplates(*now); err != nil {
+		if err := srv.syncLineClientTemplates(now.now()); err != nil {
 			t.Fatal(err)
 		}
 		if got, ok := st.LineClientTemplate(line.LineHashID); !ok || !reflect.DeepEqual(got, want) {
 			t.Fatalf("%s: a listed line must keep its template: %+v ok=%v", name, got, ok)
 		}
 	}
-	*now = now.Add(time.Minute)
+	now.advance(time.Minute)
 	report()
-	if err := srv.syncLineClientTemplates(*now); err != nil {
+	if err := srv.syncLineClientTemplates(now.now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := st.LineClientTemplate(line.LineHashID); ok {
@@ -457,9 +459,9 @@ func TestSyncLineClientTemplatesKeepsALineItCannotRebuild(t *testing.T) {
 // while a change that holds lands one sync later.
 func TestSyncLineClientTemplatesConfirmsAChangeBeforeStoringIt(t *testing.T) {
 	srv, st, now, report := templateSyncFixture(t)
-	t0 := *now
+	t0 := now.now()
 	report(realityTemplateNode("203.0.113.5"))
-	if err := srv.syncLineClientTemplates(*now); err != nil {
+	if err := srv.syncLineClientTemplates(now.now()); err != nil {
 		t.Fatal(err)
 	}
 	line := findLine(t, srv.buildLineGroups(), "node-t", "reality-443")
@@ -477,9 +479,9 @@ func TestSyncLineClientTemplatesConfirmsAChangeBeforeStoringIt(t *testing.T) {
 	// Flapping: v6, v4, v6, v4. No sync sees the same new value twice in a
 	// row, so nothing is written.
 	for i, host := range []string{"2001:db8::5", "203.0.113.5", "2001:db8::5", "203.0.113.5"} {
-		*now = now.Add(time.Minute)
+		now.advance(time.Minute)
 		report(realityTemplateNode(host))
-		if err := srv.syncLineClientTemplates(*now); err != nil {
+		if err := srv.syncLineClientTemplates(now.now()); err != nil {
 			t.Fatal(err)
 		}
 		if got := stored(); got.Host != "203.0.113.5" || !got.UpdatedAt.Equal(t0) {
@@ -487,19 +489,19 @@ func TestSyncLineClientTemplatesConfirmsAChangeBeforeStoringIt(t *testing.T) {
 		}
 	}
 	// A change that holds: held at the first sighting, stored at the second.
-	*now = now.Add(time.Minute)
+	now.advance(time.Minute)
 	report(realityTemplateNode("198.51.100.7"))
-	if err := srv.syncLineClientTemplates(*now); err != nil {
+	if err := srv.syncLineClientTemplates(now.now()); err != nil {
 		t.Fatal(err)
 	}
 	if got := stored(); got.Host != "203.0.113.5" {
 		t.Fatalf("first sighting of a change must not store it: %+v", got)
 	}
-	*now = now.Add(time.Minute)
-	if err := srv.syncLineClientTemplates(*now); err != nil {
+	now.advance(time.Minute)
+	if err := srv.syncLineClientTemplates(now.now()); err != nil {
 		t.Fatal(err)
 	}
-	if got := stored(); got.Host != "198.51.100.7" || !got.UpdatedAt.Equal(*now) {
+	if got := stored(); got.Host != "198.51.100.7" || !got.UpdatedAt.Equal(now.now()) {
 		t.Fatalf("a change seen twice in a row must be stored: %+v", got)
 	}
 }

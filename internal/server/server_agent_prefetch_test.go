@@ -493,7 +493,7 @@ func TestAgentArtifactByteCacheSharesOneVerifiedCopy(t *testing.T) {
 func TestAgentPrefetchConfigIndexIsShortLived(t *testing.T) {
 	f := newPrefetchFixture(t, 16<<10, true)
 	now := time.Now()
-	f.srv.now = func() time.Time { return now }
+	serverClock(t, f.srv).set(now)
 	if got := f.config(t).AgentUpdate; got.Prefetch == nil {
 		t.Fatal("the open plan must be named")
 	}
@@ -507,6 +507,7 @@ func TestAgentPrefetchConfigIndexIsShortLived(t *testing.T) {
 		t.Fatalf("the route reads fresh and must refuse a closed plan at once, got %d", res.StatusCode)
 	}
 	now = now.Add(agentPrefetchIndexTTL)
+	serverClock(t, f.srv).set(now)
 	if got := f.config(t).AgentUpdate; got.Prefetch != nil || len(got.Keep) != 0 {
 		t.Fatalf("past its TTL the index must be rebuilt: %+v", got)
 	}
@@ -546,7 +547,7 @@ func TestAgentPrefetchFetchesThePlanThatRunsNext(t *testing.T) {
 	if queued, leased := f.st.ApprovalTaskState(f.approval.ID); queued || !leased {
 		t.Fatalf("task %s must be leased now", task.ID)
 	}
-	f.srv.now = func() time.Time { return time.Now().Add(agentPrefetchIndexTTL) }
+	serverClock(t, f.srv).runAhead(agentPrefetchIndexTTL)
 	if got := f.config(t).AgentUpdate; got.Prefetch != nil {
 		t.Fatalf("nothing is fetched while an update runs: %+v", got.Prefetch)
 	}
@@ -565,7 +566,7 @@ func TestAgentPrefetchFetchesThePlanThatRunsNext(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	f.srv.now = func() time.Time { return time.Now().Add(2 * agentPrefetchIndexTTL) }
+	serverClock(t, f.srv).runAhead(2 * agentPrefetchIndexTTL)
 	if got := f.config(t).AgentUpdate; got.Prefetch != nil {
 		t.Fatalf("a leased update anywhere among the open plans stops prefetch: %+v", got.Prefetch)
 	}
@@ -576,7 +577,7 @@ func TestAgentPrefetchFetchesThePlanThatRunsNext(t *testing.T) {
 func TestAgentPrefetchServeAuditsAreFolded(t *testing.T) {
 	f := newPrefetchFixture(t, 16<<10, true)
 	now := time.Now()
-	f.srv.now = func() time.Time { return now }
+	serverClock(t, f.srv).set(now)
 	serves := func() []model.AuditEvent {
 		var out []model.AuditEvent
 		for _, ev := range f.st.AuditEvents() {
@@ -597,6 +598,7 @@ func TestAgentPrefetchServeAuditsAreFolded(t *testing.T) {
 		t.Fatalf("repeats inside a minute must fold into one audit, got %d", len(got))
 	}
 	now = now.Add(time.Minute)
+	serverClock(t, f.srv).set(now)
 	res := f.get(t, prefetchPath(f.ref, "node-a"), f.token, nil)
 	res.Body.Close()
 	// The store lists audit events newest first.
@@ -684,11 +686,11 @@ func TestAgentPrefetchReportIsShownBesideItsApproval(t *testing.T) {
 	if got := shown(); got == nil || got.State != "complete" {
 		t.Fatalf("shown %+v", got)
 	}
-	f.srv.now = func() time.Time { return time.Now().Add(agentPrefetchReportTTL + time.Minute) }
+	serverClock(t, f.srv).runAhead(agentPrefetchReportTTL + time.Minute)
 	if got := shown(); got != nil {
 		t.Fatalf("a report older than its TTL must not be shown: %+v", got)
 	}
-	f.srv.now = time.Now
+	serverClock(t, f.srv).runAhead(0)
 	beat("")
 	if got := shown(); got != nil {
 		t.Fatalf("a beat without a report must clear it: %+v", got)

@@ -110,12 +110,12 @@ func openDegradedFixture(t *testing.T, dir string, history []store.MonitorResult
 	if err := st.EnableRuntimeBoltHotStore(hot); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &degradedFixture{t: t, dir: dir, srv: srv, st: st, clock: &testClock{at: degradedBase}}
-	srv.now = f.clock.now
+	f := &degradedFixture{t: t, dir: dir, srv: srv, st: st, clock: serverClock(t, srv)}
+	f.clock.set(degradedBase)
 	f.sent = captureTypedNotices(srv)
 	t.Cleanup(f.close)
 	for _, n := range []model.Node{

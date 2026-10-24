@@ -48,7 +48,7 @@ func TestNotifyRulesRouteMatchingEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestNotifyRulesFallbackBroadcastWhenNoRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}

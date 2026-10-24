@@ -46,7 +46,7 @@ func goldenSubServer(t *testing.T) (*Server, *store.Store) {
 	s, st := newShareTestServer(t)
 
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	past := now.Add(-time.Hour)
 
 	const pluginID = "latticenet.sub-store"

@@ -48,7 +48,7 @@ func newEvidenceServer(t *testing.T, st *store.Store, logCap int64) evidenceHarn
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ls.Close() })
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts, LogStore: ls})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts, LogStore: ls})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +518,7 @@ func TestRetentionWaitEndsOnAKick(t *testing.T) {
 		t.Fatal(err)
 	}
 	// No background loops, so nothing else takes the kick.
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -47,7 +47,7 @@ func TestPluginInvokeExecutesArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		PluginDir:        pluginRoot,
 		PluginRuntimeDir: t.TempDir(),
@@ -108,7 +108,7 @@ func TestPluginInvokeDoesNotExposeOrAuditRawStderr(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PluginDir: pluginRoot, PluginRuntimeDir: t.TempDir()})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PluginDir: pluginRoot, PluginRuntimeDir: t.TempDir()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestPluginCallFallsBackToRuntimeArtifact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		PluginDir:        pluginRoot,
 		PluginRuntimeDir: t.TempDir(),
@@ -221,7 +221,7 @@ func TestPluginContributionsAndCallGatewayEnforceActionScopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, PluginDir: pluginRoot, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, PluginDir: pluginRoot, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -1190,7 +1190,7 @@ func TestPluginInvokeRefusesNonDiagnosticActions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		PluginDir:        pluginRoot,
 		PluginRuntimeDir: t.TempDir(),
@@ -1414,7 +1414,7 @@ func TestPluginCallServiceErrorKeepsItsMessageAs400(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true,
 		PluginDir:        pluginRoot,
 		PluginRuntimeDir: t.TempDir(),

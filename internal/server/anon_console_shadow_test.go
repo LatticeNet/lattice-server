@@ -19,7 +19,7 @@ func consoleShadowServer(t *testing.T) (*Server, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:                   st,
 		AdminPassword:           testAdminPass,
 		PublicURL:               "https://console.example.com",

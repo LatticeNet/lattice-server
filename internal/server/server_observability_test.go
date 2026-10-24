@@ -102,7 +102,7 @@ func newObservabilityTestServer(t *testing.T, metricsToken string) (http.Handler
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, MetricsToken: metricsToken})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, MetricsToken: metricsToken})
 	if err != nil {
 		t.Fatal(err)
 	}

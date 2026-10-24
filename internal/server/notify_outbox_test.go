@@ -502,7 +502,7 @@ func TestQueuedDigestLineSurvivesACrash(t *testing.T) {
 	if err := st2.EnableRuntimeBoltHotStore(filepath.Join(crashDir, "state-hot.db")); err != nil {
 		t.Fatal(err)
 	}
-	srv2, err := New(Options{Store: st2, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv2, err := newClockedServer(t, Options{Store: st2, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -577,7 +577,7 @@ func TestChannelFailureStoresNoCredential(t *testing.T) {
 	if err := st.EnableRuntimeBoltHotStore(filepath.Join(dir, "state-hot.db")); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -610,32 +610,14 @@ func TestChannelFailureStoresNoCredential(t *testing.T) {
 	}
 }
 
-// testClock is a server clock a test moves by hand.
-type testClock struct {
-	mu sync.Mutex
-	at time.Time
-}
-
-func (c *testClock) now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.at
-}
-
-func (c *testClock) advance(d time.Duration) {
-	c.mu.Lock()
-	c.at = c.at.Add(d)
-	c.mu.Unlock()
-}
-
 // An operator's failed test neither counts toward failing nor starts its
 // window: a test that failed 20 minutes ago followed by one real failure is
 // not a failing channel and pages nobody. The rule itself still holds: three
 // real failures announce it.
 func TestFailedTestDoesNotStartTheFailingWindow(t *testing.T) {
 	srv, _, st := newInventoryServer(t)
-	clock := &testClock{at: time.Date(2026, 10, 3, 9, 0, 0, 0, time.UTC)}
-	srv.now = clock.now
+	clock := serverClock(t, srv)
+	clock.set(time.Date(2026, 10, 3, 9, 0, 0, 0, time.UTC))
 	addNotifyChannel(t, st, "nc-urgent", "Bark urgent")
 	addNotifyChannel(t, st, "nc-info", "Bark info")
 	if err := st.UpsertNotifyRule(model.NotifyRule{ID: "r-urgent", Name: "Urgent", EventTypes: []string{EventNodeOffline}, ChannelIDs: []string{"nc-urgent"}, Enabled: true}); err != nil {

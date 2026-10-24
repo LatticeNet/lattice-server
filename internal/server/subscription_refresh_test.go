@@ -296,7 +296,8 @@ func TestCaptureSubscriptionRefreshAuthorityPanicReleasesGate(t *testing.T) {
 	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s", Raw: "fresh", FetchedAt: stableNow}); err != nil {
 		t.Fatal(err)
 	}
-	s.now = func() time.Time { panic("clock panic canary") }
+	clock := serverClock(t, s)
+	clock.panicHere("clock panic canary")
 	func() {
 		defer func() {
 			if recover() == nil {
@@ -305,7 +306,7 @@ func TestCaptureSubscriptionRefreshAuthorityPanicReleasesGate(t *testing.T) {
 		}()
 		_, _ = s.snapshotFor(context.Background(), "p", "s", false)
 	}()
-	s.now = func() time.Time { return stableNow }
+	clock.set(stableNow)
 	snapshot, err := s.snapshotFor(context.Background(), "p", "s", false)
 	if err != nil || snapshot.Raw != "fresh" {
 		t.Fatalf("plugin gate remained consumed after authority capture panic: %+v err=%v", snapshot, err)
@@ -349,7 +350,7 @@ func TestSnapshotForNeverAuditsLegacyRawDerivedVersion(t *testing.T) {
 func TestSnapshotForRetriesRecentStaleAndClearsOnRecovery(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{PluginID: "p", SubscriptionID: "s1", Raw: "last-good", FetchedAt: now}); err != nil {
 		t.Fatal(err)
 	}
@@ -370,6 +371,7 @@ func TestSnapshotForRetriesRecentStaleAndClearsOnRecovery(t *testing.T) {
 		t.Fatalf("within-window retry = %+v calls=%d err=%v", withinWindow, calls, err)
 	}
 	now = now.Add(subscriptionStaleRetryInterval + time.Second)
+	serverClock(t, s).set(now)
 	recovered, err := s.snapshotFor(context.Background(), "p", "s1", false)
 	if err != nil || recovered.Stale || recovered.Raw != "recovered" || calls != 1 {
 		t.Fatalf("recovery = %+v calls=%d err=%v", recovered, calls, err)
@@ -379,7 +381,7 @@ func TestSnapshotForRetriesRecentStaleAndClearsOnRecovery(t *testing.T) {
 func TestSnapshotForPropagatesStaleAndRecoveryAcrossSourceCaches(t *testing.T) {
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	for _, share := range []model.SubscriptionShare{
 		{ID: "s1", Slug: "one", Token: strings.Repeat("a", 32), Enabled: true, Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}},
 		{ID: "s2", Slug: "two", Token: strings.Repeat("b", 32), Enabled: true, Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "graph"}},
@@ -421,6 +423,7 @@ func TestSnapshotForPropagatesStaleAndRecoveryAcrossSourceCaches(t *testing.T) {
 		return model.SubscriptionSnapshot{Raw: "last-good", Userinfo: "upload=2"}, nil
 	}
 	now = now.Add(subscriptionStaleRetryInterval + time.Second)
+	serverClock(t, s).set(now)
 	if got, err := s.snapshotFor(context.Background(), "p", "graph", false); err != nil || got.Stale {
 		t.Fatalf("recovery = %+v err=%v", got, err)
 	}

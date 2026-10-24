@@ -63,7 +63,7 @@ func TestPluginArmingIsIndependentOfLoadOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := New(Options{
+	if _, err := newClockedServer(t, Options{
 		Store:         st,
 		AdminPassword: testAdminPass,
 		PluginDir:     dir,

@@ -581,7 +581,7 @@ func TestLineChainCompilerUsesImmutableCapturedSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv.replaceAgentCapabilities("node-b", nil)
-	srv.now = func() time.Time { return time.Unix(2_000_000_000, 0).UTC() }
+	serverClock(t, srv).set(time.Unix(2_000_000_000, 0).UTC())
 	second, err := srv.compileLineChainSnapshot(snapshot, lineChainCompileRequest{SourceLineUUID: sourceUUID, TargetLineUUID: targetUUID})
 	if err != nil {
 		t.Fatalf("captured snapshot changed after live capability mutation: %v", err)

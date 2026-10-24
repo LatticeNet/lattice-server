@@ -288,7 +288,7 @@ func usageTestServer(t *testing.T, now time.Time) *Server {
 		t.Fatal(err)
 	}
 	srv := newLinemetaTestServer(t, st)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	return srv
 }
 

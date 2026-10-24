@@ -71,7 +71,7 @@ func getExpiring(t *testing.T, handler http.Handler, req *http.Request) expiring
 func TestExpiringListsEveryKindInDateOrder(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	seedExpiring(t, srv, st)
 	cookies, _ := loginSession(t, handler)
 	req := httptest.NewRequest(http.MethodGet, "/api/expiring", nil)
@@ -152,7 +152,7 @@ func TestExpiringListsEveryKindInDateOrder(t *testing.T) {
 func TestExpiringNamesKindsTheSessionCannotRead(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	seedExpiring(t, srv, st)
 	cookies, csrf := loginSession(t, handler)
 	all := []string{expiringKindMachine, expiringKindVPNUser, expiringKindShare, expiringKindTLS}
@@ -214,7 +214,7 @@ func TestExpiringNamesKindsTheSessionCannotRead(t *testing.T) {
 func TestExpiringCertificatesFollowMonitorVisibility(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	seedExpiring(t, srv, st)
 	// The API creates certificate monitors without nodes today; this one is
 	// stored directly to pin the row rule to the monitors list's predicate.
@@ -255,7 +255,7 @@ func TestExpiringCertificatesFollowMonitorVisibility(t *testing.T) {
 func TestExpiringSubtitlesAreDataAndUsersCarryQuota(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	seedExpiring(t, srv, st)
 	expires := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
 	for _, u := range []VpnUser{

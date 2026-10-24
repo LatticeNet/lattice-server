@@ -20,7 +20,7 @@ type dependsEnv struct {
 	contents map[string]string
 	fetches  map[string]*atomic.Int64
 	paths    map[string]string
-	clock    atomic.Int64
+	clock    *testClock
 }
 
 // dependsFixture shares "fleet-rec" and "provider-rec" with the given
@@ -29,8 +29,8 @@ func dependsFixture(t *testing.T, contents map[string]string) *dependsEnv {
 	t.Helper()
 	s, _ := newShareTestServer(t)
 	e := &dependsEnv{s: s, contents: map[string]string{}, fetches: map[string]*atomic.Int64{}, paths: map[string]string{}}
-	e.clock.Store(time.Unix(1_700_000_000, 0).UTC().UnixNano())
-	s.now = func() time.Time { return time.Unix(0, e.clock.Load()).UTC() }
+	e.clock = serverClock(t, s)
+	e.clock.set(time.Unix(1_700_000_000, 0).UTC())
 	s.subscriptionFetch = func(_ context.Context, _ string, record string) (model.SubscriptionSnapshot, error) {
 		e.mu.Lock()
 		defer e.mu.Unlock()
@@ -90,7 +90,7 @@ func (e *dependsEnv) count(record string) int64 {
 // advance commits a vpn-core write after the pacing interval, so the
 // generation advances at once.
 func (e *dependsEnv) advance() {
-	e.clock.Add(int64(vpnCoreLinkChangeInterval + time.Second))
+	e.clock.advance(vpnCoreLinkChangeInterval + time.Second)
 	e.s.triggerVPNCoreMutation()
 }
 

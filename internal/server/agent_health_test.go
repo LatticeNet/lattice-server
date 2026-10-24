@@ -94,8 +94,8 @@ func TestAgentLoopProblemsReadTheAgentsClock(t *testing.T) {
 // reports zero clears it.
 func TestDroppedMonitorResultsDegradeOnlyWhileRising(t *testing.T) {
 	srv, _, _ := newInventoryServer(t)
-	clock := &testClock{at: time.Date(2026, 10, 3, 1, 0, 0, 0, time.UTC)}
-	srv.now = clock.now
+	clock := serverClock(t, srv)
+	clock.set(time.Date(2026, 10, 3, 1, 0, 0, 0, time.UTC))
 	started := clock.now().Add(-time.Hour)
 	beatWith := func(dropped uint64, startedAt time.Time) agentHealthRecord {
 		srv.noteAgentHealth("n1", &model.AgentHealth{StartedAt: startedAt, CycleCompletedAt: clock.now(), MonitorResultsDropped: dropped}, clock.now())
@@ -167,8 +167,8 @@ func TestAgentLoopHealthDegradesNodeStatus(t *testing.T) {
 	f := openNotifyFixture(t, dir)
 	// Beats stamp LastSeen with the wall clock, so this server's clock is the
 	// wall clock too; the agent's runs an hour behind.
-	clock := &testClock{at: time.Now().UTC()}
-	f.srv.now = clock.now
+	clock := serverClock(t, f.srv)
+	clock.set(time.Now().UTC())
 	cookies, csrf := loginSession(t, f.handler)
 	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "n-loop", "loop")
 	oldToken := enrollNamedNodeToken(t, f.handler, cookies, csrf, "n-old", "old")

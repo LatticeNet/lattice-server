@@ -20,7 +20,7 @@ func knockToolHandler(t *testing.T, publicURL string) http.Handler {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, PublicURL: publicURL, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, PublicURL: publicURL, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestKnockRevealOffersThisControlPlaneFirst(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, PublicURL: "https://lattice.example.com/", DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, PublicURL: "https://lattice.example.com/", DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}

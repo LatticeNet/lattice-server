@@ -55,7 +55,7 @@ func newSubStoreSvcHarness(t testing.TB) *subStoreSvcHarness {
 		t.Fatal(err)
 	}
 	sink := &subStoreSvcLog{}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, PublicURL: "https://lattice.example/",
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, PublicURL: "https://lattice.example/",
 		DisableRenewalScheduler: true, Logger: log.New(sink, "", 0)})
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +65,7 @@ func newSubStoreSvcHarness(t testing.TB) *subStoreSvcHarness {
 	// active; no plugin is installed here, so stand in for the lifecycle.
 	srv.pluginRPC.SetOwnerActive(func(string) bool { return true })
 	now := time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	if err := st.UpsertSubscriptionSnapshot(model.SubscriptionSnapshot{
 		PluginID: subStorePluginID, SubscriptionID: "rec", Raw: "nodes", FetchedAt: now,
 	}); err != nil {

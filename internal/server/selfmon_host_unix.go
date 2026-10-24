@@ -37,7 +37,7 @@ func volumeBytes(path string) (total, free, used uint64, ok bool) {
 	if err := syscall.Statfs(path, &st); err != nil {
 		return 0, 0, 0, false
 	}
-	bsize := uint64(st.Bsize)
+	bsize := uint64(st.Bsize) // #nosec G115 -- statfs reports a positive block size
 	total = uint64(st.Blocks) * bsize
 	free = uint64(st.Bavail) * bsize
 	used = (uint64(st.Blocks) - uint64(st.Bfree)) * bsize

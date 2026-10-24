@@ -192,20 +192,20 @@ func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 // GuardURL rejects outbound HTTP(S) targets that point at local, private,
 // link-local, multicast, unspecified, or cloud metadata addresses.
 func GuardURL(raw string) error {
-	u, err := http.NewRequest(http.MethodGet, raw, nil)
+	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("invalid url: %w", err)
 	}
-	if u.URL.Scheme != "http" && u.URL.Scheme != "https" {
-		return fmt.Errorf("unsupported scheme %q", u.URL.Scheme)
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported scheme %q", u.Scheme)
 	}
-	host := u.URL.Hostname()
+	host := u.Hostname()
 	if host == "" {
 		return errors.New("missing host")
 	}
-	port := u.URL.Port()
+	port := u.Port()
 	if port == "" {
-		if u.URL.Scheme == "https" {
+		if u.Scheme == "https" {
 			port = "443"
 		} else {
 			port = "80"

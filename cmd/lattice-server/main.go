@@ -421,7 +421,7 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	}
 	d, err := time.ParseDuration(raw)
 	if err != nil {
-		log.Fatalf("invalid %s duration %q: %v", key, raw, err)
+		log.Fatalf("invalid %s duration %q: %v", key, raw, err) // #nosec G706 -- %q quotes the operator's own environment value
 	}
 	return d
 }
@@ -624,7 +624,7 @@ func loadPluginTrust(path string) (plugin.TrustPolicy, error) {
 	if path == "" {
 		return plugin.TrustPolicy{}, nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- the trust policy path is the operator's flag
 	if err != nil {
 		return plugin.TrustPolicy{}, fmt.Errorf("read plugin trust policy: %w", err)
 	}

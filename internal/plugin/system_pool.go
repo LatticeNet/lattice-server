@@ -417,7 +417,7 @@ func newConfiguredSystemPool(size, maxOverflow, maxUses int, maxAge time.Duratio
 		superCtx: ctx, superCancel: cancel, superSignal: make(chan struct{}, 1),
 		superDone: make(chan struct{}), backoffBase: 100 * time.Millisecond,
 		jitterFn: func(delay time.Duration) time.Duration {
-			jitter := time.Duration(rand.Uint64()%21) * delay / 100
+			jitter := time.Duration(rand.Uint64()%21) * delay / 100 // #nosec G404 -- backoff jitter, not a secret
 			return min(30*time.Second, delay+jitter)
 		},
 		waitBackoff: func(ctx context.Context, delay time.Duration) bool {

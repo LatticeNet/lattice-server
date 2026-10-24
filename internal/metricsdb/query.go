@@ -233,7 +233,7 @@ func (db *DB) collect(owner string, names []string, ti int, from, to time.Time, 
 			if len(k) != 12 {
 				continue
 			}
-			if err := decodeRow(v, want, fold(int64(binary.BigEndian.Uint64(k[4:])))); err != nil {
+			if err := decodeRow(v, want, fold(int64(binary.BigEndian.Uint64(k[4:])))); err != nil { // #nosec G115 -- ownerKey writes the time half from a non-negative int64
 				return err
 			}
 		}

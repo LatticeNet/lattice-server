@@ -518,7 +518,7 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 		return s, nil
 	}
 	if !cph.Enabled() {
-		data, readErr := os.ReadFile(path)
+		data, readErr := os.ReadFile(path) // #nosec G304 -- the path is the server's own state path, not request input
 		if readErr == nil && len(data) != 0 {
 			var probe State
 			if err := json.Unmarshal(data, &probe); err != nil {
@@ -546,7 +546,7 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 	// "never checked".
 	openHead, openCount := wal.Head()
 	s.recordAuditWALVerification(audit.Result{Count: openCount, Head: openHead}, walAnchorPath != "", nil, time.Now())
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- the path is the server's own state path, not request input
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
 	}
@@ -698,7 +698,7 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 		return err
 	}
 	if err := syncRuntimeBoltHotState(bs, s.state); err != nil {
-		bs.Close()
+		_ = bs.Close()
 		return err
 	}
 	// Audit is deliberately excluded: from here on bolt owns the log and reads
@@ -706,7 +706,7 @@ func (s *Store) EnableRuntimeBoltHotStore(path string) error {
 	// gigabytes and, on a 3.8 GB host, eventually cost the boot itself.
 	hot, err := bs.ExportStateWithoutAudit()
 	if err != nil {
-		bs.Close()
+		_ = bs.Close()
 		return err
 	}
 	// Whether the file still carries the two domains that just moved. The point
@@ -1517,11 +1517,11 @@ func syncedAtomicWrite(path string, data []byte, perm os.FileMode) error {
 func syncedAtomicWriteStatus(path string, data []byte, perm os.FileMode, syncParentDir func(string) error) (bool, error) {
 	tmp := path + ".tmp"
 	if err := writeSyncedFile(tmp, data, perm); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return false, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return false, err
 	}
 	return true, syncParentDir(filepath.Dir(path))
@@ -1530,16 +1530,16 @@ func syncedAtomicWriteStatus(path string, data []byte, perm os.FileMode, syncPar
 // writeSyncedFile writes data to path (creating/truncating) and fsyncs the file
 // before closing, so its contents are durable on disk.
 func writeSyncedFile(path string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm) // #nosec G304 -- callers pass the server's own state path plus .tmp
 	if err != nil {
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	return f.Close()
@@ -1549,7 +1549,7 @@ func writeSyncedFile(path string, data []byte, perm os.FileMode) error {
 // cannot be opened/synced (rare; some platforms) is reported but non-fatal at
 // the call sites that can tolerate it.
 func syncDir(dir string) error {
-	d, err := os.Open(dir)
+	d, err := os.Open(dir) // #nosec G304 -- the parent directory of the server's own state path
 	if err != nil {
 		return err
 	}

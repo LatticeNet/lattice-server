@@ -158,7 +158,7 @@ func lineUserCredential(u VpnUser, protocol, userName string) (lineUserCredentia
 
 // lineUserCredentialSHA binds the exact payload bytes an approval reviewed.
 func lineUserCredentialSHA(payload lineUserCredentialPayload) (string, error) {
-	raw, err := json.Marshal(payload)
+	raw, err := json.Marshal(payload) // #nosec G117 -- marshaled only to hash the reviewed payload; the bytes stay here
 	if err != nil {
 		return "", err
 	}
@@ -1042,7 +1042,7 @@ func (s *Server) lineUserApplyScript(approval model.Approval) string {
 // adoptedLineUserScript is the apply script for one adopted line-user op:
 // `sb --json user add|del <line> <payload>`, with the payload as JSON.
 func adoptedLineUserScript(op, line string, payload lineUserCredentialPayload) (string, error) {
-	payloadJSON, err := json.Marshal(payload)
+	payloadJSON, err := json.Marshal(payload) // #nosec G117 -- the node needs the credential to apply it; sent on the node channel
 	if err != nil {
 		return "", fmt.Errorf("encode payload: %v", err)
 	}
@@ -1320,7 +1320,7 @@ func lineBindingCredentialState(u VpnUser, b LineBinding, ln Line, lineKnown boo
 
 // lineUserAppliedCredentialBackfill names the one-time migration that fills
 // the applied credential of bindings made before the field existed.
-const lineUserAppliedCredentialBackfill = "vpnuser-applied-credential-v1"
+const lineUserAppliedCredentialBackfill = "vpnuser-applied-credential-v1" // #nosec G101 -- a migration name, not a credential
 
 // backfillLineUserAppliedCredentials fills each binding that has no applied
 // credential from approval history, once per store: the credential hash of

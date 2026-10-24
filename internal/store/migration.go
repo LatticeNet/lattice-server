@@ -22,7 +22,7 @@ func LoadJSONState(path string, cph secret.Cipher) (State, error) {
 		cph = secret.Disabled()
 	}
 	st := emptyState()
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- the path is the server's own state path, not request input
 	if err != nil {
 		return State{}, err
 	}
@@ -82,7 +82,7 @@ func MigrateJSONToBolt(jsonPath, boltPath string, cph secret.Cipher, opts Migrat
 		return err
 	}
 	if err := bs.ImportState(st); err != nil {
-		bs.Close()
+		_ = bs.Close()
 		return err
 	}
 	if err := bs.Close(); err != nil {
@@ -156,7 +156,7 @@ func migrationTempPath(path string) (string, func(), error) {
 	// placeholder in place — os.WriteFile/writeSyncedFile truncates it, and
 	// bbolt initializes an empty file as a fresh database.
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return "", nil, err
 	}
 	return tmp, func() { _ = os.Remove(tmp) }, nil
@@ -203,7 +203,7 @@ func moveExistingTargetAside(target string) (string, error) {
 	}
 	backup := f.Name()
 	if err := f.Close(); err != nil {
-		os.Remove(backup)
+		_ = os.Remove(backup)
 		return "", err
 	}
 	if err := os.Remove(backup); err != nil {

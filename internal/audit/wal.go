@@ -159,13 +159,13 @@ func openWAL(path, anchorPath string) (*WAL, error) {
 		}
 		res = anchored
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600) // #nosec G304 -- the path is the server's own state path plus a fixed suffix
 	if err != nil {
 		return nil, err
 	}
 	fingerprints, err := readWALFingerprints(path)
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, err
 	}
 	return &WAL{f: f, seq: res.Count, head: res.Head, anchorPath: anchorPath, fingerprintByID: fingerprints, writeAnchor: writeAnchor}, nil
@@ -183,7 +183,7 @@ func eventFingerprint(ev model.AuditEvent) ([32]byte, error) {
 }
 
 func readWALFingerprints(path string) (map[string][32]byte, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- the path is the server's own state path plus a fixed suffix
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string][32]byte{}, nil
 	}
@@ -347,7 +347,7 @@ func ReadAnchor(path string) (Anchor, bool, error) {
 // beyond limit and cannot make a sound chain look broken.
 func VerifyPrefixAgainstAnchor(walPath string, limit int64, anchor Anchor, anchored bool) (Result, error) {
 	res := Result{Count: 0, Head: genesisHash}
-	f, err := os.Open(walPath)
+	f, err := os.Open(walPath) // #nosec G304 -- the path is the server's own state path plus a fixed suffix
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 	case err != nil:
@@ -370,7 +370,7 @@ func VerifyPrefixAgainstAnchor(walPath string, limit int64, anchor Anchor, ancho
 }
 
 func verifyWALPath(path string) (Result, error) {
-	existing, err := os.Open(path)
+	existing, err := os.Open(path) // #nosec G304 -- the path is the server's own state path plus a fixed suffix
 	if errors.Is(err, os.ErrNotExist) {
 		return Result{Count: 0, Head: genesisHash}, nil
 	}
@@ -432,7 +432,7 @@ func anchorMismatchError(anchor Anchor, res Result) error {
 }
 
 func readAnchor(path string) (Anchor, bool, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- the path is the server's own state path plus a fixed suffix
 	if errors.Is(err, os.ErrNotExist) {
 		return Anchor{}, false, nil
 	}
@@ -481,38 +481,38 @@ func writeAnchor(path string, anchor Anchor) error {
 	data = append(data, '\n')
 	tmp := path + ".tmp"
 	if err := writeSyncedFile(tmp, data, 0o600); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 	return syncDir(filepath.Dir(path))
 }
 
 func writeSyncedFile(path string, data []byte, perm os.FileMode) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm) // #nosec G304 -- writeAnchor passes the anchor path plus .tmp
 	if err != nil {
 		return err
 	}
 	if err := f.Chmod(perm); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if _, err := f.Write(data); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	return f.Close()
 }
 
 func syncDir(dir string) error {
-	d, err := os.Open(dir)
+	d, err := os.Open(dir) // #nosec G304 -- the parent directory of the anchor path
 	if err != nil {
 		return err
 	}

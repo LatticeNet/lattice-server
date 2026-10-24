@@ -92,11 +92,12 @@ func main() {
 	fmt.Printf("signing payload bytes  : %d\n", len(payload))
 
 	if *write {
-		must(os.WriteFile(*manifestPath, out, 0o644), "write manifest")
+		must(os.WriteFile(*manifestPath, out, 0o644), "write manifest") // #nosec G306 -- a signed manifest is public by design
 		fmt.Printf("wrote %s\n", *manifestPath)
 	} else {
 		fmt.Println("--- canonical manifest (not written; pass -write) ---")
-		os.Stdout.Write(out)
+		_, err := os.Stdout.Write(out)
+		must(err, "print manifest")
 	}
 
 	// End-to-end gate: reproduce the server's load-time verification exactly —

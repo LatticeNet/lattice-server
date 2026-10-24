@@ -77,7 +77,7 @@ func checkManifest(path string) (plugin.Manifest, error) {
 }
 
 func readManifest(path string) (plugin.Manifest, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- the manifest path is this tool's own argument
 	if err != nil {
 		return plugin.Manifest{}, fmt.Errorf("read: %w", err)
 	}

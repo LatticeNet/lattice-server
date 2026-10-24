@@ -655,7 +655,7 @@ func (t *systemWorkerTransport) wait() error {
 	}
 	<-t.readDone
 	<-t.stderrDone
-	t.closePipes()
+	_ = t.closePipes()
 	t.waitMu.Lock()
 	defer t.waitMu.Unlock()
 	return t.waitErr

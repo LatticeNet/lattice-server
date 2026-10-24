@@ -162,7 +162,7 @@ func recordState(tx *sql.Tx, r model.ConnRecord) (existed, wasOpen bool, err err
 	var open int64
 	row := tx.QueryRow(`SELECT open FROM conn_records
 		WHERE node_id = ? AND core_generation = ? AND log_id = ? AND started_at = ?`,
-		r.NodeID, int64(r.CoreGeneration), int64(r.LogID), nanos(r.StartedAt))
+		r.NodeID, counterSQL(r.CoreGeneration), int64(r.LogID), nanos(r.StartedAt))
 	switch err := row.Scan(&open); err {
 	case nil:
 		return true, open != 0, nil
@@ -190,7 +190,7 @@ func (s *Store) insertRecord(tx *sql.Tx, r model.ConnRecord) error {
 		return err
 	}
 	_, err = tx.Exec(insertRecordSQL,
-		r.NodeID, int64(r.CoreGeneration), int64(r.LogID), nanos(r.StartedAt),
+		r.NodeID, counterSQL(r.CoreGeneration), int64(r.LogID), nanos(r.StartedAt),
 		r.LineUUID, r.LineHashID, r.InboundTag, r.InboundType,
 		r.UserName, r.UserID, r.UserKind,
 		r.Network, r.SrcIP, int64(r.SrcPort), r.DstHost, r.DstIP, int64(r.DstPort),
@@ -208,7 +208,7 @@ func (s *Store) insertRecord(tx *sql.Tx, r model.ConnRecord) error {
 func replaceRecordSessions(tx *sql.Tx, r model.ConnRecord) error {
 	if _, err := tx.Exec(`DELETE FROM conn_record_sessions
 		WHERE node_id = ? AND core_generation = ? AND log_id = ? AND started_at = ?`,
-		r.NodeID, int64(r.CoreGeneration), int64(r.LogID), nanos(r.StartedAt)); err != nil {
+		r.NodeID, counterSQL(r.CoreGeneration), int64(r.LogID), nanos(r.StartedAt)); err != nil {
 		return err
 	}
 	for _, id := range r.SessionIDs {
@@ -217,7 +217,7 @@ func replaceRecordSessions(tx *sql.Tx, r model.ConnRecord) error {
 		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO conn_record_sessions
 			(session_id, started_at, node_id, core_generation, log_id) VALUES (?, ?, ?, ?, ?)`,
-			id, nanos(r.StartedAt), r.NodeID, int64(r.CoreGeneration), int64(r.LogID)); err != nil {
+			id, nanos(r.StartedAt), r.NodeID, counterSQL(r.CoreGeneration), int64(r.LogID)); err != nil {
 			return err
 		}
 	}
@@ -395,7 +395,7 @@ func (s *Store) AppendLines(ls []model.TraceLine) (int, error) {
 			(session_id, node_id, seq, at, level, log_id, tag, message, raw, dedupe_key)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (session_id, dedupe_key) DO NOTHING`,
-			l.SessionID, l.NodeID, int64(l.Seq), nanos(at), l.Level, int64(l.LogID), l.Tag, message, raw, dedupe)
+			l.SessionID, l.NodeID, counterSQL(l.Seq), nanos(at), l.Level, int64(l.LogID), l.Tag, message, raw, dedupe)
 		if err != nil {
 			return 0, fmt.Errorf("tracestore: append lines: %w", err)
 		}
@@ -479,7 +479,7 @@ func (s *Store) Reattribute(key model.ConnRecordKey, startedAt time.Time, to mod
 	)
 	row := tx.QueryRow(`SELECT open, bytes_known, upload, download, close_reason, user_id, line_uuid
 		FROM conn_records WHERE node_id = ? AND core_generation = ? AND log_id = ? AND started_at = ?`,
-		key.NodeID, int64(key.CoreGeneration), int64(key.LogID), nanos(startedAt))
+		key.NodeID, counterSQL(key.CoreGeneration), int64(key.LogID), nanos(startedAt))
 	if err := row.Scan(&open, &bytesKnown, &upload, &download, &closeReason, &oldUser, &oldLine); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
@@ -491,7 +491,7 @@ func (s *Store) Reattribute(key model.ConnRecordKey, startedAt time.Time, to mod
 		SET user_id = ?, user_kind = ?, line_uuid = ?, line_hash_id = ?
 		WHERE node_id = ? AND core_generation = ? AND log_id = ? AND started_at = ?`,
 		to.UserID, to.UserKind, to.LineUUID, to.LineHashID,
-		key.NodeID, int64(key.CoreGeneration), int64(key.LogID), nanos(startedAt)); err != nil {
+		key.NodeID, counterSQL(key.CoreGeneration), int64(key.LogID), nanos(startedAt)); err != nil {
 		return fmt.Errorf("tracestore: reattribute: %w", err)
 	}
 

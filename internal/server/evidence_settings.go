@@ -131,7 +131,7 @@ func (s *Server) effectiveEvidenceSettings() (cfg model.EvidenceSettings, stored
 	}
 	rawCap := int64(logstore.DefaultMaxSourceBytes)
 	if s.logStore != nil {
-		rawCap = int64(s.logStore.SourceBytesCap())
+		rawCap = int64(s.logStore.SourceBytesCap()) // #nosec G115 -- SetSourceBytesCap stores only a positive int64
 	} else if env := logstore.EnvMaxSourceBytes(os.Getenv(envLogMaxSourceBytes)); env > 0 {
 		rawCap = env
 	}

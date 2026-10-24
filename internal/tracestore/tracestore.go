@@ -164,11 +164,11 @@ func Open(path string, cipher secret.Cipher, opts Options) (*Store, error) {
 	// and any later chmod. SQLite copies this mode onto the -wal and -shm
 	// sidecars it creates, so setting it once here covers all three.
 	if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600) // #nosec G304 -- the trace database path is the server's own data dir
 		if err != nil {
 			return nil, fmt.Errorf("tracestore: create %s: %w", path, err)
 		}
-		f.Close()
+		_ = f.Close()
 	}
 	db, err := sql.Open("sqlite", dsn(path))
 	if err != nil {
@@ -182,13 +182,13 @@ func Open(path string, cipher secret.Cipher, opts Options) (*Store, error) {
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(8)
 	if err := db.Ping(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("tracestore: open %s: %w", path, err)
 	}
 	s := &Store{db: db, cipher: cipher, path: path}
 	s.SetLimits(opts)
 	if err := migrate(db); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	var mode int
@@ -329,6 +329,15 @@ func (s *Store) unseal(v string) (string, error) {
 // that ordering, range scans and the keyset cursor are all plain integer
 // comparisons.
 func nanos(t time.Time) int64 { return t.UTC().UnixNano() }
+
+// counterSQL encodes a uint64 counter (a core generation, a line sequence) for
+// an SQLite INTEGER, which is a signed 64-bit value. The bit pattern is kept,
+// so counterFromSQL reads back the value written; a counter would need 2^63
+// steps before it sorted as negative.
+func counterSQL(v uint64) int64 { return int64(v) } // #nosec G115 -- a bit-preserving round trip with counterFromSQL
+
+// counterFromSQL decodes a counter counterSQL stored.
+func counterFromSQL(v int64) uint64 { return uint64(v) } // #nosec G115 -- the inverse of counterSQL
 
 // nullNanos encodes an optional timestamp. The zero time becomes NULL rather
 // than an integer, so a connection that never ended reads back as a zero

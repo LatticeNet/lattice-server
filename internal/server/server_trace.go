@@ -262,7 +262,7 @@ func (s *Server) handleTraceLines(w http.ResponseWriter, r *http.Request, p prin
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	lines, err := s.traceStore.QueryLines(sessionID, uint64(afterSeq), limit)
+	lines, err := s.traceStore.QueryLines(sessionID, uint64(afterSeq), limit) // #nosec G115 -- intParam rejects negative values
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -280,7 +280,7 @@ func (s *Server) handleTraceLines(w http.ResponseWriter, r *http.Request, p prin
 	// The cursor never goes backwards. A quiet interval returns no lines, and
 	// reporting next_seq=0 there would send the client back to the beginning
 	// and re-deliver everything it already has. Floor it at what was asked for.
-	next := uint64(afterSeq)
+	next := uint64(afterSeq) // #nosec G115 -- intParam rejects negative values
 	for _, l := range lines {
 		if l.Seq > next {
 			next = l.Seq

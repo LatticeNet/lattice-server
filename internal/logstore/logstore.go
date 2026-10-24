@@ -85,7 +85,7 @@ func Open(path string, cipher secret.Cipher, maxSourceBytes int64) (*Store, erro
 		_, e := tx.CreateBucketIfNotExists([]byte(metaBucketName))
 		return e
 	}); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, fmt.Errorf("logstore: init: %w", err)
 	}
 	cap_ := uint64(DefaultMaxSourceBytes)

@@ -258,3 +258,37 @@ func TestNinetyDaysReadsTheHourTier(t *testing.T) {
 		}
 	}
 }
+
+// A range that starts before the epoch reads the same rows as one that starts
+// at it. No row predates 1970, and the time half of a row key sorts as the
+// number only from zero up, so an earlier start must not seek past the rows.
+func TestQueryFromBeforeTheEpochReadsTheRolledTier(t *testing.T) {
+	db, c, _ := openTest(t, Options{})
+	end := t0.Add(72 * time.Hour)
+	for at := t0; at.Before(end); at = at.Add(time.Hour) {
+		c.Set(at)
+		mustWrite(t, db, at, gauge("cp", "x", 1))
+	}
+	c.Set(end)
+	observed := func(from time.Time) (uint32, string) {
+		t.Helper()
+		res, err := db.Query("cp", nil, from, end, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n uint32
+		for _, s := range res.Series {
+			for _, p := range s.Points {
+				n += p.Gauge.Count
+			}
+		}
+		return n, res.Tier.Name
+	}
+	atEpoch, tier := observed(time.Unix(0, 0))
+	if tier != "1d" || atEpoch != 72 {
+		t.Fatalf("from the epoch: %d observations from tier %s, want all 72 from 1d", atEpoch, tier)
+	}
+	if before, _ := observed(time.Unix(-1, 0)); before != atEpoch {
+		t.Fatalf("from one second before the epoch: %d observations, want %d", before, atEpoch)
+	}
+}

@@ -3,7 +3,7 @@ package auth
 import (
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha1"
+	"crypto/sha1" // #nosec G505 -- RFC 6238 TOTP is HMAC-SHA1, which authenticator apps expect
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base32"
@@ -45,7 +45,7 @@ func TOTPCodeAt(secret string, t time.Time) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return hotp(key, uint64(t.Unix())/totpPeriodSecs), nil
+	return hotp(key, uint64(t.Unix())/totpPeriodSecs), nil // #nosec G115 -- t is a wall-clock instant after 1970
 }
 
 // ValidateTOTP reports whether code matches secret at time t, tolerating one
@@ -71,7 +71,7 @@ func ValidateTOTPStep(secret, code string, t time.Time) (uint64, bool) {
 	if err != nil || len(key) == 0 {
 		return 0, false
 	}
-	counter := uint64(t.Unix()) / totpPeriodSecs
+	counter := uint64(t.Unix()) / totpPeriodSecs // #nosec G115 -- t is a wall-clock instant after 1970
 	steps := []uint64{counter, counter + 1}
 	if counter > 0 {
 		steps = append(steps, counter-1)

@@ -703,7 +703,7 @@ func lineChainApplyScript(compiled lineChainCompiledArtifact) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("encode line-chain fixture: %w", err)
 		}
-		if err := os.WriteFile(fixturePath, append(fixtureRaw, '\n'), 0o600); err != nil {
+		if err := os.WriteFile(fixturePath, append(fixtureRaw, '\n'), 0o600); err != nil { // #nosec G703 -- the fixture path is the operator's LATTICE_LINECHAIN_FIXTURE_OUT test hook
 			return "", fmt.Errorf("write line-chain fixture: %w", err)
 		}
 	}

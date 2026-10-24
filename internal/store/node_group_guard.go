@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"time"
 
@@ -383,4 +384,65 @@ func guardRulesReferenceGroup(rules []model.GuardRule, groupID string) bool {
 		}
 	}
 	return false
+}
+
+// GuardPlan is one node's share of a batch NetGuard plan: its binding carrying
+// the new plan anchor, as read when the plan was made, and the approval that
+// carries the plan.
+type GuardPlan struct {
+	Binding  model.NodeGuardBinding
+	Approval model.Approval
+}
+
+// GuardPlanConflictError names the node whose binding moved between the
+// batch's read and its write.
+type GuardPlanConflictError struct {
+	NodeID string
+}
+
+func (e *GuardPlanConflictError) Error() string {
+	return fmt.Sprintf("guard binding of node %s changed while the batch was planned", e.NodeID)
+}
+
+func (e *GuardPlanConflictError) Unwrap() error { return ErrGuardVersionConflict }
+
+// CommitGuardPlans writes a batch plan's anchors and approvals in one commit,
+// all of them or none. A binding whose version moved since it was read fails
+// the whole batch with a GuardPlanConflictError naming its node, and a failed
+// save leaves the live state as it was, so a batch never leaves some of its
+// approvals behind. It returns the approvals as stored. committed is true
+// once the whole batch is in, even when err then reports that the parent
+// directory sync failed (degraded durability, as persistState reports it).
+func (s *Store) CommitGuardPlans(plans []GuardPlan) (stored []model.Approval, committed bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	staged := s.state
+	staged.GuardBindings = maps.Clone(s.state.GuardBindings)
+	staged.Approvals = maps.Clone(s.state.Approvals)
+	out := make([]model.Approval, 0, len(plans))
+	for _, plan := range plans {
+		binding := plan.Binding
+		existing, ok := staged.GuardBindings[binding.NodeID]
+		if !ok || existing.Version != binding.Version {
+			return nil, false, &GuardPlanConflictError{NodeID: binding.NodeID}
+		}
+		binding.CreatedAt = existing.CreatedAt
+		binding.Version++
+		binding.UpdatedAt = now
+		staged.GuardBindings[binding.NodeID] = cloneNodeGuardBinding(binding)
+		approval := plan.Approval
+		approval.UpdatedAt = now
+		if approval.CreatedAt.IsZero() {
+			approval.CreatedAt = now
+		}
+		staged.Approvals[approval.ID] = approval
+		out = append(out, approval)
+	}
+	committed, err = s.persistState(s.jsonPersistStateFrom(staged))
+	if !committed {
+		return nil, false, err
+	}
+	s.state = staged
+	return out, true, err
 }

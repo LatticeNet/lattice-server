@@ -485,3 +485,63 @@ func TestApprovalsListHidesFirewallPlansThatReachUnreadableNodes(t *testing.T) {
 		}
 	}
 }
+
+// A batch plan is written all or none. When the second node's binding moves
+// after its plan was made and before the batch is written, no node's plan is
+// written, and the answer names that node and why; the next batch, with
+// nothing moving, plans both.
+func TestNodeGroupPlanWritesNothingWhenTheSecondNodeFails(t *testing.T) {
+	srv, handler, st := newInventoryServer(t)
+	cookies, csrf := loginSession(t, handler)
+	adoptGuardNode(t, handler, st, cookies, csrf, "node-a", "Node A")
+	adoptGuardNode(t, handler, st, cookies, csrf, "node-b", "Node B")
+	if _, err := st.UpsertSecurityGroup(webSecurityGroup); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertGroup(model.Group{ID: "grp_web", Name: "web", Members: []string{"node-a", "node-b"}}); err != nil {
+		t.Fatal(err)
+	}
+	bindNodeGroup(t, handler, cookies, csrf, "grp_web", 0, "sg-web")
+	before := len(st.Approvals())
+	anchorA, _ := st.NodeGuardBinding("node-a")
+
+	var planned []string
+	srv.nodeGroupPlanHook = func(nodeID string) {
+		planned = append(planned, nodeID)
+		if len(planned) != 2 {
+			return
+		}
+		binding, _ := st.NodeGuardBinding(nodeID)
+		binding.LastError = "written by another request"
+		if _, err := st.UpsertNodeGuardBinding(binding); err != nil {
+			t.Error(err)
+		}
+	}
+	res := doJSON(t, handler, http.MethodPost, "/api/netguard/node-group-bindings/plan", `{}`, cookies, csrf)
+	body := readBody(t, res)
+	if res.StatusCode != http.StatusConflict || !strings.Contains(body, `node \"Node B\" (node-b)`) || !strings.Contains(body, "no plan in the batch was written") {
+		t.Fatalf("batch with node-b moved = %d %s, want 409 naming node-b", res.StatusCode, body)
+	}
+	if strings.Join(planned, ",") != "node-a,node-b" {
+		t.Fatalf("planned %v, want node-a then node-b", planned)
+	}
+	if n := len(st.Approvals()); n != before {
+		t.Fatalf("a failed batch left %d approvals behind", n-before)
+	}
+	if binding, _ := st.NodeGuardBinding("node-a"); binding.LastPlanSHA != anchorA.LastPlanSHA || binding.Version != anchorA.Version {
+		t.Fatalf("a failed batch moved node-a's anchor: %+v, was %+v", binding, anchorA)
+	}
+
+	srv.nodeGroupPlanHook = nil
+	out := planNodeGroups(t, handler, cookies, csrf, `{}`)
+	if len(out.Affected) != 2 {
+		t.Fatalf("the next batch should plan both nodes: %+v", out)
+	}
+	for _, node := range out.Affected {
+		approval, ok := st.Approval(node.ApprovalID)
+		binding, _ := st.NodeGuardBinding(node.NodeID)
+		if !ok || approval.Status != model.ApprovalPending || binding.LastPlanSHA != node.PlanSHA || approvalPlanSHA(approval) != node.PlanSHA {
+			t.Fatalf("%s: approval %+v and anchor %q must match the plan %q", node.NodeID, approval, binding.LastPlanSHA, node.PlanSHA)
+		}
+	}
+}

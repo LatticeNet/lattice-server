@@ -433,6 +433,9 @@ type Server struct {
 	// for them.
 	notifyDeliveries notifyInflight
 	// outbox drains the stored notification outbox; see notify_outbox.go.
+	// nodeGroupPlanHook (tests only) runs after the node-group batch plan
+	// has made a node's plan and before the batch is written.
+	nodeGroupPlanHook func(nodeID string)
 	// heldWithdrawalHook (tests only) runs between the decision to withdraw
 	// a held incident message and its record, with incidentMu held.
 	outbox             notifyOutboxRunner

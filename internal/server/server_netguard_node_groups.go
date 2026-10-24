@@ -271,6 +271,8 @@ func (s *Server) handleNetGuardNodeGroupPlan(w http.ResponseWriter, r *http.Requ
 	}
 
 	affected := []nodeGroupPlanNode{}
+	// plans[i] is affected[i]'s anchor and approval, written together below.
+	plans := []store.GuardPlan{}
 	unchanged := []nodeGroupPlanSkipped{}
 	conflicts := []nodeGroupPlanSkipped{}
 	inactive := []nodeGroupPlanSkipped{}
@@ -340,19 +342,6 @@ func (s *Server) handleNetGuardNodeGroupPlan(w http.ResponseWriter, r *http.Requ
 		planned := input.Binding
 		planned.LastPlanSHA = approvalPlanSHA(approval)
 		planned.LastError = ""
-		if _, err := s.store.UpsertNodeGuardBinding(planned); err != nil {
-			if errors.Is(err, store.ErrGuardVersionConflict) {
-				conflict("its NetGuard binding changed while planning; plan again", nil)
-				continue
-			}
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		approval, err = s.submitApproval(r.Context(), approval)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
 		node := nodeGroupPlanNode{NodeID: nodeID, NodeName: names[nodeID], ApprovalID: approval.ID, PlanSHA: planned.LastPlanSHA,
 			Added: []nodeGroupPlanGroup{}, Removed: []nodeGroupPlanGroup{}, Order: []nodeGroupPlanGroup{}, Findings: findings}
 		for _, d := range added {
@@ -368,14 +357,47 @@ func (s *Server) handleNetGuardNodeGroupPlan(w http.ResponseWriter, r *http.Requ
 		for _, d := range derivedNow {
 			node.Order = append(node.Order, planGroup(d))
 		}
-		if netguard.Blocking(findings) {
-			lockoutAccepted++
-			s.recordPrincipalAudit(p, model.AuditEvent{
-				ID: id.New("audit"), NodeID: nodeID, Action: "netguard.lockout_risk.accepted", Scope: "netguard:admin",
-				Metadata: map[string]string{"node_id": nodeID, "approval_id": approval.ID},
-			})
-		}
+		plans = append(plans, store.GuardPlan{Binding: planned, Approval: approval})
 		affected = append(affected, node)
+		if s.nodeGroupPlanHook != nil {
+			s.nodeGroupPlanHook(nodeID)
+		}
+	}
+
+	// The batch is written in one commit, every anchor and approval or none,
+	// so a failure on one node never leaves the others' plans behind.
+	if len(plans) > 0 {
+		stored, committed, err := s.store.CommitGuardPlans(plans)
+		if !committed {
+			var moved *store.GuardPlanConflictError
+			if errors.As(err, &moved) {
+				label := moved.NodeID
+				if name := names[moved.NodeID]; name != "" {
+					label = fmt.Sprintf("%q (%s)", name, moved.NodeID)
+				}
+				writeError(w, http.StatusConflict, versionConflict(fmt.Errorf(
+					"node %s: its NetGuard binding changed while the batch was planned, so no plan in the batch was written; plan again", label)))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if err != nil {
+			// The whole batch is in; answering an error would invite a retry
+			// that plans every node again.
+			s.logger.Printf("netguard node-group plan committed with degraded durability: %v", err)
+		}
+		for i, approval := range stored {
+			approval = s.evaluateApprovalAutoRules(r.Context(), approval)
+			affected[i].ApprovalID = approval.ID
+			if netguard.Blocking(affected[i].Findings) {
+				lockoutAccepted++
+				s.recordPrincipalAudit(p, model.AuditEvent{
+					ID: id.New("audit"), NodeID: approval.NodeID, Action: "netguard.lockout_risk.accepted", Scope: "netguard:admin",
+					Metadata: map[string]string{"node_id": approval.NodeID, "approval_id": approval.ID},
+				})
+			}
+		}
 	}
 
 	// Unmanaged members: the binding is inactive there, and nothing is

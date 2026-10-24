@@ -108,7 +108,9 @@ func SanitizeRedirect(p string) string {
 	if p == "" || !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") {
 		return "/"
 	}
-	if strings.ContainsAny(p, "\\\r\n") {
+	// A browser strips tab and newline before it parses a URL, so "/\t/host"
+	// would land on another origin. Refuse every ASCII control character.
+	if strings.ContainsFunc(p, func(r rune) bool { return r == '\\' || r < 0x20 || r == 0x7f }) {
 		return "/"
 	}
 	return p

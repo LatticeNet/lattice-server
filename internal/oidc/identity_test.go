@@ -202,6 +202,11 @@ func TestSanitizeRedirect(t *testing.T) {
 		"javascript:alert(1)": "/", // no leading slash
 		"/path\ninjection":    "/", // control char
 		"/path\\back":         "/", // backslash
+		// A browser strips tab and newline from a URL before parsing it, so a
+		// tab between the slashes would leave a protocol-relative URL.
+		"/\t/evil.com":   "/",
+		"/\x00/evil.com": "/",
+		"/\x7f/evil.com": "/",
 	}
 	for in, want := range cases {
 		if got := SanitizeRedirect(in); got != want {

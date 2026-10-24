@@ -479,7 +479,14 @@ type WriteResult struct {
 	NewlyRefused []RefusedSeries `json:"-"`
 }
 
+// ownerKey is an owner's row key at unix seconds. The big-endian time sorts
+// as the number only from zero up, so an instant before the epoch, which no
+// row carries, becomes the epoch: a range that starts earlier then seeks to
+// the owner's first row instead of past its last.
 func ownerKey(owner uint32, unix int64) []byte {
+	if unix < 0 {
+		unix = 0
+	}
 	k := make([]byte, 12)
 	binary.BigEndian.PutUint32(k[:4], owner)
 	binary.BigEndian.PutUint64(k[4:], uint64(unix))

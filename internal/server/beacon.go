@@ -339,10 +339,10 @@ func rotateBeaconEpoch(t *store.BeaconTarget, now time.Time) {
 }
 
 // beaconCurrentSources are the sources that use target's beacon now: the
-// path set's candidates for it, the sources of every enabled auto check
-// definition whose target set holds it, and every source of an enabled
-// operator beacon check naming it, less nodes that are gone, disabled, or
-// whose agent does not run the beacon client.
+// candidates planned names for it (beaconPlanned: the path set's and every
+// enabled auto check definition's whose target set holds it) and every
+// source of an enabled operator beacon check naming it, less nodes that are
+// gone, disabled, or whose agent does not run the beacon client.
 func (s *Server) beaconCurrentSources(target string, planned latencyPlan, monitors []model.Monitor, nodes map[string]model.Node) map[string]bool {
 	out := map[string]bool{}
 	add := func(sourceID string) {
@@ -353,9 +353,6 @@ func (s *Server) beaconCurrentSources(target string, planned latencyPlan, monito
 		out[sourceID] = true
 	}
 	for _, sourceID := range planned.beaconCandidates[target] {
-		add(sourceID)
-	}
-	for _, sourceID := range s.checkBeaconCandidates(target, nodes) {
 		add(sourceID)
 	}
 	targets := monitorTargets{nodes: nodes}
@@ -402,7 +399,7 @@ func (s *Server) agentBeaconConfig(node model.Node, now time.Time) *model.AgentB
 	for _, n := range s.store.Nodes() {
 		nodes[n.ID] = n
 	}
-	planned := s.pathPlanned(now)
+	planned := s.beaconPlanned(now, nodes)
 	monitors := s.store.Monitors()
 	out := &model.AgentBeaconConfig{SourceID: ids[node.ID]}
 
@@ -568,7 +565,7 @@ func (s *Server) syncBeaconReach(now time.Time) {
 	for _, n := range s.store.Nodes() {
 		nodes[n.ID] = n
 	}
-	planned := s.pathPlanned(now)
+	planned := s.beaconPlanned(now, nodes)
 	monitors := s.store.Monitors()
 	var desired []model.Monitor
 	ids := make([]string, 0, len(targets))
@@ -708,12 +705,32 @@ func randomBeaconPort() (int, error) {
 	}
 }
 
-// checkBeaconCandidates are the sources of every enabled auto check
-// definition that measures target, less its excluded pairs: an auto pair
-// takes the beacon only once the target's applied plan approves its source,
-// so a node.beacon plan for the target approves them, as it did the path
-// set's auto sources (design 29 D12, design 32 R1).
-func (s *Server) checkBeaconCandidates(target string, nodes map[string]model.Node) []string {
+// beaconPlanned is the path set's plan with the beacon candidates of the
+// enabled auto check definitions added, each definition's sets resolved once
+// for every target the caller walks. The cached plan is not changed.
+func (s *Server) beaconPlanned(now time.Time, nodes map[string]model.Node) latencyPlan {
+	planned := s.pathPlanned(now)
+	checks := s.checkBeaconCandidates(nodes)
+	if len(checks) == 0 {
+		return planned
+	}
+	merged := make(map[string][]string, len(planned.beaconCandidates)+len(checks))
+	for target, sources := range planned.beaconCandidates {
+		merged[target] = sources
+	}
+	for target, sources := range checks {
+		merged[target] = append(slices.Clone(merged[target]), sources...)
+	}
+	planned.beaconCandidates = merged
+	return planned
+}
+
+// checkBeaconCandidates are, per target node, the sources of every enabled
+// auto check definition that measures it, less its excluded pairs: an auto
+// pair takes the beacon only once the target's applied plan approves its
+// source, so a node.beacon plan for the target approves them, as it did the
+// path set's auto sources (design 29 D12, design 32 R1).
+func (s *Server) checkBeaconCandidates(nodes map[string]model.Node) map[string][]string {
 	var defs []model.CheckDefinition
 	for _, def := range s.store.CheckDefinitions() {
 		if def.Enabled && def.Type == model.CheckMethodAuto {
@@ -728,14 +745,14 @@ func (s *Server) checkBeaconCandidates(target string, nodes map[string]model.Nod
 		list = append(list, n)
 	}
 	groupList := s.store.Groups()
-	var out []string
+	out := map[string][]string{}
 	for _, def := range defs {
-		if !slices.Contains(groups.ResolveTargets(def.Targets, list, groupList), target) {
-			continue
-		}
-		for _, sourceID := range groups.ResolveTargets(def.Sources, list, groupList) {
-			if sourceID != target && !slices.Contains(def.ExcludedPairs, model.LatencyPair{Source: sourceID, Target: target}) {
-				out = append(out, sourceID)
+		sources := groups.ResolveTargets(def.Sources, list, groupList)
+		for _, target := range groups.ResolveTargets(def.Targets, list, groupList) {
+			for _, sourceID := range sources {
+				if sourceID != target && !slices.Contains(def.ExcludedPairs, model.LatencyPair{Source: sourceID, Target: target}) {
+					out[target] = append(out[target], sourceID)
+				}
 			}
 		}
 	}

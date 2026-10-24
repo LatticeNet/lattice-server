@@ -5302,6 +5302,10 @@ func cloneGroup(g model.Group) model.Group {
 // cloneGroupPolicy deep-copies a group policy's Rules (and each rule's Ports)
 // so persisted state and returned values never share a backing array.
 func cloneGroupPolicy(p model.GroupNetPolicy) model.GroupNetPolicy {
+	if p.Scope != nil {
+		scope := p.TargetScope()
+		p.Scope = &scope
+	}
 	if p.Rules != nil {
 		rules := make([]model.GroupNetRule, len(p.Rules))
 		for i, r := range p.Rules {

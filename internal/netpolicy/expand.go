@@ -4,12 +4,27 @@ import (
 	"sort"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/groups"
 )
 
-// ExpandGroupPolicies materializes group-scoped policies into one per-node
-// model.NetPolicy per node covered by any policy's scope group. A rule whose
-// remote is a group (NetRefGroup) fans out to one node-ref rule per resolved
-// remote member, so the UNCHANGED per-node compiler never sees a group ref.
+// PolicyTargets resolves every policy's target selector (its TargetScope:
+// the stored scope, or the one-group selector scope_group_id stands for)
+// against the fleet, keyed by policy ID. Disabled policies are resolved too,
+// because callers that ask what a policy reaches ask regardless of state.
+func PolicyTargets(policies []model.GroupNetPolicy, nodes []model.Node, groupList []model.Group) map[string][]string {
+	out := make(map[string][]string, len(policies))
+	for _, gp := range policies {
+		out[gp.ID] = groups.ResolveTargets(gp.TargetScope(), nodes, groupList)
+	}
+	return out
+}
+
+// ExpandGroupPolicies materializes outbound policies into one per-node
+// model.NetPolicy per node any enabled policy targets. targets maps a policy
+// ID to its resolved target nodes (PolicyTargets), so one node, several nodes,
+// groups and the whole fleet all expand the same way. A rule whose remote is a
+// group (NetRefGroup) fans out to one node-ref rule per resolved remote member,
+// so the UNCHANGED per-node compiler never sees a group ref.
 //
 // Policies apply in (Priority, ID) order; within a policy, rule order is
 // preserved. resolved maps a group ID to its resolved member node IDs (as
@@ -19,7 +34,7 @@ import (
 // ID. Because they contain CONCRETE node refs, the compiled plan SHA changes
 // whenever membership changes — closing the plan-staleness gap by construction
 // (a node joining/leaving a remote group changes the rule set, hence the SHA).
-func ExpandGroupPolicies(policies []model.GroupNetPolicy, resolved map[string][]string) map[string]model.NetPolicy {
+func ExpandGroupPolicies(policies []model.GroupNetPolicy, targets map[string][]string, resolved map[string][]string) map[string]model.NetPolicy {
 	sorted := append([]model.GroupNetPolicy(nil), policies...)
 	sort.Slice(sorted, func(i, j int) bool {
 		if sorted[i].Priority != sorted[j].Priority {
@@ -33,7 +48,7 @@ func ExpandGroupPolicies(policies []model.GroupNetPolicy, resolved map[string][]
 		if !gp.Enabled {
 			continue
 		}
-		for _, target := range resolved[gp.ScopeGroupID] {
+		for _, target := range targets[gp.ID] {
 			rules := expandRulesForTarget(gp.Rules, target, resolved)
 			if len(rules) == 0 {
 				continue

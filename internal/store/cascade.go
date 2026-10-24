@@ -35,8 +35,11 @@ type NodeCascadeReport struct {
 	// NetPeerRulesStripped / GroupPolicyRulesStripped count node-reference rules
 	// removed from OTHER nodes' net policies and from group policies (SHARED:
 	// strip the dangling Remote.NodeID rule, keep the owner's policy).
-	NetPeerRulesStripped        int `json:"net_peer_rules_stripped"`
-	GroupPolicyRulesStripped    int `json:"group_policy_rules_stripped"`
+	NetPeerRulesStripped     int `json:"net_peer_rules_stripped"`
+	GroupPolicyRulesStripped int `json:"group_policy_rules_stripped"`
+	// GroupPolicyScopesStripped counts outbound policies whose target selector
+	// named the node, as a target or an exclusion (SHARED: strip, keep).
+	GroupPolicyScopesStripped   int `json:"group_policy_scopes_stripped"`
 	GeoRoutingStripped          int `json:"geo_routing_stripped"` // SHARED: stripped, kept
 	GeoRoutingDeleted           int `json:"geo_routing_deleted"`  // became empty -> deleted
 	AgentUpdatePolicies         int `json:"agent_update_policies"`
@@ -452,6 +455,26 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 			}
 			gp.Rules = kept
 			s.state.GroupPolicies[key] = gp
+		}
+	}
+
+	// Step 7c: the node inside outbound policy target selectors. A stored
+	// selector is resolved against the live fleet, so a gone node already
+	// drops out of every target; stripping it keeps a deleted id from coming
+	// back as a target if a node with the same id enrolls later. The policy is
+	// kept even when its last explicit node goes: it then targets nothing,
+	// which the console shows, and the operator retargets or deletes it.
+	for key, gp := range s.state.GroupPolicies {
+		if gp.Scope == nil || (!contains(gp.Scope.Nodes, nodeID) && !contains(gp.Scope.Exclude, nodeID)) {
+			continue
+		}
+		report.GroupPolicyScopesStripped++
+		if mutate {
+			clone := cloneGroupPolicy(gp)
+			clone.Scope.Nodes = withoutString(clone.Scope.Nodes, nodeID)
+			clone.Scope.Exclude = withoutString(clone.Scope.Exclude, nodeID)
+			clone.ScopeGroupID = ScopeGroupAlias(*clone.Scope)
+			s.state.GroupPolicies[key] = clone
 		}
 	}
 

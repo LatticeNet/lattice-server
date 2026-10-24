@@ -9,20 +9,22 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-// TestGroupPolicyWritesConfinedToGroupReach pins the follow-up disposition of
-// finding E (2026-09-01 multi-operator audit). The first fix refused every
-// node-restricted token from group policy writes, the same rule the no-node
-// objects (capability gates, SSO providers, notify routing) use. But a group
-// policy names its blast radius, the members of its scope group, so the
-// confinement model can do better than a ban: a confined token may define and
-// delete policy for a group it fully reaches, and is refused the moment the
-// group resolves to any node outside its allowlist. This is the reach rule the
-// enroll-time group join and group membership edits already apply.
+// TestGroupPolicyGroupTargetsNeedAnUnrestrictedPrincipal pins the current
+// disposition of finding E (2026-09-01 multi-operator audit). The first fix
+// refused every node-restricted token from group policy writes; the follow-up
+// let a confined token define and delete policy for a group it fully reached
+// at write time. Design 32 replaced that reach rule: a stored group selector
+// is expanded at plan time by whoever plans, the fleet-wide plan an
+// unrestricted operator runs applies a confined author's group policy to
+// every node the group resolves to then, and a selector-backed group grows on
+// a tag or geo change with no write that could carry a reach check. So a
+// group target, even one fully in reach today, needs an unrestricted
+// principal, and a confined token targets explicit nodes instead
+// (TestOutboundPolicyRestrictedPrincipalScope covers that half).
 //
-// Without the reach check the confined upsert against the spanning group
-// returns 200 and the policy lands, which is the regression this test exists
-// to catch.
-func TestGroupPolicyWritesConfinedToGroupReach(t *testing.T) {
+// Without the rule the confined upsert against the in-reach group returns
+// 200, which is the regression this test exists to catch.
+func TestGroupPolicyGroupTargetsNeedAnUnrestrictedPrincipal(t *testing.T) {
 	handler, st := newTestServer(t)
 	st.UpsertNode(model.Node{ID: "node-a", Name: "allowed"})
 	st.UpsertNode(model.Node{ID: "node-b", Name: "denied"})
@@ -55,38 +57,36 @@ func TestGroupPolicyWritesConfinedToGroupReach(t *testing.T) {
 		return res.StatusCode
 	}
 
-	// A confined token writes freely within its reach.
-	code, inReachID := upsert(confined, "g-in")
+	for _, groupID := range []string{"g-in", "g-span"} {
+		if code, _ := upsert(confined, groupID); code != http.StatusForbidden {
+			t.Fatalf("confined token must be refused a group target (%s), got %d", groupID, code)
+		}
+	}
+	if policies := st.GroupPolicies(); len(policies) != 0 {
+		t.Fatalf("the refused upserts must not land, found %d policies", len(policies))
+	}
+
+	// An unrestricted token with the same scopes proceeds, on either group.
+	code, inID := upsert(unrestricted, "g-in")
 	if code != http.StatusOK {
-		t.Fatalf("confined token must define policy for a group it fully reaches, got %d", code)
+		t.Fatalf("unrestricted token must define the in-reach group policy, got %d", code)
 	}
-
-	// The same token is refused the moment the group spans past the allowlist.
-	if code, _ := upsert(confined, "g-span"); code != http.StatusForbidden {
-		t.Fatalf("confined token must be refused on a group spanning node-b, got %d", code)
-	}
-	if policies := st.GroupPolicies(); len(policies) != 1 {
-		t.Fatalf("the refused upsert must not land, found %d policies", len(policies))
-	}
-
-	// An unrestricted token with the same scopes proceeds.
 	code, spanID := upsert(unrestricted, "g-span")
 	if code != http.StatusOK {
 		t.Fatalf("unrestricted token must define the spanning policy, got %d", code)
 	}
 
-	// Delete follows the same reach rule.
-	if code := del(confined, spanID); code != http.StatusForbidden {
-		t.Fatalf("confined token must not delete policy for a group spanning node-b, got %d", code)
-	}
-	if _, ok := st.GroupPolicy(spanID); !ok {
-		t.Fatal("the refused delete must not land")
-	}
-	if code := del(confined, inReachID); code != http.StatusOK {
-		t.Fatalf("confined token must delete its in-reach policy, got %d", code)
-	}
-	if code := del(unrestricted, spanID); code != http.StatusOK {
-		t.Fatalf("unrestricted token must delete the spanning policy, got %d", code)
+	// Delete follows the same rule.
+	for _, policyID := range []string{inID, spanID} {
+		if code := del(confined, policyID); code != http.StatusForbidden {
+			t.Fatalf("confined token must not delete a group policy, got %d", code)
+		}
+		if _, ok := st.GroupPolicy(policyID); !ok {
+			t.Fatal("the refused delete must not land")
+		}
+		if code := del(unrestricted, policyID); code != http.StatusOK {
+			t.Fatalf("unrestricted token must delete the group policy, got %d", code)
+		}
 	}
 }
 

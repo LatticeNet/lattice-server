@@ -406,6 +406,10 @@ type Server struct {
 	// and a configuration save never plan against each other's half-written
 	// monitors; see latency_probes.go.
 	latencySync sync.Mutex
+	// checkDefSync serializes every write of check definitions and their
+	// monitors (saves, deletes, forgets, sweeps), so a plan and the write
+	// that follows it see the same definitions. Taken after monitorSaves.
+	checkDefSync sync.Mutex
 	// latencySyncStop stops the latency probe sweep before Close returns, so
 	// no sync writes the store or the audit log after shutdown;
 	// latencySyncLoops counts the sweeps still running.
@@ -1539,6 +1543,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/maintenance-windows", s.withAuth("monitor:read", s.handleMaintenanceWindows))
 	mux.HandleFunc("/api/maintenance-windows/delete", s.withAuth("monitor:admin", s.handleDeleteMaintenanceWindow))
 	mux.HandleFunc("/api/monitors/latency", s.withAuth("", s.handleLatencyProbes))
+	mux.HandleFunc("/api/monitors/definitions", s.withAuth("", s.handleCheckDefinitions))
+	mux.HandleFunc("/api/monitors/definitions/update", s.withAuth("monitor:admin", s.handleCheckDefinitionUpdate))
+	mux.HandleFunc("/api/monitors/definitions/preview", s.withAuth("monitor:admin", s.handleCheckDefinitionPreview))
+	mux.HandleFunc("/api/monitors/definitions/delete", s.withAuth("monitor:admin", s.handleCheckDefinitionDelete))
+	mux.HandleFunc("/api/monitors/definitions/forget", s.withAuth("monitor:admin", s.handleCheckDefinitionForget))
 	mux.HandleFunc("/api/monitors/latency/rollups", s.withAuth("monitor:read", s.handleLatencyRollups))
 	mux.HandleFunc("/api/monitors/latency/series", s.withAuth("monitor:read", s.handleLatencySeries))
 	// Evidence is the job "show me what the nodes actually did": the log store
@@ -1579,12 +1588,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/netpolicy", s.withAuth("", s.handleNetPolicy))
 	mux.HandleFunc("/api/netpolicy/plan", s.withAuth("", s.handleNetPolicyPlan))
 	mux.HandleFunc("/api/netpolicy/delete", s.withAuth("", s.handleDeleteNetPolicy))
+	mux.HandleFunc("/api/netpolicy/convert", s.withAuth("", s.handleNetPolicyConvert))
 	mux.HandleFunc("/api/netpolicy/graph", s.withAuth("", s.handleNetPolicyGraph))
 	mux.HandleFunc("/api/groups", s.withAuth("", s.handleGroups))
 	mux.HandleFunc("/api/groups/delete", s.withAuth("group:admin", s.handleDeleteGroup))
 	mux.HandleFunc("/api/groups/reorder", s.withAuth("group:admin", s.handleReorderGroups))
 	mux.HandleFunc("/api/groups/members", s.withAuth("group:admin", s.handleGroupMembers))
 	mux.HandleFunc("/api/groups/preview", s.withAuth("group:read", s.handleGroupPreview))
+	mux.HandleFunc("/api/groups/used-by", s.withAuth("group:read", s.handleGroupUsedBy))
 	mux.HandleFunc("/api/groups/seed", s.withAuth("group:admin", s.handleGroupSeed))
 	mux.HandleFunc("/api/group-policies", s.withAuth("", s.handleGroupPolicy))
 	mux.HandleFunc("/api/group-policies/delete", s.withAuth("netpolicy:admin", s.handleDeleteGroupPolicy))
@@ -3735,6 +3746,8 @@ func (s *Server) handleNodeDisable(w http.ResponseWriter, r *http.Request, p pri
 		action = "node.disable"
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "node:admin"})
+	// A disabled node takes no part in a check definition's sets.
+	s.resyncCheckDefinitions("node")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "disabled": req.Disabled})
 }
 
@@ -3804,6 +3817,8 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: "node.update", Scope: "node:admin"})
+	// Tags and role decide group selector membership.
+	s.resyncCheckDefinitions("node")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": node.Name, "role": node.Role, "comment": node.Comment, "tags": node.Tags, "agent_source_allowlist": append([]string{}, node.AgentSourceAllowlist...), "inventory": node.Inventory})
 }
 
@@ -5485,6 +5500,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		for i, mon := range visible {
 			views[i].Latest = monitorLatestViews(p, mon, latest[mon.ID])
 		}
+		s.narrowDefinitionMonitorViews(p, visible, views)
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
 		if !s.requireScope(w, p, "monitor:admin") {

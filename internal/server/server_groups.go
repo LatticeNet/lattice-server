@@ -13,6 +13,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/groups"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // Grouping (iter-063, Phase 1). A Group is a first-class organizational entity.
@@ -433,6 +434,9 @@ func (s *Server) upsertGroup(req model.Group, p principal) (groupView, error) {
 		Scope:    "group:admin",
 		Metadata: map[string]string{"group_id": stored.ID, "slug": stored.Slug},
 	})
+	// A check definition that names the group follows its membership now,
+	// not at the next sweep (design 32 D1).
+	s.resyncCheckDefinitions("group")
 
 	// Resolved over the caller's readable nodes, not the fleet. Resolving a
 	// caller-supplied selector over every node and echoing the matches is the
@@ -461,7 +465,13 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request, p pri
 		return
 	}
 	if err := s.store.DeleteGroup(req.ID); err != nil {
-		// Store rejects delete when the group has children or is policy-referenced.
+		// Store rejects delete when the group has children or a policy names
+		// it; the refusal names every user so the operator can act on it.
+		var inUse *store.GroupInUseError
+		if errors.As(err, &inUse) {
+			writeError(w, http.StatusConflict, errors.New(s.groupInUseMessage(p, req.ID, inUse)))
+			return
+		}
 		writeError(w, http.StatusConflict, err)
 		return
 	}
@@ -618,6 +628,7 @@ func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request, p pr
 		Scope:    "group:admin",
 		Metadata: map[string]string{"group_id": stored.ID},
 	})
+	s.resyncCheckDefinitions("group")
 	resolved := groups.ResolveMembers(stored, nodes)
 	rollup, rm := rollupFor(resolved, s.nodeStatusIndex(nodes, s.now()))
 	writeJSON(w, http.StatusOK, toGroupView(p, stored, rm, rollup))

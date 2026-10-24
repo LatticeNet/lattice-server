@@ -126,6 +126,8 @@ func (s *Server) handleNodesGeo(w http.ResponseWriter, r *http.Request, p princi
 			Scope:    "node:admin",
 			Metadata: map[string]string{"node_id": req.NodeID},
 		})
+		// Country and continent decide group selector membership.
+		s.resyncCheckDefinitions("node")
 		writeJSON(w, http.StatusOK, s.toNodeGeoView(node))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))

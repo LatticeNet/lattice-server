@@ -234,6 +234,40 @@ func readBoltLatencyProbes(tx *bolt.Tx) (*model.LatencyProbeConfig, error) {
 	return &cfg, nil
 }
 
+// boltKeyCheckDefinitions holds State.CheckDefinitions in the meta bucket,
+// so the offline migrate round trip keeps them. Like the latency
+// configuration they are operator config written only on an edit; the
+// running server reads them from the JSON state.
+var boltKeyCheckDefinitions = []byte("check_definitions")
+
+func putBoltCheckDefinitions(tx *bolt.Tx, defs map[string]model.CheckDefinition) error {
+	meta := tx.Bucket(boltBucketMeta)
+	if len(defs) == 0 {
+		return meta.Delete(boltKeyCheckDefinitions)
+	}
+	raw, err := json.Marshal(defs)
+	if err != nil {
+		return err
+	}
+	return meta.Put(boltKeyCheckDefinitions, raw)
+}
+
+func readBoltCheckDefinitions(tx *bolt.Tx) (map[string]model.CheckDefinition, error) {
+	out := map[string]model.CheckDefinition{}
+	meta := tx.Bucket(boltBucketMeta)
+	if meta == nil {
+		return out, nil
+	}
+	raw := meta.Get(boltKeyCheckDefinitions)
+	if len(raw) == 0 {
+		return out, nil
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("decode check definitions: %w", err)
+	}
+	return out, nil
+}
+
 // boltKeyBeacon holds State.Beacon in the meta bucket, so the offline
 // migrate round trip keeps the beacon's source ids, plans and (encrypted)
 // target keys.
@@ -634,6 +668,9 @@ func (bs *BoltStateStore) importState(st State, subscriptionAuthorityInitialized
 		if err := putBoltLatencyProbes(tx, persist.LatencyProbes); err != nil {
 			return err
 		}
+		if err := putBoltCheckDefinitions(tx, persist.CheckDefinitions); err != nil {
+			return err
+		}
 		if err := putBoltMonitorSettings(tx, persist.MonitorSettings); err != nil {
 			return err
 		}
@@ -908,6 +945,9 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		st.LatencyProbes = latency
+		if st.CheckDefinitions, err = readBoltCheckDefinitions(tx); err != nil {
+			return err
+		}
 		monitorSettings, err := readBoltMonitorSettings(tx)
 		if err != nil {
 			return err
@@ -2883,19 +2923,20 @@ func (bs *BoltStateStore) DeleteGroup(id string) error {
 		if err != nil {
 			return err
 		}
-		for _, child := range groups {
-			if child.ParentID == id {
-				return fmt.Errorf("group %q has child group %q; reparent or delete children first", id, child.ID)
-			}
-		}
 		policies, err := listMapValues[model.GroupNetPolicy](tx, boltBucketGroupPolicies)
 		if err != nil {
 			return err
 		}
-		for _, gp := range policies {
-			if gp.ScopeGroupID == id {
-				return fmt.Errorf("group %q is referenced by group policy %q; delete the policy first", id, gp.ID)
-			}
+		defMap, err := readBoltCheckDefinitions(tx)
+		if err != nil {
+			return err
+		}
+		defs := make([]model.CheckDefinition, 0, len(defMap))
+		for _, def := range defMap {
+			defs = append(defs, def)
+		}
+		if err := groupInUse(id, groups, policies, defs); err != nil {
+			return err
 		}
 		return deleteRecord(tx, boltBucketGroups, id)
 	})

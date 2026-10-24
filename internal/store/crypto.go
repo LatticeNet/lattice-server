@@ -175,6 +175,19 @@ func encryptedState(st State, c secret.Cipher) (State, error) {
 	}
 	out.Monitors = monitors
 
+	if st.CheckDefinitions != nil {
+		defs := make(map[string]model.CheckDefinition, len(st.CheckDefinitions))
+		for id, d := range st.CheckDefinitions {
+			headers, err := encryptSecretHeaders("check definition "+id, d.Headers, c)
+			if err != nil {
+				return State{}, err
+			}
+			d.Headers = headers
+			defs[id] = d
+		}
+		out.CheckDefinitions = defs
+	}
+
 	providers := make(map[string]model.OIDCProvider, len(st.OIDCProviders))
 	for id, p := range st.OIDCProviders {
 		enc, err := encryptOIDCProviderRecord(id, p, c)
@@ -416,6 +429,19 @@ func decryptState(st *State, c secret.Cipher) error {
 		st.Monitors = monitors
 	}
 
+	if st.CheckDefinitions != nil {
+		defs := make(map[string]model.CheckDefinition, len(st.CheckDefinitions))
+		for id, d := range st.CheckDefinitions {
+			headers, err := decryptSecretHeaders("check definition "+id, d.Headers, c)
+			if err != nil {
+				return err
+			}
+			d.Headers = headers
+			defs[id] = d
+		}
+		st.CheckDefinitions = defs
+	}
+
 	providers := make(map[string]model.OIDCProvider, len(st.OIDCProviders))
 	for id, p := range st.OIDCProviders {
 		dec, err := decryptOIDCProviderRecord(id, p, c)
@@ -564,6 +590,13 @@ func stateHasEnvelope(st *State) bool {
 	}
 	for _, m := range st.Monitors {
 		for _, h := range m.Headers {
+			if h.Secret && secret.IsEnvelope(h.Value) {
+				return true
+			}
+		}
+	}
+	for _, d := range st.CheckDefinitions {
+		for _, h := range d.Headers {
 			if h.Secret && secret.IsEnvelope(h.Value) {
 				return true
 			}
@@ -816,16 +849,9 @@ func encryptMonitorRecord(id string, m model.Monitor, c secret.Cipher) (model.Mo
 	if !model.MonitorHasSecrets(m) {
 		return m, nil
 	}
-	headers := make([]model.MonitorHeader, len(m.Headers))
-	for i, h := range m.Headers {
-		if h.Secret {
-			ev, err := c.Encrypt(h.Value)
-			if err != nil {
-				return model.Monitor{}, fmt.Errorf("encrypt monitor %s header %s: %w", id, h.Name, err)
-			}
-			h.Value = ev
-		}
-		headers[i] = h
+	headers, err := encryptSecretHeaders("monitor "+id, m.Headers, c)
+	if err != nil {
+		return model.Monitor{}, err
 	}
 	m.Headers = headers
 	return m, nil
@@ -835,22 +861,55 @@ func decryptMonitorRecord(id string, m model.Monitor, c secret.Cipher) (model.Mo
 	if !model.MonitorHasSecrets(m) {
 		return m, nil
 	}
-	headers := make([]model.MonitorHeader, len(m.Headers))
-	for i, h := range m.Headers {
-		if h.Secret {
-			if !c.Enabled() && secret.IsEnvelope(h.Value) {
-				return model.Monitor{}, lostMasterKeyError()
-			}
-			dv, err := c.Decrypt(h.Value)
-			if err != nil {
-				return model.Monitor{}, fmt.Errorf("decrypt monitor %s header %s: %w", id, h.Name, err)
-			}
-			h.Value = dv
-		}
-		headers[i] = h
+	headers, err := decryptSecretHeaders("monitor "+id, m.Headers, c)
+	if err != nil {
+		return model.Monitor{}, err
 	}
 	m.Headers = headers
 	return m, nil
+}
+
+// encryptSecretHeaders encrypts the values of the secret headers in a
+// copy of headers, for a monitor or a check definition (design 32 D1 keeps
+// a definition's secrets as its monitors' are). what names the record in an
+// error.
+func encryptSecretHeaders(what string, headers []model.MonitorHeader, c secret.Cipher) ([]model.MonitorHeader, error) {
+	if len(headers) == 0 {
+		return headers, nil
+	}
+	out := make([]model.MonitorHeader, len(headers))
+	for i, h := range headers {
+		if h.Secret {
+			ev, err := c.Encrypt(h.Value)
+			if err != nil {
+				return nil, fmt.Errorf("encrypt %s header %s: %w", what, h.Name, err)
+			}
+			h.Value = ev
+		}
+		out[i] = h
+	}
+	return out, nil
+}
+
+func decryptSecretHeaders(what string, headers []model.MonitorHeader, c secret.Cipher) ([]model.MonitorHeader, error) {
+	if len(headers) == 0 {
+		return headers, nil
+	}
+	out := make([]model.MonitorHeader, len(headers))
+	for i, h := range headers {
+		if h.Secret {
+			if !c.Enabled() && secret.IsEnvelope(h.Value) {
+				return nil, lostMasterKeyError()
+			}
+			dv, err := c.Decrypt(h.Value)
+			if err != nil {
+				return nil, fmt.Errorf("decrypt %s header %s: %w", what, h.Name, err)
+			}
+			h.Value = dv
+		}
+		out[i] = h
+	}
+	return out, nil
 }
 
 func decryptNotifyRecord(id string, n model.NotifyChannel, c secret.Cipher) (model.NotifyChannel, error) {

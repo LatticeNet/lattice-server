@@ -120,6 +120,10 @@ type State struct {
 	// LatencyProbes is the operator's latency probe configuration
 	// (latency_probes.go), nil until one is saved. Written only on an edit.
 	LatencyProbes *model.LatencyProbeConfig `json:"latency_probes,omitempty"`
+	// CheckDefinitions are the operator's check definitions (design 32 D1,
+	// check_definitions.go), by id. Written only on an edit; the monitors
+	// they expand into live in Monitors.
+	CheckDefinitions map[string]model.CheckDefinition `json:"check_definitions,omitempty"`
 	// MonitorSettings is the operator's monitor history setting
 	// (monitor_settings.go), nil until one is saved. Written only on an edit.
 	MonitorSettings *model.MonitorSettings `json:"monitor_settings,omitempty"`
@@ -951,6 +955,7 @@ func emptyState() State {
 		NotifyChannels:          map[string]model.NotifyChannel{},
 		NotifyRules:             map[string]model.NotifyRule{},
 		NotifyRuleOptions:       map[string]NotifyRuleOptions{},
+		CheckDefinitions:        map[string]model.CheckDefinition{},
 		NotifyChannelOptions:    map[string]NotifyChannelOptions{},
 		ProbeTargets:            map[string]ProbeTarget{},
 		NotifyWebhooks:          map[string]NotifyWebhook{},
@@ -1087,6 +1092,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NotifyRuleOptions == nil {
 		st.NotifyRuleOptions = map[string]NotifyRuleOptions{}
+	}
+	if st.CheckDefinitions == nil {
+		st.CheckDefinitions = map[string]model.CheckDefinition{}
 	}
 	if st.ProbeTargets == nil {
 		st.ProbeTargets = map[string]ProbeTarget{}
@@ -5208,27 +5216,33 @@ func (s *Store) Groups() []model.Group {
 	return out
 }
 
-// DeleteGroup removes a group. It refuses (returns an error) when the group
-// still has child groups (another group's ParentID points at it) or is the
-// scope of any GroupNetPolicy, so deletion cannot orphan a subtree or silently
-// drop an authored policy. Phase 1 surfaces this as an explicit
-// reparent-to-root flow before delete. A missing id is a no-op (idempotent,
-// matching the other Delete* methods).
+// DeleteGroup removes a group. It refuses with a *GroupInUseError when the
+// group still has child groups (another group's ParentID points at it), when
+// any outbound policy names it, as a target or as a rule's remote, or when
+// any check definition names it among its sources or targets, so deletion
+// cannot orphan a subtree or leave a policy or a check naming nothing. Phase 1
+// surfaces this as an explicit reparent-to-root flow before delete. A missing
+// id is a no-op (idempotent, matching the other Delete* methods).
 func (s *Store) DeleteGroup(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.state.Groups[id]; !ok {
 		return nil
 	}
-	for _, child := range s.state.Groups {
-		if child.ParentID == id {
-			return fmt.Errorf("group %q has child group %q; reparent or delete children first", id, child.ID)
-		}
+	all := make([]model.Group, 0, len(s.state.Groups))
+	for _, g := range s.state.Groups {
+		all = append(all, g)
 	}
+	policies := make([]model.GroupNetPolicy, 0, len(s.state.GroupPolicies))
 	for _, gp := range s.state.GroupPolicies {
-		if gp.ScopeGroupID == id {
-			return fmt.Errorf("group %q is referenced by group policy %q; delete the policy first", id, gp.ID)
-		}
+		policies = append(policies, gp)
+	}
+	defs := make([]model.CheckDefinition, 0, len(s.state.CheckDefinitions))
+	for _, def := range s.state.CheckDefinitions {
+		defs = append(defs, def)
+	}
+	if err := groupInUse(id, all, policies, defs); err != nil {
+		return err
 	}
 	delete(s.state.Groups, id)
 	return s.Save()
@@ -5302,6 +5316,10 @@ func cloneGroup(g model.Group) model.Group {
 // cloneGroupPolicy deep-copies a group policy's Rules (and each rule's Ports)
 // so persisted state and returned values never share a backing array.
 func cloneGroupPolicy(p model.GroupNetPolicy) model.GroupNetPolicy {
+	if p.Scope != nil {
+		scope := p.TargetScope()
+		p.Scope = &scope
+	}
 	if p.Rules != nil {
 		rules := make([]model.GroupNetRule, len(p.Rules))
 		for i, r := range p.Rules {

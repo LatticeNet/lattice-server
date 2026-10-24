@@ -2,58 +2,57 @@ package groups
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
 
-// ResolveTargets resolves a target selector (design 32 D5) against the fleet
-// as it is now: the ids of the nodes it selects, sorted and without repeats.
-// A node is selected when sel.All is set, when sel.Nodes names it, or when it
-// is a member of a group sel.Groups names, resolved by ResolveMembers, so a
-// group's selector criteria combine with AND exactly as everywhere else. A
-// node sel.Exclude names is never selected.
-//
-// Only nodes in nodes are returned: an explicit id or a group member with no
-// node record selects nothing, and a group id that names no group
-// contributes nothing. Disabled nodes are returned like any other; whether a
-// disabled node takes part is the caller's decision.
+// ResolveTargets resolves a target selector (design 32 D5) against the fleet.
+// The result is the union of the named nodes, the resolved members of each
+// named group (ResolveMembers; an unknown group contributes nothing) and every
+// node when All is set, minus the nodes in Exclude. Only ids present in nodes
+// survive, so a stale explicit node or pinned group member is dropped. Ids are
+// trimmed; the result is deduplicated and sorted, and never nil.
 func ResolveTargets(sel model.TargetSelector, nodes []model.Node, groups []model.Group) []string {
-	exists := make(map[string]bool, len(nodes))
+	fleet := make(map[string]struct{}, len(nodes))
 	for _, n := range nodes {
-		exists[n.ID] = true
+		fleet[n.ID] = struct{}{}
 	}
-	picked := map[string]bool{}
+	set := make(map[string]struct{})
+	add := func(id string) {
+		id = strings.TrimSpace(id)
+		if _, ok := fleet[id]; ok {
+			set[id] = struct{}{}
+		}
+	}
 	if sel.All {
-		for id := range exists {
-			picked[id] = true
+		for id := range fleet {
+			set[id] = struct{}{}
 		}
 	}
 	for _, id := range sel.Nodes {
-		if exists[id] {
-			picked[id] = true
-		}
+		add(id)
 	}
 	if len(sel.Groups) > 0 {
-		named := make(map[string]bool, len(sel.Groups))
-		for _, id := range sel.Groups {
-			named[id] = true
-		}
+		byID := make(map[string]model.Group, len(groups))
 		for _, g := range groups {
-			if !named[g.ID] {
+			byID[g.ID] = g
+		}
+		for _, gid := range sel.Groups {
+			g, ok := byID[strings.TrimSpace(gid)]
+			if !ok {
 				continue
 			}
 			for _, id := range ResolveMembers(g, nodes) {
-				if exists[id] {
-					picked[id] = true
-				}
+				add(id)
 			}
 		}
 	}
 	for _, id := range sel.Exclude {
-		delete(picked, id)
+		delete(set, strings.TrimSpace(id))
 	}
-	out := make([]string, 0, len(picked))
-	for id := range picked {
+	out := make([]string, 0, len(set))
+	for id := range set {
 		out = append(out, id)
 	}
 	sort.Strings(out)

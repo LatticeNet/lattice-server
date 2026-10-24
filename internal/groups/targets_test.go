@@ -8,36 +8,33 @@ import (
 )
 
 func TestResolveTargets(t *testing.T) {
-	nodes := []model.Node{
-		{ID: "n-jp", Tags: []string{"edge"}, Geo: &model.NodeGeo{Country: "JP"}},
-		{ID: "n-hk", Tags: []string{"edge"}, Geo: &model.NodeGeo{Country: "HK"}},
-		{ID: "n-de", Geo: &model.NodeGeo{Country: "DE"}},
-		{ID: "n-us", Tags: []string{"core"}, Geo: &model.NodeGeo{Country: "US"}},
+	nodes := fixtureNodes()
+	groupList := []model.Group{
+		{ID: "g-prod", Selector: sel(model.GroupSelector{MatchTagsAny: []string{"prod"}})},
+		{ID: "g-pinned", Members: []string{"node_c", "node_gone"}},
 	}
-	groups := []model.Group{
-		// Explicit members, one of them a node that no longer exists.
-		{ID: "grp_pinned", Members: []string{"n-de", "n-gone"}},
-		// A selector whose two criteria combine with AND: edge-tagged
-		// nodes in Asia, which n-us (core) and n-de (Europe) are not.
-		{ID: "grp_asia_edge", Selector: &model.GroupSelector{MatchTagsAny: []string{"edge"}, MatchContinent: []string{"AS"}}},
-	}
-	cases := []struct {
+
+	tests := []struct {
 		name string
 		sel  model.TargetSelector
 		want []string
 	}{
-		{"empty selects nothing", model.TargetSelector{}, []string{}},
-		{"explicit nodes, unknown dropped, repeats folded", model.TargetSelector{Nodes: []string{"n-us", "n-gone", "n-us"}}, []string{"n-us"}},
-		{"group members are existing nodes only", model.TargetSelector{Groups: []string{"grp_pinned"}}, []string{"n-de"}},
-		{"group selector through the resolver", model.TargetSelector{Groups: []string{"grp_asia_edge"}}, []string{"n-hk", "n-jp"}},
-		{"unknown group contributes nothing", model.TargetSelector{Groups: []string{"grp_none"}, Nodes: []string{"n-de"}}, []string{"n-de"}},
-		{"whole fleet", model.TargetSelector{All: true}, []string{"n-de", "n-hk", "n-jp", "n-us"}},
-		{"exclusion wins over every criterion", model.TargetSelector{All: true, Nodes: []string{"n-jp"}, Groups: []string{"grp_asia_edge"}, Exclude: []string{"n-jp", "n-de"}}, []string{"n-hk", "n-us"}},
-		{"union of nodes and groups, sorted", model.TargetSelector{Nodes: []string{"n-us"}, Groups: []string{"grp_pinned", "grp_asia_edge"}}, []string{"n-de", "n-hk", "n-jp", "n-us"}},
+		{name: "empty selector targets nothing", sel: model.TargetSelector{}, want: []string{}},
+		{name: "explicit nodes, sorted and deduped", sel: model.TargetSelector{Nodes: []string{"node_c", "node_a", "node_c"}}, want: []string{"node_a", "node_c"}},
+		{name: "an explicit node not in the fleet is dropped", sel: model.TargetSelector{Nodes: []string{"node_gone", "node_b"}}, want: []string{"node_b"}},
+		{name: "explicit ids are trimmed", sel: model.TargetSelector{Nodes: []string{" node_a "}}, want: []string{"node_a"}},
+		{name: "a group contributes its resolved members", sel: model.TargetSelector{Groups: []string{"g-prod"}}, want: []string{"node_a", "node_b"}},
+		{name: "a stale pinned member of a group is dropped", sel: model.TargetSelector{Groups: []string{"g-pinned"}}, want: []string{"node_c"}},
+		{name: "an unknown group contributes nothing", sel: model.TargetSelector{Groups: []string{"g-missing"}}, want: []string{}},
+		{name: "nodes and groups union", sel: model.TargetSelector{Nodes: []string{"node_d"}, Groups: []string{"g-prod", "g-pinned"}}, want: []string{"node_a", "node_b", "node_c", "node_d"}},
+		{name: "all is the whole fleet", sel: model.TargetSelector{All: true}, want: []string{"node_a", "node_b", "node_c", "node_d"}},
+		{name: "exclude subtracts from all", sel: model.TargetSelector{All: true, Exclude: []string{"node_b", "node_gone"}}, want: []string{"node_a", "node_c", "node_d"}},
+		{name: "exclude subtracts from a group", sel: model.TargetSelector{Groups: []string{"g-prod"}, Exclude: []string{"node_a"}}, want: []string{"node_b"}},
+		{name: "exclude wins over an explicit node", sel: model.TargetSelector{Nodes: []string{"node_a"}, Exclude: []string{"node_a"}}, want: []string{}},
 	}
-	for _, tc := range cases {
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := ResolveTargets(tc.sel, nodes, groups)
+			got := ResolveTargets(tc.sel, nodes, groupList)
 			if !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("ResolveTargets(%+v) = %v, want %v", tc.sel, got, tc.want)
 			}

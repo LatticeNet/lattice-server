@@ -190,16 +190,10 @@ func normalizeCheckAddress(kind, raw string) (string, error) {
 // normalizeCheckDefinition validates a save against the fleet now and
 // returns the definition to store. prior is the stored definition for an
 // edit, nil for a create. A refusal carries its status: 403 for scope, 400
-// for everything else.
+// for everything else. Scope is judged first, on the ids as sent, so a
+// restricted principal cannot tell from the answer whether an id it may not
+// read exists.
 func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinitionSave, prior *model.CheckDefinition) (model.CheckDefinition, *checkDefinitionError) {
-	nodes := map[string]bool{}
-	for _, n := range s.store.Nodes() {
-		nodes[n.ID] = true
-	}
-	groupIDs := map[string]bool{}
-	for _, g := range s.store.Groups() {
-		groupIDs[g.ID] = true
-	}
 	spec := req.CheckDefinitionSpec
 	out := model.CheckDefinition{}
 	if prior != nil {
@@ -218,167 +212,18 @@ func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinition
 	default:
 		return out, checkBadRequest("type must be tcp, icmp, beacon, http or tls")
 	}
-	var priorSources, priorTargets *model.TargetSelector
-	if prior != nil {
-		priorSources, priorTargets = &prior.Sources, &prior.Targets
+	if failure := checkDefinitionScope(p, out.Type, spec.Sources, spec.Targets); failure != nil {
+		return out, failure
 	}
-	var err error
-	if out.Sources, err = normalizeCheckSelector("sources", spec.Sources, priorSources, nodes, groupIDs); err != nil {
-		return out, checkBadRequest("%v", err)
+	if failure := s.normalizeCheckTargets(&out, spec, prior); failure != nil {
+		return out, failure
 	}
-	if out.Targets, err = normalizeCheckSelector("targets", spec.Targets, priorTargets, nodes, groupIDs); err != nil {
-		return out, checkBadRequest("%v", err)
+	if failure := normalizeCheckTiming(&out, spec); failure != nil {
+		return out, failure
 	}
-	seen := map[string]bool{}
-	for _, raw := range spec.Addresses {
-		if strings.TrimSpace(raw) == "" {
-			continue
-		}
-		addr, err := normalizeCheckAddress(out.Type, raw)
-		if err != nil {
-			return out, checkBadRequest("%v", err)
-		}
-		if !seen[addr] {
-			seen[addr] = true
-			out.Addresses = append(out.Addresses, addr)
-		}
+	if failure := normalizeCheckHTTP(&out, req, prior); failure != nil {
+		return out, failure
 	}
-	sort.Strings(out.Addresses)
-	if len(out.Addresses) > model.CheckDefinitionAddressesMax {
-		return out, checkBadRequest("addresses holds %d entries, at most %d", len(out.Addresses), model.CheckDefinitionAddressesMax)
-	}
-
-	// The shape each method takes.
-	tls := out.Type == model.MonitorTypeTLS
-	switch {
-	case tls && (!checkSelectorEmpty(out.Sources) || len(out.Sources.Exclude) > 0):
-		return out, checkBadRequest("a tls check runs on the control plane: it takes no sources")
-	case !tls && checkSelectorEmpty(out.Sources):
-		return out, checkBadRequest("sources selects no node: name nodes, groups or the whole fleet")
-	case !checkKindTakesNodes(out.Type) && (!checkSelectorEmpty(out.Targets) || len(out.Targets.Exclude) > 0):
-		return out, checkBadRequest("a %s check takes addresses, not target nodes", out.Type)
-	case !checkKindTakesAddresses(out.Type) && len(out.Addresses) > 0:
-		return out, checkBadRequest("a beacon check names target nodes; it never takes an address")
-	case checkSelectorEmpty(out.Targets) && len(out.Addresses) == 0:
-		return out, checkBadRequest("the check has no target: name target nodes or addresses")
-	}
-
-	// Who may store these selectors. Expansion runs as the system, so a
-	// stored group or whole-fleet selector would let a restricted
-	// principal's targets grow to nodes it cannot read, as the path set
-	// refuses for the same reason.
-	restricted := principalHasNodeRestriction(p)
-	if restricted && (checkSelectorBroad(out.Sources) || checkSelectorBroad(out.Targets)) {
-		return out, checkForbidden("a group or whole-fleet selector needs a token with no node allowlist; name the nodes instead")
-	}
-	if restricted && tls {
-		return out, checkForbidden("restricted token cannot create a server-evaluated monitor")
-	}
-	for _, nodeID := range out.Sources.Nodes {
-		if !rbac.Allows(p.Principal, "monitor:admin", nodeID) {
-			return out, checkForbidden("forbidden: sources names a node this token may not administer")
-		}
-	}
-	for _, list := range [][]string{out.Targets.Nodes, out.Sources.Exclude, out.Targets.Exclude} {
-		for _, nodeID := range list {
-			if !latencyNodeVisible(p, nodeID) {
-				return out, checkForbidden("forbidden: the check names a node this token may not read")
-			}
-		}
-	}
-
-	// Timing, packets and the tls window.
-	out.IntervalSec, out.TimeoutSec = spec.IntervalSec, spec.TimeoutSec
-	if out.IntervalSec <= 0 {
-		out.IntervalSec = 30
-		if tls {
-			out.IntervalSec = int(tlsMonitorDefaultInterval / time.Second)
-		}
-	}
-	if out.TimeoutSec <= 0 {
-		out.TimeoutSec = 5
-		if tls {
-			out.TimeoutSec = int(tlsMonitorDefaultTimeout / time.Second)
-		}
-	}
-	if err := validMonitorTiming(out.IntervalSec, out.TimeoutSec); err != nil {
-		return out, checkBadRequest("%v", err)
-	}
-	if model.MonitorKindSendsPackets(out.Type) {
-		out.Packets = spec.Packets
-		if out.Packets == 0 {
-			out.Packets = model.MonitorPacketsDefault
-		}
-		if out.Packets < 1 || out.Packets > model.MonitorPacketsMax {
-			return out, checkBadRequest("packets must be 1 to %d", model.MonitorPacketsMax)
-		}
-		if err := validMonitorRun(model.Monitor{Type: out.Type, IntervalSec: out.IntervalSec, TimeoutSec: out.TimeoutSec, Packets: out.Packets}); err != nil {
-			return out, checkBadRequest("%v", err)
-		}
-	} else if spec.Packets != 0 {
-		return out, checkBadRequest("%v", errMonitorPacketsKinds)
-	}
-	if tls {
-		out.ThresholdDays = spec.ThresholdDays
-		if out.ThresholdDays == 0 {
-			out.ThresholdDays = tlsMonitorDefaultThresholdDays
-		}
-		if out.ThresholdDays < 1 || out.ThresholdDays > tlsMonitorMaxThresholdDays {
-			return out, checkBadRequest("threshold_days must be between 1 and %d", tlsMonitorMaxThresholdDays)
-		}
-	} else if spec.ThresholdDays != 0 {
-		return out, checkBadRequest("threshold_days applies to tls checks only")
-	}
-
-	// Expectations and headers, http only. Header edits apply to the
-	// stored headers in order, as a check's edit does.
-	if out.Type != model.MonitorTypeHTTP {
-		if strings.TrimSpace(spec.ExpectStatus) != "" || len(req.Headers) > 0 {
-			return out, checkBadRequest("expect_status and headers apply to http checks only")
-		}
-	} else {
-		var stored []model.MonitorHeader
-		if prior != nil && prior.Type == model.MonitorTypeHTTP {
-			stored = prior.Headers
-		}
-		headers, err := applyMonitorHeaderEdits(stored, req.Headers)
-		if err != nil {
-			return out, checkBadRequest("%v", err)
-		}
-		probe := model.Monitor{Type: out.Type, Target: "https://example.invalid/", ExpectStatus: spec.ExpectStatus, Headers: headers}
-		if len(out.Addresses) > 0 {
-			probe.Target = out.Addresses[0]
-		}
-		if err := normalizeHTTPMonitor(&probe, false); err != nil {
-			return out, checkBadRequest("%v", err)
-		}
-		out.ExpectStatus, out.Headers = probe.ExpectStatus, probe.Headers
-		if model.MonitorHasSecrets(probe) {
-			if checkSelectorBroad(out.Sources) {
-				return out, checkBadRequest("a check with secret headers names its sources as nodes, never a group or the whole fleet: a node that joined would receive the secrets")
-			}
-			origins := map[string]bool{}
-			for _, addr := range out.Addresses {
-				origin, err := model.MonitorOrigin(addr)
-				if err != nil {
-					return out, checkBadRequest("%v", err)
-				}
-				if !strings.HasPrefix(origin, "https://") {
-					return out, checkBadRequest("a check with secret headers must use https for every address, so the secrets travel encrypted to a verified host")
-				}
-				origins[origin] = true
-			}
-			for origin := range origins {
-				out.SecretsOrigins = append(out.SecretsOrigins, origin)
-			}
-			sort.Strings(out.SecretsOrigins)
-			if err := checkSecretsRebound(prior, out.SecretsOrigins, req.Headers); err != nil {
-				return out, checkBadRequest("%v", err)
-			}
-		}
-	}
-
-	// Alerting.
 	out.Alert = strings.TrimSpace(spec.Alert)
 	degraded, err := validMonitorAlertFor(out.Type, out.Alert, spec.Degraded)
 	if err != nil {
@@ -396,10 +241,196 @@ func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinition
 	return out, nil
 }
 
+// checkDefinitionScope is who may store these selectors. Expansion runs as
+// the system, so a stored group or whole-fleet selector would let a
+// restricted principal's targets grow to nodes it cannot read, as the path
+// set refuses for the same reason. A restricted principal may name explicit
+// nodes: sources it administers, targets and exclusions it can read.
+func checkDefinitionScope(p principal, kind string, sources, targets model.TargetSelector) *checkDefinitionError {
+	restricted := principalHasNodeRestriction(p)
+	if restricted && (checkSelectorBroad(sources) || checkSelectorBroad(targets)) {
+		return checkForbidden("a group or whole-fleet selector needs a token with no node allowlist; name the nodes instead")
+	}
+	if restricted && kind == model.MonitorTypeTLS {
+		return checkForbidden("restricted token cannot create a server-evaluated monitor")
+	}
+	for _, nodeID := range cleanNodeList(sources.Nodes) {
+		if !rbac.Allows(p.Principal, "monitor:admin", nodeID) {
+			return checkForbidden("forbidden: sources names a node this token may not administer")
+		}
+	}
+	for _, list := range [][]string{targets.Nodes, sources.Exclude, targets.Exclude} {
+		for _, nodeID := range cleanNodeList(list) {
+			if !latencyNodeVisible(p, nodeID) {
+				return checkForbidden("forbidden: the check names a node this token may not read")
+			}
+		}
+	}
+	return nil
+}
+
+// normalizeCheckTargets cleans the selectors and addresses and checks the
+// shape the method takes.
+func (s *Server) normalizeCheckTargets(out *model.CheckDefinition, spec model.CheckDefinitionSpec, prior *model.CheckDefinition) *checkDefinitionError {
+	nodes := map[string]bool{}
+	for _, n := range s.store.Nodes() {
+		nodes[n.ID] = true
+	}
+	groupIDs := map[string]bool{}
+	for _, g := range s.store.Groups() {
+		groupIDs[g.ID] = true
+	}
+	var priorSources, priorTargets *model.TargetSelector
+	if prior != nil {
+		priorSources, priorTargets = &prior.Sources, &prior.Targets
+	}
+	var err error
+	if out.Sources, err = normalizeCheckSelector("sources", spec.Sources, priorSources, nodes, groupIDs); err != nil {
+		return checkBadRequest("%v", err)
+	}
+	if out.Targets, err = normalizeCheckSelector("targets", spec.Targets, priorTargets, nodes, groupIDs); err != nil {
+		return checkBadRequest("%v", err)
+	}
+	seen := map[string]bool{}
+	for _, raw := range spec.Addresses {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		addr, err := normalizeCheckAddress(out.Type, raw)
+		if err != nil {
+			return checkBadRequest("%v", err)
+		}
+		if !seen[addr] {
+			seen[addr] = true
+			out.Addresses = append(out.Addresses, addr)
+		}
+	}
+	sort.Strings(out.Addresses)
+	if len(out.Addresses) > model.CheckDefinitionAddressesMax {
+		return checkBadRequest("addresses holds %d entries, at most %d", len(out.Addresses), model.CheckDefinitionAddressesMax)
+	}
+	tls := out.Type == model.MonitorTypeTLS
+	switch {
+	case tls && (!checkSelectorEmpty(out.Sources) || len(out.Sources.Exclude) > 0):
+		return checkBadRequest("a tls check runs on the control plane: it takes no sources")
+	case !tls && checkSelectorEmpty(out.Sources):
+		return checkBadRequest("sources selects no node: name nodes, groups or the whole fleet")
+	case !checkKindTakesNodes(out.Type) && (!checkSelectorEmpty(out.Targets) || len(out.Targets.Exclude) > 0):
+		return checkBadRequest("a %s check takes addresses, not target nodes", out.Type)
+	case !checkKindTakesAddresses(out.Type) && len(out.Addresses) > 0:
+		return checkBadRequest("a beacon check names target nodes; it never takes an address")
+	case checkSelectorEmpty(out.Targets) && len(out.Addresses) == 0:
+		return checkBadRequest("the check has no target: name target nodes or addresses")
+	}
+	return nil
+}
+
+// normalizeCheckTiming fills and checks the interval, the timeout, the
+// packets and the tls warning window.
+func normalizeCheckTiming(out *model.CheckDefinition, spec model.CheckDefinitionSpec) *checkDefinitionError {
+	tls := out.Type == model.MonitorTypeTLS
+	out.IntervalSec, out.TimeoutSec = spec.IntervalSec, spec.TimeoutSec
+	if out.IntervalSec <= 0 {
+		out.IntervalSec = 30
+		if tls {
+			out.IntervalSec = int(tlsMonitorDefaultInterval / time.Second)
+		}
+	}
+	if out.TimeoutSec <= 0 {
+		out.TimeoutSec = 5
+		if tls {
+			out.TimeoutSec = int(tlsMonitorDefaultTimeout / time.Second)
+		}
+	}
+	if err := validMonitorTiming(out.IntervalSec, out.TimeoutSec); err != nil {
+		return checkBadRequest("%v", err)
+	}
+	if model.MonitorKindSendsPackets(out.Type) {
+		out.Packets = spec.Packets
+		if out.Packets == 0 {
+			out.Packets = model.MonitorPacketsDefault
+		}
+		if out.Packets < 1 || out.Packets > model.MonitorPacketsMax {
+			return checkBadRequest("packets must be 1 to %d", model.MonitorPacketsMax)
+		}
+		if err := validMonitorRun(model.Monitor{Type: out.Type, IntervalSec: out.IntervalSec, TimeoutSec: out.TimeoutSec, Packets: out.Packets}); err != nil {
+			return checkBadRequest("%v", err)
+		}
+	} else if spec.Packets != 0 {
+		return checkBadRequest("%v", errMonitorPacketsKinds)
+	}
+	if tls {
+		out.ThresholdDays = spec.ThresholdDays
+		if out.ThresholdDays == 0 {
+			out.ThresholdDays = tlsMonitorDefaultThresholdDays
+		}
+		if out.ThresholdDays < 1 || out.ThresholdDays > tlsMonitorMaxThresholdDays {
+			return checkBadRequest("threshold_days must be between 1 and %d", tlsMonitorMaxThresholdDays)
+		}
+	} else if spec.ThresholdDays != 0 {
+		return checkBadRequest("threshold_days applies to tls checks only")
+	}
+	return nil
+}
+
+// normalizeCheckHTTP checks an http definition's expectations and headers.
+// Header edits apply to the stored headers in order, as a check's edit
+// does; secrets need explicit source nodes and https everywhere, and stay
+// bound to the origins they were saved for.
+func normalizeCheckHTTP(out *model.CheckDefinition, req model.CheckDefinitionSave, prior *model.CheckDefinition) *checkDefinitionError {
+	if out.Type != model.MonitorTypeHTTP {
+		if strings.TrimSpace(req.ExpectStatus) != "" || len(req.Headers) > 0 {
+			return checkBadRequest("expect_status and headers apply to http checks only")
+		}
+		return nil
+	}
+	var stored []model.MonitorHeader
+	if prior != nil && prior.Type == model.MonitorTypeHTTP {
+		stored = prior.Headers
+	}
+	headers, err := applyMonitorHeaderEdits(stored, req.Headers)
+	if err != nil {
+		return checkBadRequest("%v", err)
+	}
+	probe := model.Monitor{Type: out.Type, Target: "https://example.invalid/", ExpectStatus: req.ExpectStatus, Headers: headers}
+	if len(out.Addresses) > 0 {
+		probe.Target = out.Addresses[0]
+	}
+	if err := normalizeHTTPMonitor(&probe, false); err != nil {
+		return checkBadRequest("%v", err)
+	}
+	out.ExpectStatus, out.Headers = probe.ExpectStatus, probe.Headers
+	if !model.MonitorHasSecrets(probe) {
+		return nil
+	}
+	if checkSelectorBroad(out.Sources) {
+		return checkBadRequest("a check with secret headers names its sources as nodes, never a group or the whole fleet: a node that joined would receive the secrets")
+	}
+	origins := map[string]bool{}
+	for _, addr := range out.Addresses {
+		origin, err := model.MonitorOrigin(addr)
+		if err != nil {
+			return checkBadRequest("%v", err)
+		}
+		if !strings.HasPrefix(origin, "https://") {
+			return checkBadRequest("a check with secret headers must use https for every address, so the secrets travel encrypted to a verified host")
+		}
+		origins[origin] = true
+	}
+	for origin := range origins {
+		out.SecretsOrigins = append(out.SecretsOrigins, origin)
+	}
+	sort.Strings(out.SecretsOrigins)
+	if err := checkSecretsRebound(prior, out.SecretsOrigins, req.Headers); err != nil {
+		return checkBadRequest("%v", err)
+	}
+	return nil
+}
+
 // checkSecretsRebound refuses an edit that would send stored secrets to an
 // origin they were not saved for (design 29 D1 binds secrets to their
 // origin): an edit that adds such an origin must set every secret header
-// again in the same edit.
+// again in the same edit, or delete it.
 func checkSecretsRebound(prior *model.CheckDefinition, origins []string, edits []model.MonitorHeaderEdit) error {
 	if prior == nil || prior.Type != model.MonitorTypeHTTP {
 		return nil
@@ -413,14 +444,14 @@ func checkSecretsRebound(prior *model.CheckDefinition, origins []string, edits [
 	if len(added) == 0 {
 		return nil
 	}
-	set := map[string]bool{}
+	settled := map[string]bool{}
 	for _, e := range edits {
-		if e.Op == model.MonitorHeaderSet {
-			set[model.CanonicalMonitorHeaderName(e.Name)] = true
+		if e.Op == model.MonitorHeaderSet || e.Op == model.MonitorHeaderDelete {
+			settled[model.CanonicalMonitorHeaderName(e.Name)] = true
 		}
 	}
 	for _, h := range prior.Headers {
-		if h.Secret && !set[h.Name] {
+		if h.Secret && !settled[h.Name] {
 			return fmt.Errorf("secret header %s was saved for %s; adding %s needs it set again in the same edit", h.Name, strings.Join(prior.SecretsOrigins, ", "), strings.Join(added, ", "))
 		}
 	}
@@ -513,7 +544,7 @@ func (p *checkDefinitionPlan) monitorOf(e checkPlanEntry) *model.Monitor {
 // planAll plans every definition in defs, oldest first, with override in
 // place of the definition of the same id (or after the others when it is
 // new), so the packet budget is shared out in the same order whichever
-// call plans.
+// call plans. It charges the context's budget, so a context plans once.
 func (c *checkPlanContext) planAll(defs []model.CheckDefinition, override *model.CheckDefinition) []checkDefinitionPlan {
 	defs = slices.Clone(defs)
 	if override != nil {
@@ -564,10 +595,17 @@ func (c *checkPlanContext) shareBudget(plans []checkDefinitionPlan) {
 				continue
 			}
 			prior, had := c.existing[plan.owner][mon.ID]
+			running := map[string]bool{}
+			if had && prior.Enabled && prior.Target == mon.Target {
+				for _, sourceID := range prior.NodeIDs {
+					running[sourceID] = true
+				}
+				for _, sourceID := range prior.PausedNodeIDs {
+					delete(running, sourceID)
+				}
+			}
 			for _, sourceID := range mon.NodeIDs {
-				runs := had && prior.Enabled && prior.Target == mon.Target &&
-					slices.Contains(prior.NodeIDs, sourceID) && !slices.Contains(prior.PausedNodeIDs, sourceID)
-				if runs {
+				if running[sourceID] {
 					incumbents = append(incumbents, pair{pi, ei, sourceID})
 				} else {
 					newcomers = append(newcomers, pair{pi, ei, sourceID})
@@ -800,8 +838,10 @@ func (s *Server) checkPairReason(c *checkPlanContext, e checkPlanEntry, mon *mod
 	return ""
 }
 
-// preview is the dry run of one plan: what a save writes and measures.
-func (s *Server) checkPreview(c *checkPlanContext, plan checkDefinitionPlan) model.CheckDefinitionPreview {
+// checkPreview is the dry run of one plan among plans: what a save writes
+// and measures, judged by the store's own sync rule over every
+// definition's set, as the save writes them.
+func (s *Server) checkPreview(c *checkPlanContext, plans []checkDefinitionPlan, plan checkDefinitionPlan) (model.CheckDefinitionPreview, error) {
 	out := model.CheckDefinitionPreview{
 		Sources: slices.Clone(plan.sources),
 		Targets: []model.CheckPreviewTarget{},
@@ -829,7 +869,17 @@ func (s *Server) checkPreview(c *checkPlanContext, plan checkDefinitionPlan) mod
 		out.Targets = append(out.Targets, t)
 	}
 	out.Paths = len(out.Pairs)
-	diff := s.store.DiffManagedMonitors(plan.owner, plan.desired)
+	changes, err := s.store.DiffManagedMonitorSets(c.sets(plans), plan.def.ID)
+	if err != nil {
+		return out, err
+	}
+	diff := changes[plan.owner]
+	for owner, ch := range changes {
+		if owner != plan.owner && ch.Changed() {
+			out.AlsoChanges = append(out.AlsoChanges, strings.TrimPrefix(owner, store.MonitorManagedCheckPrefix))
+		}
+	}
+	sort.Strings(out.AlsoChanges)
 	inSet := map[string]bool{}
 	for _, e := range plan.entries {
 		inSet[e.monitorID] = true
@@ -845,7 +895,7 @@ func (s *Server) checkPreview(c *checkPlanContext, plan checkDefinitionPlan) mod
 	if len(plan.notes) > 0 {
 		out.Notes = plan.notes
 	}
-	return out
+	return out, nil
 }
 
 func emptyIfNil(ids []string) []string {
@@ -863,7 +913,7 @@ func (s *Server) syncCheckDefinitions(now time.Time, trigger string) (map[string
 	s.checkDefSync.Lock()
 	defer s.checkDefSync.Unlock()
 	defs := s.store.CheckDefinitions()
-	if len(defs) == 0 && !s.anyDefinitionMonitor() {
+	if len(defs) == 0 && !s.store.AnyDefinitionMonitor() {
 		return nil, nil
 	}
 	c := s.checkPlanContextAt(now)
@@ -878,17 +928,6 @@ func (s *Server) syncCheckDefinitions(now time.Time, trigger string) (map[string
 	}
 	s.auditCheckSync(now, trigger, changes)
 	return changes, nil
-}
-
-// anyDefinitionMonitor reports whether any stored monitor was expanded from
-// a check definition, so a fleet with none skips planning.
-func (s *Server) anyDefinitionMonitor() bool {
-	for _, mon := range s.store.Monitors() {
-		if store.MonitorOwnerOf(mon) == store.MonitorOwnerDefinition {
-			return true
-		}
-	}
-	return false
 }
 
 // auditCheckSync records a sync that changed monitors, as

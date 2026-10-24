@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -932,5 +933,192 @@ func TestCheckDefinitionPacketBudgetKeepsRunningPairs(t *testing.T) {
 	}
 	if mon := definitionMonitors(st, newer.ID)[0]; len(mon.PausedNodeIDs) != 0 {
 		t.Fatalf("the allocation flapped: %+v", mon)
+	}
+}
+
+// A restricted token sees a definition that names only nodes it can read,
+// but never the monitors of targets that left the set while the selector
+// was broad, which name nodes it may not read; and the monitors list never
+// shows it a broad definition's other sources or its id.
+func TestCheckDefinitionRestrictedViewsNameOnlyReadableNodes(t *testing.T) {
+	_, handler, _ := checkFleet(t)
+	admin := newCheckClient(t, handler)
+	confined := &checkClient{t: t, handler: handler, token: createPAT(t, handler, admin.cookies, admin.csrf, []string{"monitor:read", "monitor:admin"}, []string{"node-sh", "node-jp"})}
+
+	broad := tcpMesh(nil, []string{"node-jp", "node-us"})
+	broad.Sources = model.TargetSelector{All: true}
+	view := admin.create(broad)
+	code, raw := confined.do(http.MethodGet, "/api/monitors", nil)
+	if code != http.StatusOK {
+		t.Fatalf("monitors list = %d %s", code, raw)
+	}
+	var listed []map[string]any
+	if err := json.Unmarshal([]byte(raw), &listed); err != nil {
+		t.Fatal(err)
+	}
+	for _, mon := range listed {
+		if strings.HasPrefix(mon["id"].(string), "mon_"+view.ID) {
+			if mon["check_definition_id"] != nil {
+				t.Fatalf("a restricted token learns the id of a definition it cannot read: %v", mon)
+			}
+			for _, nodeID := range mon["node_ids"].([]any) {
+				if nodeID != "node-sh" && nodeID != "node-jp" {
+					t.Fatalf("a restricted token sees source %v of a broad definition", nodeID)
+				}
+			}
+		}
+	}
+
+	// Narrowed to nodes the token can read: the definition shows, its
+	// paused target to node-us (whole-fleet sources) does not.
+	edit := saveOf(view)
+	edit.Sources = model.TargetSelector{Nodes: []string{"node-sh"}}
+	edit.Targets = model.TargetSelector{Nodes: []string{"node-jp"}}
+	admin.update(edit)
+	got := confined.get(view.ID)
+	for _, mon := range got.Monitors {
+		if mon.TargetNode == "node-us" {
+			t.Fatalf("a restricted token sees a paused target it cannot read: %+v", mon)
+		}
+		for _, source := range mon.Sources {
+			if source != "node-sh" && source != "node-jp" {
+				t.Fatalf("a restricted token sees source %s of a paused target", source)
+			}
+		}
+	}
+	if got.Summary.PausedTargets != 0 {
+		t.Fatalf("restricted summary counts unreadable paused targets: %+v", got.Summary)
+	}
+	if full := admin.get(view.ID); full.Summary.PausedTargets != 1 {
+		t.Fatalf("admin summary = %+v, want the paused target counted", full.Summary)
+	}
+}
+
+// Scope is judged before existence: a restricted token naming an id it
+// cannot read gets 403 whether or not the node exists.
+func TestCheckDefinitionScopeBeforeExistence(t *testing.T) {
+	_, handler, _ := checkFleet(t)
+	admin := newCheckClient(t, handler)
+	confined := &checkClient{t: t, handler: handler, token: createPAT(t, handler, admin.cookies, admin.csrf, []string{"monitor:read", "monitor:admin"}, []string{"node-sh", "node-jp"})}
+	for _, target := range []string{"node-us", "node-does-not-exist"} {
+		if code, raw := confined.do(http.MethodPost, "/api/monitors/definitions/preview", tcpMesh([]string{"node-sh"}, []string{target})); code != http.StatusForbidden {
+			t.Fatalf("restricted target %s = %d %s, want 403 either way", target, code, raw)
+		}
+	}
+}
+
+// An edit that adds an origin may delete a secret header instead of
+// setting it again; the one it keeps must be set again.
+func TestCheckDefinitionSecretDeleteSettlesANewOrigin(t *testing.T) {
+	_, handler, _ := checkFleet(t)
+	c := newCheckClient(t, handler)
+	view := c.create(model.CheckDefinitionSave{
+		CheckDefinitionSpec: model.CheckDefinitionSpec{
+			Name: "api", Type: model.MonitorTypeHTTP, IntervalSec: 60, TimeoutSec: 5, Enabled: true,
+			Sources: model.TargetSelector{Nodes: []string{"node-sh"}}, Addresses: []string{"https://api.example.com/health"},
+		},
+		Headers: []model.MonitorHeaderEdit{
+			{Name: "X-Api-Key", Op: model.MonitorHeaderSet, Value: "s3cret", Secret: true},
+			{Name: "X-Old-Token", Op: model.MonitorHeaderSet, Value: "old", Secret: true},
+		},
+	})
+	next := saveOf(view)
+	next.Addresses = append(next.Addresses, "https://other.example.net/health")
+	next.Headers = []model.MonitorHeaderEdit{
+		{Name: "X-Old-Token", Op: model.MonitorHeaderDelete},
+		{Name: "X-Api-Key", Op: model.MonitorHeaderSet, Value: "s3cret2", Secret: true},
+	}
+	got := c.update(next)
+	if len(got.Headers) != 1 || got.Headers[0].Name != "X-Api-Key" || len(got.SecretsOrigins) != 2 {
+		t.Fatalf("after deleting one secret and setting the other = headers %+v origins %v", got.Headers, got.SecretsOrigins)
+	}
+}
+
+// The bounds a save may leave: paths, paused targets and the number of
+// definitions.
+func TestCheckDefinitionBounds(t *testing.T) {
+	plan := checkDefinitionPlan{def: model.CheckDefinition{CheckDefinitionSpec: model.CheckDefinitionSpec{Type: model.MonitorTypeTCP}}}
+	for i := range model.CheckDefinitionPausedMax + 1 {
+		plan.desired = append(plan.desired, model.Monitor{ID: "mon_paused_" + strconv.Itoa(i)})
+	}
+	if err := checkPlanBounds(plan); err == nil || !strings.Contains(err.Error(), "forget") {
+		t.Fatalf("too many paused targets = %v", err)
+	}
+	plan.desired = nil
+	for i := range 65 {
+		plan.sources = append(plan.sources, "src-"+strconv.Itoa(i))
+		plan.entries = append(plan.entries, checkPlanEntry{key: "t-" + strconv.Itoa(i), targetNode: "t-" + strconv.Itoa(i)})
+	}
+	if err := checkPlanBounds(plan); err == nil || !strings.Contains(err.Error(), "paths") {
+		t.Fatalf("65 by 65 = %v, want the path bound", err)
+	}
+
+	_, handler, st := checkFleet(t)
+	c := newCheckClient(t, handler)
+	for i := range model.CheckDefinitionsMax {
+		id := "chk_fill" + strconv.Itoa(i)
+		if _, _, err := st.SaveCheckDefinition(model.CheckDefinition{ID: id, CheckDefinitionSpec: model.CheckDefinitionSpec{Name: id, Type: model.MonitorTypeTCP}}, 0, "admin", nil, checkT0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if code, raw := c.do(http.MethodPost, "/api/monitors/definitions", tcpMesh([]string{"node-sh"}, []string{"node-jp"})); code != http.StatusBadRequest || !strings.Contains(raw, "at most") {
+		t.Fatalf("create past the definition bound = %d %s", code, raw)
+	}
+}
+
+// The dry run of an edit that frees packet budget names the other
+// definition whose paused pair the save would resume.
+func TestCheckDefinitionPreviewNamesOtherDefinitionsItRewrites(t *testing.T) {
+	_, handler, st := checkFleet(t)
+	c := newCheckClient(t, handler)
+	ping := func(name string) model.CheckDefinitionSave {
+		return model.CheckDefinitionSave{CheckDefinitionSpec: model.CheckDefinitionSpec{
+			Name: name, Type: model.MonitorTypeICMP, IntervalSec: 10, TimeoutSec: 5, Packets: 10, Enabled: true,
+			Sources: model.TargetSelector{Nodes: []string{"node-sh"}}, Targets: model.TargetSelector{Nodes: []string{"node-jp"}},
+		}}
+	}
+	first := c.create(ping("first"))
+	second := c.create(ping("second"))
+	third := c.create(ping("third"))
+	if mon := definitionMonitors(st, third.ID)[0]; len(mon.PausedNodeIDs) != 1 {
+		t.Fatalf("the third definition should be over the budget: %+v", mon)
+	}
+	off := saveOf(first)
+	off.Enabled = false
+	pre := c.preview(off)
+	if !slices.Contains(pre.AlsoChanges, third.ID) || slices.Contains(pre.AlsoChanges, second.ID) {
+		t.Fatalf("also_changes = %v, want %s (resumed) and not %s", pre.AlsoChanges, third.ID, second.ID)
+	}
+}
+
+// Saves, previews and sweeps run at once without a race or a lost write.
+func TestCheckDefinitionSavesAndSweepsConcurrently(t *testing.T) {
+	srv, handler, st := checkFleet(t)
+	c := newCheckClient(t, handler)
+	view := c.create(tcpMesh([]string{"node-sh"}, []string{"node-jp"}))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 20 {
+			if _, err := srv.syncCheckDefinitions(checkT0, "sweep"); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+	}()
+	for i := range 10 {
+		edit := saveOf(c.get(view.ID))
+		edit.IntervalSec = 60 + 10*(i+1)
+		c.update(edit)
+		c.preview(edit)
+	}
+	<-done
+	if def, _ := st.CheckDefinition(view.ID); def.IntervalSec != 160 {
+		t.Fatalf("final interval = %d, want the last edit's 160", def.IntervalSec)
+	}
+	for _, mon := range definitionMonitors(st, view.ID) {
+		if mon.IntervalSec != 160 {
+			t.Fatalf("monitor after concurrent saves = %+v", mon)
+		}
 	}
 }

@@ -474,7 +474,6 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request, p pri
 		Scope:    "group:admin",
 		Metadata: map[string]string{"group_id": req.ID},
 	})
-	s.resyncCheckDefinitions("group")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

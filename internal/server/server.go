@@ -3737,6 +3737,8 @@ func (s *Server) handleNodeDisable(w http.ResponseWriter, r *http.Request, p pri
 		action = "node.disable"
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), NodeID: req.NodeID, Action: action, Scope: "node:admin"})
+	// A disabled node takes no part in a check definition's sets.
+	s.resyncCheckDefinitions("node")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "disabled": req.Disabled})
 }
 
@@ -5489,6 +5491,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		for i, mon := range visible {
 			views[i].Latest = monitorLatestViews(p, mon, latest[mon.ID])
 		}
+		s.narrowDefinitionMonitorViews(p, visible, views)
 		writeJSON(w, http.StatusOK, views)
 	case http.MethodPost:
 		if !s.requireScope(w, p, "monitor:admin") {

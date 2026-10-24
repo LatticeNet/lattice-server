@@ -2,8 +2,10 @@ package store
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,5 +165,145 @@ func TestCheckDefinitionsPersist(t *testing.T) {
 	}
 	if back, ok := exported.CheckDefinitions["chk_a"]; !ok || !back.Targets.All {
 		t.Fatalf("migrate round trip lost the definition: %+v", exported.CheckDefinitions)
+	}
+}
+
+// A definition's secret header values are encrypted at rest, as its
+// monitors' are, in the state file and in the migrate round trip.
+func TestCheckDefinitionSecretsEncryptedAtRest(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	cph := testCipher(t)
+	s, err := OpenWithCipher(path, cph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := model.CheckDefinition{
+		ID:                  "chk_a",
+		CheckDefinitionSpec: model.CheckDefinitionSpec{Name: "a", Type: model.MonitorTypeHTTP, Addresses: []string{"https://api.example.com/x"}},
+		Headers:             []model.MonitorHeader{{Name: "X-Api-Key", Value: "s3cret-value", Secret: true}, {Name: "Accept", Value: "text/plain"}},
+	}
+	if _, _, err := s.SaveCheckDefinition(def, 0, "admin", nil, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "s3cret-value") {
+		t.Fatal("the state file holds the secret header value in plaintext")
+	}
+	if !strings.Contains(string(raw), "text/plain") {
+		t.Fatal("a plain header should stay readable")
+	}
+	again, err := OpenWithCipher(path, cph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := again.CheckDefinition("chk_a")
+	if len(got.Headers) != 2 || got.Headers[0].Value != "s3cret-value" {
+		t.Fatalf("reopened headers = %+v", got.Headers)
+	}
+	if _, err := Open(path); err == nil {
+		t.Fatal("opening the state without the key should refuse, not read envelopes as values")
+	}
+	bolt, err := OpenBoltState(filepath.Join(dir, "migrate.db"), cph)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bolt.Close()
+	if err := bolt.ImportState(again.state); err != nil {
+		t.Fatal(err)
+	}
+	dbRaw, err := os.ReadFile(filepath.Join(dir, "migrate.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(dbRaw), "s3cret-value") {
+		t.Fatal("the bolt file holds the secret header value in plaintext")
+	}
+	exported, err := bolt.ExportState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back := exported.CheckDefinitions["chk_a"]; len(back.Headers) != 2 || back.Headers[0].Value != "s3cret-value" {
+		t.Fatalf("migrate round trip headers = %+v", back.Headers)
+	}
+}
+
+// A save whose state write fails leaves memory as it was: no definition,
+// no monitors.
+func TestSaveCheckDefinitionRollsBackAFailedWrite(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root writes into a read-only directory")
+	}
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	def := model.CheckDefinition{ID: "chk_a", CheckDefinitionSpec: model.CheckDefinitionSpec{Name: "a", Type: model.MonitorTypeTCP}}
+	owner := CheckDefinitionOwner(def.ID)
+	if _, _, err := s.SaveCheckDefinition(def, 0, "admin", map[string][]model.Monitor{owner: {checkMon("mon_chk_a_1", owner, 60)}}, time.Now()); err == nil {
+		t.Fatal("a save into a read-only directory succeeded")
+	}
+	if _, ok := s.CheckDefinition(def.ID); ok {
+		t.Fatal("the definition survived a failed write")
+	}
+	if _, ok := s.Monitor("mon_chk_a_1"); ok {
+		t.Fatal("the monitor survived a failed write")
+	}
+}
+
+// The dry run and the sync judge by one rule: the same sets give the same
+// changes, an id two owners want is refused by both, and an owner whose
+// definition is gone keeps nothing unless the dry run assumes it exists.
+func TestDiffManagedMonitorSetsMatchesTheSync(t *testing.T) {
+	s := checkDefStore(t)
+	now := time.Now()
+	for _, id := range []string{"chk_a", "chk_b"} {
+		if _, _, err := s.SaveCheckDefinition(model.CheckDefinition{ID: id, CheckDefinitionSpec: model.CheckDefinitionSpec{Name: id, Type: model.MonitorTypeTCP}}, 0, "admin", nil, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, b := CheckDefinitionOwner("chk_a"), CheckDefinitionOwner("chk_b")
+	if _, err := s.SyncManagedMonitorSets(map[string][]model.Monitor{a: {checkMon("mon_chk_a_1", a, 60), checkMon("mon_chk_a_2", a, 60)}}, now); err != nil {
+		t.Fatal(err)
+	}
+	sets := map[string][]model.Monitor{
+		a: {checkMon("mon_chk_a_1", a, 120)},
+		b: {checkMon("mon_chk_b_1", b, 60)},
+	}
+	diff, err := s.DiffManagedMonitorSets(sets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applied, err := s.SyncManagedMonitorSets(sets, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, owner := range []string{a, b} {
+		if !slices.Equal(diff[owner].Created, applied[owner].Created) || !slices.Equal(diff[owner].Updated, applied[owner].Updated) || !slices.Equal(diff[owner].Deleted, applied[owner].Deleted) {
+			t.Fatalf("%s: dry run %+v, sync %+v", owner, diff[owner], applied[owner])
+		}
+	}
+	twice := map[string][]model.Monitor{a: {checkMon("mon_x", a, 60)}, b: {checkMon("mon_x", b, 60)}}
+	if _, err := s.DiffManagedMonitorSets(twice); err == nil {
+		t.Fatal("the dry run accepted an id two owners want")
+	}
+	if _, err := s.SyncManagedMonitorSets(twice, now); err == nil {
+		t.Fatal("the sync accepted an id two owners want")
+	}
+	ghost := CheckDefinitionOwner("chk_new")
+	ghostSet := map[string][]model.Monitor{ghost: {checkMon("mon_chk_new_1", ghost, 60)}}
+	if diff, _ := s.DiffManagedMonitorSets(ghostSet); diff[ghost].Changed() {
+		t.Fatalf("an owner with no definition would get monitors: %+v", diff[ghost])
+	}
+	if diff, _ := s.DiffManagedMonitorSets(ghostSet, "chk_new"); len(diff[ghost].Created) != 1 {
+		t.Fatalf("a dry run of a create should show its monitors: %+v", diff[ghost])
 	}
 }

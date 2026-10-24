@@ -252,19 +252,20 @@ func putBoltCheckDefinitions(tx *bolt.Tx, defs map[string]model.CheckDefinition)
 	return meta.Put(boltKeyCheckDefinitions, raw)
 }
 
-func readBoltCheckDefinitions(tx *bolt.Tx, into map[string]model.CheckDefinition) error {
+func readBoltCheckDefinitions(tx *bolt.Tx) (map[string]model.CheckDefinition, error) {
+	out := map[string]model.CheckDefinition{}
 	meta := tx.Bucket(boltBucketMeta)
 	if meta == nil {
-		return nil
+		return out, nil
 	}
 	raw := meta.Get(boltKeyCheckDefinitions)
 	if len(raw) == 0 {
-		return nil
+		return out, nil
 	}
-	if err := json.Unmarshal(raw, &into); err != nil {
-		return fmt.Errorf("decode check definitions: %w", err)
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("decode check definitions: %w", err)
 	}
-	return nil
+	return out, nil
 }
 
 // boltKeyBeacon holds State.Beacon in the meta bucket, so the offline
@@ -944,7 +945,7 @@ func (bs *BoltStateStore) exportState(migrate, includeAudit bool) (State, error)
 			return err
 		}
 		st.LatencyProbes = latency
-		if err := readBoltCheckDefinitions(tx, st.CheckDefinitions); err != nil {
+		if st.CheckDefinitions, err = readBoltCheckDefinitions(tx); err != nil {
 			return err
 		}
 		monitorSettings, err := readBoltMonitorSettings(tx)

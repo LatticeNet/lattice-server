@@ -116,13 +116,36 @@ func (s *Store) SaveCheckDefinition(def model.CheckDefinition, expected int64, a
 		restore()
 		return model.CheckDefinition{}, nil, err
 	}
-	if err := s.Save(); err != nil {
+	// A write on disk that could not be made durable keeps memory as the
+	// file has it and still reports the error, as DeleteCheckDefinition does.
+	committed, err := s.persistState(s.jsonPersistState())
+	if !committed {
 		undo.revert(s)
 		restore()
 		return model.CheckDefinition{}, nil, err
 	}
 	undo.committed(s)
-	return cloneCheckDefinition(stored), changes, nil
+	return cloneCheckDefinition(stored), changes, err
+}
+
+// CheckDefinitionCount is how many definitions are stored.
+func (s *Store) CheckDefinitionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.state.CheckDefinitions)
+}
+
+// AnyDefinitionMonitor reports whether any stored monitor was expanded from
+// a check definition, without copying the monitors.
+func (s *Store) AnyDefinitionMonitor() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, mon := range s.state.Monitors {
+		if MonitorOwnerOf(mon) == MonitorOwnerDefinition {
+			return true
+		}
+	}
+	return false
 }
 
 // DeleteCheckDefinition removes a definition and every monitor it expanded

@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strconv"
@@ -66,10 +67,12 @@ func checkDefinitionManageable(p principal, def model.CheckDefinition) bool {
 }
 
 // checkMonitorRuns counts the results each monitor stores over every
-// source, from the latest records the hot store keeps per pair.
+// source, from the latest records the hot store keeps per pair. A failed
+// read is logged and counts nothing, so a confirmation never stalls on it.
 func (s *Server) checkMonitorRuns() map[string]int {
 	latest, err := s.store.LatestMonitorResults()
 	if err != nil {
+		s.logger.Printf("check definitions: run counts unread: %v", err)
 		return map[string]int{}
 	}
 	out := make(map[string]int, len(latest))
@@ -81,9 +84,64 @@ func (s *Server) checkMonitorRuns() map[string]int {
 	return out
 }
 
-// checkDefinitionView is def as the API reads it: secret values removed,
-// counted against what is stored now, with its monitors when asked.
-func (s *Server) checkDefinitionView(def model.CheckDefinition, plan checkDefinitionPlan, monitors []model.Monitor, runs map[string]int, withMonitors bool) model.CheckDefinitionView {
+// checkMonitorReadable is whether p may read everything a definition's
+// monitor names: the check as an operator's check is read, and every source
+// it holds. A monitor of a target that left the set keeps the sources and
+// the address it had, which can name nodes the definition no longer does.
+func checkMonitorReadable(p principal, mon model.Monitor) bool {
+	if !monitorVisibleToPrincipal(p, "monitor:read", mon) {
+		return false
+	}
+	for _, nodeID := range mon.NodeIDs {
+		if !latencyNodeVisible(p, nodeID) {
+			return false
+		}
+	}
+	return true
+}
+
+// narrowDefinitionMonitorViews narrows, for a principal with a node
+// allowlist, the monitors a check definition expanded into: a definition's
+// monitor runs from many sources, and one the principal may read through any
+// of them must not list the others, nor name a definition the principal may
+// not read.
+func (s *Server) narrowDefinitionMonitorViews(p principal, monitors []model.Monitor, views []monitorView) {
+	if !principalHasNodeRestriction(p) {
+		return
+	}
+	visibleDefs := map[string]bool{}
+	readable := func(list []string) []string {
+		var out []string
+		for _, nodeID := range list {
+			if latencyNodeVisible(p, nodeID) {
+				out = append(out, nodeID)
+			}
+		}
+		return out
+	}
+	for i, mon := range monitors {
+		definitionID, ok := store.MonitorDefinitionID(mon)
+		if !ok {
+			continue
+		}
+		views[i].NodeIDs = readable(mon.NodeIDs)
+		views[i].PausedNodeIDs = readable(mon.PausedNodeIDs)
+		seen, known := visibleDefs[definitionID]
+		if !known {
+			def, exists := s.store.CheckDefinition(definitionID)
+			seen = exists && checkDefinitionVisible(p, def)
+			visibleDefs[definitionID] = seen
+		}
+		if !seen {
+			views[i].CheckDefinitionID = ""
+		}
+	}
+}
+
+// checkDefinitionView is def as p reads it: secret values removed, counted
+// against what is stored now, with its monitors when asked, less any
+// monitor that names a node p may not read.
+func (s *Server) checkDefinitionView(p principal, def model.CheckDefinition, plan checkDefinitionPlan, monitors []model.Monitor, runs map[string]int, withMonitors bool) model.CheckDefinitionView {
 	view := model.CheckDefinitionView{CheckDefinition: def}
 	view.Headers = redactMonitorHeaders(def.Headers)
 	inSet := map[string]bool{}
@@ -91,8 +149,9 @@ func (s *Server) checkDefinitionView(def model.CheckDefinition, plan checkDefini
 		inSet[e.monitorID] = true
 	}
 	owner := store.CheckDefinitionOwner(def.ID)
+	restricted := principalHasNodeRestriction(p)
 	for _, mon := range monitors {
-		if mon.ManagedBy != owner {
+		if mon.ManagedBy != owner || (restricted && !checkMonitorReadable(p, mon)) {
 			continue
 		}
 		view.Summary.Monitors++
@@ -174,7 +233,7 @@ func (s *Server) handleCheckDefinitions(w http.ResponseWriter, r *http.Request, 
 		if wanted := strings.TrimSpace(r.URL.Query().Get("id")); wanted != "" {
 			for _, plan := range plans {
 				if plan.def.ID == wanted && checkDefinitionVisible(p, plan.def) {
-					writeJSON(w, http.StatusOK, s.checkDefinitionView(plan.def, plan, monitors, runs, true))
+					writeJSON(w, http.StatusOK, s.checkDefinitionView(p, plan.def, plan, monitors, runs, true))
 					return
 				}
 			}
@@ -184,7 +243,7 @@ func (s *Server) handleCheckDefinitions(w http.ResponseWriter, r *http.Request, 
 		list := model.CheckDefinitionList{Definitions: []model.CheckDefinitionView{}, FleetMesh: s.checkFleetMesh(p, now)}
 		for _, plan := range plans {
 			if checkDefinitionVisible(p, plan.def) {
-				list.Definitions = append(list.Definitions, s.checkDefinitionView(plan.def, plan, monitors, runs, false))
+				list.Definitions = append(list.Definitions, s.checkDefinitionView(p, plan.def, plan, monitors, runs, false))
 			}
 		}
 		slices.SortStableFunc(list.Definitions, func(a, b model.CheckDefinitionView) int {
@@ -230,6 +289,47 @@ func (s *Server) handleCheckDefinitionUpdate(w http.ResponseWriter, r *http.Requ
 	s.saveCheckDefinition(w, p, req)
 }
 
+// managedDefinition loads the definition id names for an edit, a dry run,
+// a delete or a forget: 404 when it does not exist or p may not read it,
+// 403 when p may read it but not manage it. false means the answer is
+// written.
+func (s *Server) managedDefinition(w http.ResponseWriter, p principal, id string) (model.CheckDefinition, bool) {
+	def, ok := s.store.CheckDefinition(strings.TrimSpace(id))
+	if !ok || !checkDefinitionVisible(p, def) {
+		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "check definition not found"))
+		return model.CheckDefinition{}, false
+	}
+	if !checkDefinitionManageable(p, def) {
+		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+		return model.CheckDefinition{}, false
+	}
+	return def, true
+}
+
+// checkPlanBounds refuses a plan past the bounds a save may leave: more
+// paths than CheckDefinitionPairsMax, or more paused targets than
+// CheckDefinitionPausedMax (a token that churns addresses would otherwise
+// grow the state without limit; the operator forgets paused targets first).
+func checkPlanBounds(plan checkDefinitionPlan) error {
+	if n := checkPairCount(plan); n > model.CheckDefinitionPairsMax {
+		return fmt.Errorf("the check would measure %d paths, at most %d: narrow its sources or targets", n, model.CheckDefinitionPairsMax)
+	}
+	inSet := map[string]bool{}
+	for _, e := range plan.entries {
+		inSet[e.monitorID] = true
+	}
+	paused := 0
+	for _, mon := range plan.desired {
+		if !inSet[mon.ID] {
+			paused++
+		}
+	}
+	if paused > model.CheckDefinitionPausedMax {
+		return fmt.Errorf("the check would keep %d paused targets, at most %d: forget some of them first", paused, model.CheckDefinitionPausedMax)
+	}
+	return nil
+}
+
 // checkPairCount is how many paths a plan measures: its sources times its
 // targets, less a node probing itself, and one per tls target.
 func checkPairCount(plan checkDefinitionPlan) int {
@@ -258,16 +358,14 @@ func (s *Server) saveCheckDefinition(w http.ResponseWriter, p principal, req mod
 	defer s.checkDefSync.Unlock()
 	var prior *model.CheckDefinition
 	if req.ID != "" {
-		stored, ok := s.store.CheckDefinition(req.ID)
-		if !ok || !checkDefinitionVisible(p, stored) {
-			writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "check definition not found"))
-			return
-		}
-		if !checkDefinitionManageable(p, stored) {
-			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+		stored, ok := s.managedDefinition(w, p, req.ID)
+		if !ok {
 			return
 		}
 		prior = &stored
+	} else if s.store.CheckDefinitionCount() >= model.CheckDefinitionsMax {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("the control plane keeps at most %d check definitions; delete one first", model.CheckDefinitionsMax))
+		return
 	}
 	def, failure := s.normalizeCheckDefinition(p, req, prior)
 	if failure != nil {
@@ -286,8 +384,8 @@ func (s *Server) saveCheckDefinition(w http.ResponseWriter, p principal, req mod
 	plans := c.planAll(s.store.CheckDefinitions(), &def)
 	for _, plan := range plans {
 		if plan.def.ID == def.ID {
-			if n := checkPairCount(plan); n > model.CheckDefinitionPairsMax {
-				writeError(w, http.StatusBadRequest, errors.New("the check would measure "+strconv.Itoa(n)+" paths, at most "+strconv.Itoa(model.CheckDefinitionPairsMax)+": narrow its sources or targets"))
+			if err := checkPlanBounds(plan); err != nil {
+				writeError(w, http.StatusBadRequest, err)
 				return
 			}
 		}
@@ -297,9 +395,12 @@ func (s *Server) saveCheckDefinition(w http.ResponseWriter, p principal, req mod
 	case errors.Is(err, store.ErrCheckDefinitionVersion):
 		writeError(w, http.StatusConflict, err)
 		return
-	case err != nil:
+	case err != nil && stored.ID == "":
 		writeError(w, http.StatusInternalServerError, err)
 		return
+	case err != nil:
+		// On disk, not yet durable: the save stands.
+		s.logger.Printf("check definition %s saved; the state write is not durable yet: %v", stored.ID, err)
 	}
 	action := "monitor.check.create"
 	meta := checkDefinitionAuditMeta(stored)
@@ -328,7 +429,7 @@ func (s *Server) saveCheckDefinition(w http.ResponseWriter, p principal, req mod
 			plan = candidate
 		}
 	}
-	writeJSON(w, http.StatusOK, s.checkDefinitionView(stored, plan, s.store.Monitors(), s.checkMonitorRuns(), true))
+	writeJSON(w, http.StatusOK, s.checkDefinitionView(p, stored, plan, s.store.Monitors(), s.checkMonitorRuns(), true))
 }
 
 // handleCheckDefinitionPreview answers POST /api/monitors/definitions/preview:
@@ -349,13 +450,8 @@ func (s *Server) handleCheckDefinitionPreview(w http.ResponseWriter, r *http.Req
 	req.ID = strings.TrimSpace(req.ID)
 	var prior *model.CheckDefinition
 	if req.ID != "" {
-		stored, ok := s.store.CheckDefinition(req.ID)
-		if !ok || !checkDefinitionVisible(p, stored) {
-			writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "check definition not found"))
-			return
-		}
-		if !checkDefinitionManageable(p, stored) {
-			writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+		stored, ok := s.managedDefinition(w, p, req.ID)
+		if !ok {
 			return
 		}
 		prior = &stored
@@ -371,13 +467,19 @@ func (s *Server) handleCheckDefinitionPreview(w http.ResponseWriter, r *http.Req
 		def.CreatedAt = prior.CreatedAt
 	}
 	c := s.checkPlanContextAt(s.now())
-	for _, plan := range c.planAll(s.store.CheckDefinitions(), &def) {
+	plans := c.planAll(s.store.CheckDefinitions(), &def)
+	for _, plan := range plans {
 		if plan.def.ID == def.ID {
-			if n := checkPairCount(plan); n > model.CheckDefinitionPairsMax {
-				writeError(w, http.StatusBadRequest, errors.New("the check would measure "+strconv.Itoa(n)+" paths, at most "+strconv.Itoa(model.CheckDefinitionPairsMax)+": narrow its sources or targets"))
+			if err := checkPlanBounds(plan); err != nil {
+				writeError(w, http.StatusBadRequest, err)
 				return
 			}
-			writeJSON(w, http.StatusOK, s.checkPreview(c, plan))
+			preview, err := s.checkPreview(c, plans, plan)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, preview)
 			return
 		}
 	}
@@ -398,13 +500,8 @@ func (s *Server) handleCheckDefinitionDelete(w http.ResponseWriter, r *http.Requ
 	}
 	s.checkDefSync.Lock()
 	defer s.checkDefSync.Unlock()
-	def, ok := s.store.CheckDefinition(strings.TrimSpace(req.ID))
-	if !ok || !checkDefinitionVisible(p, def) {
-		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "check definition not found"))
-		return
-	}
-	if !checkDefinitionManageable(p, def) {
-		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+	def, ok := s.managedDefinition(w, p, req.ID)
+	if !ok {
 		return
 	}
 	runs := s.checkMonitorRuns()
@@ -451,13 +548,8 @@ func (s *Server) handleCheckDefinitionForget(w http.ResponseWriter, r *http.Requ
 	}
 	s.checkDefSync.Lock()
 	defer s.checkDefSync.Unlock()
-	def, ok := s.store.CheckDefinition(strings.TrimSpace(req.ID))
-	if !ok || !checkDefinitionVisible(p, def) {
-		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "check definition not found"))
-		return
-	}
-	if !checkDefinitionManageable(p, def) {
-		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
+	def, ok := s.managedDefinition(w, p, req.ID)
+	if !ok {
 		return
 	}
 	c := s.checkPlanContextAt(s.now())

@@ -115,12 +115,30 @@ func (s *Store) SyncManagedMonitorSets(sets map[string][]model.Monitor, now time
 	if err != nil || !managedChangesAny(changes) {
 		return changes, err
 	}
-	if err := s.Save(); err != nil {
+	// A write that reached the disk but could not be made durable (the
+	// directory sync failed) keeps what it wrote in memory too, so memory
+	// never reads older than the file.
+	committed, err := s.persistState(s.jsonPersistState())
+	if !committed {
 		undo.revert(s)
 		return map[string]ManagedMonitorChanges{}, err
 	}
 	undo.committed(s)
-	return changes, nil
+	return changes, err
+}
+
+// DiffManagedMonitorSets says what SyncManagedMonitorSets(sets) would do
+// now, and writes nothing: a dry run reads it, so it judges by the very
+// rule the sync writes by. assume names check definitions the dry run treats
+// as existing, such as one a create has not stored yet.
+func (s *Store) DiffManagedMonitorSets(sets map[string][]model.Monitor, assume ...string) (map[string]ManagedMonitorChanges, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	plan, err := s.planManagedSetsLocked(sets, func(definitionID string) bool {
+		_, exists := s.state.CheckDefinitions[definitionID]
+		return exists || slices.Contains(assume, definitionID)
+	})
+	return plan.changes, err
 }
 
 func managedChangesAny(changes map[string]ManagedMonitorChanges) bool {
@@ -140,6 +158,10 @@ type managedUndo struct {
 	deleted  []string
 }
 
+func newManagedUndo() managedUndo {
+	return managedUndo{monitors: map[string]*model.Monitor{}, series: map[string][]MonitorResultRecord{}}
+}
+
 func (u *managedUndo) remember(s *Store, id string) {
 	if _, seen := u.monitors[id]; seen {
 		return
@@ -152,8 +174,10 @@ func (u *managedUndo) remember(s *Store, id string) {
 }
 
 // revert puts the remembered monitors and series back after a failed write.
-// The hot store's rows of deleted monitors are already gone: the monitor
-// survives with an empty history, which the next sync deletes again.
+// The hot store's rows of deleted monitors are already gone, so such a
+// monitor survives with an empty history; deleting it again (the next sync,
+// or the operator's retried delete or forget, which names the same
+// monitors) finishes the job.
 func (u managedUndo) revert(s *Store) {
 	for id, mon := range u.monitors {
 		if mon == nil {
@@ -180,14 +204,16 @@ func (u managedUndo) committed(s *Store) {
 }
 
 // deleteMonitorsLocked removes monitors with their history, remembering
-// them in undo. The hot store's rows go before the records, as DeleteMonitor
-// does it: a failure there changes nothing.
+// them in undo. The hot store's rows of every one go first, in one
+// transaction, as DeleteMonitor does it for one: a failure there changes
+// nothing.
 func (s *Store) deleteMonitorsLocked(ids []string, undo *managedUndo) error {
+	if len(ids) == 0 {
+		return nil
+	}
 	if s.runtimeBoltHot != nil {
-		for _, id := range ids {
-			if err := s.runtimeBoltHot.DeleteMonitorResults(id); err != nil {
-				return err
-			}
+		if err := s.runtimeBoltHot.DeleteMonitorsResults(ids); err != nil {
+			return err
 		}
 	}
 	for _, id := range ids {
@@ -203,35 +229,37 @@ func (s *Store) deleteMonitorsLocked(ids []string, undo *managedUndo) error {
 	return nil
 }
 
-func newManagedUndo() managedUndo {
-	return managedUndo{monitors: map[string]*model.Monitor{}, series: map[string][]MonitorResultRecord{}}
+// managedPlan is what a sync of some sets does: what changes by owner, the
+// records it writes by id, and the ids it deletes, sorted.
+type managedPlan struct {
+	changes map[string]ManagedMonitorChanges
+	writes  map[string]model.Monitor
+	deletes []string
 }
 
-// applyManagedSetsLocked applies sets in memory and says what changed, by
-// owner. Nothing is written; on an error nothing has changed.
-func (s *Store) applyManagedSetsLocked(sets map[string][]model.Monitor, now time.Time) (map[string]ManagedMonitorChanges, managedUndo, error) {
-	undo := newManagedUndo()
-	out := make(map[string]ManagedMonitorChanges, len(sets))
+// planManagedSetsLocked judges sets against the stored monitors and changes
+// nothing. definitionExists says whether a check definition owner's
+// definition exists; an owner whose definition does not keeps nothing.
+func (s *Store) planManagedSetsLocked(sets map[string][]model.Monitor, definitionExists func(string) bool) (managedPlan, error) {
+	plan := managedPlan{changes: make(map[string]ManagedMonitorChanges, len(sets)), writes: map[string]model.Monitor{}}
 	owners := make([]string, 0, len(sets))
 	want := make(map[string]map[string]model.Monitor, len(sets))
 	claimed := map[string]string{}
 	for owner, desired := range sets {
 		if strings.TrimSpace(owner) == "" {
-			return nil, undo, errors.New("managed monitors need an owner")
+			return managedPlan{}, errors.New("managed monitors need an owner")
 		}
-		if definitionID, ok := strings.CutPrefix(owner, MonitorManagedCheckPrefix); ok {
-			if _, exists := s.state.CheckDefinitions[definitionID]; !exists {
-				desired = nil
-			}
+		if definitionID, ok := strings.CutPrefix(owner, MonitorManagedCheckPrefix); ok && !definitionExists(definitionID) {
+			desired = nil
 		}
 		owners = append(owners, owner)
 		set := make(map[string]model.Monitor, len(desired))
 		for _, mon := range desired {
 			if mon.ID == "" || strings.ContainsAny(mon.ID, "/\x00") {
-				return nil, undo, errors.New("managed monitor id is empty or malformed")
+				return managedPlan{}, errors.New("managed monitor id is empty or malformed")
 			}
 			if other, taken := claimed[mon.ID]; taken && other != owner {
-				return nil, undo, errors.New("managed monitor " + mon.ID + " is desired by two owners")
+				return managedPlan{}, errors.New("managed monitor " + mon.ID + " is desired by two owners")
 			}
 			claimed[mon.ID] = owner
 			set[mon.ID] = managedDesired(owner, mon)
@@ -239,35 +267,27 @@ func (s *Store) applyManagedSetsLocked(sets map[string][]model.Monitor, now time
 		want[owner] = set
 	}
 	sort.Strings(owners)
-	var deletes []string
-	deletedBy := map[string]string{}
 	for id, mon := range s.state.Monitors {
 		set, synced := want[mon.ManagedBy]
 		if !synced {
 			continue
 		}
 		if _, ok := set[id]; !ok {
-			deletes = append(deletes, id)
-			deletedBy[id] = mon.ManagedBy
+			plan.deletes = append(plan.deletes, id)
+			c := plan.changes[mon.ManagedBy]
+			c.Deleted = append(c.Deleted, id)
+			plan.changes[mon.ManagedBy] = c
 		}
 	}
-	sort.Strings(deletes)
-	if err := s.deleteMonitorsLocked(deletes, &undo); err != nil {
-		return nil, newManagedUndo(), err
-	}
-	for _, id := range deletes {
-		c := out[deletedBy[id]]
-		c.Deleted = append(c.Deleted, id)
-		out[deletedBy[id]] = c
-	}
-	at := now.UTC()
+	sort.Strings(plan.deletes)
 	for _, owner := range owners {
 		ids := make([]string, 0, len(want[owner]))
 		for id := range want[owner] {
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
-		c := out[owner]
+		c := plan.changes[owner]
+		sort.Strings(c.Deleted)
 		for _, id := range ids {
 			next := want[owner][id]
 			current, exists := s.state.Monitors[id]
@@ -276,20 +296,48 @@ func (s *Store) applyManagedSetsLocked(sets map[string][]model.Monitor, now time
 				continue
 			case exists && managedMonitorEqual(current, next):
 				continue
-			}
-			undo.remember(s, id)
-			next.CreatedAt, next.UpdatedAt = at, at
-			if exists {
-				next.CreatedAt = current.CreatedAt
+			case exists:
 				c.Updated = append(c.Updated, id)
-			} else {
+			default:
 				c.Created = append(c.Created, id)
 			}
-			s.state.Monitors[id] = next
+			plan.writes[id] = next
 		}
-		out[owner] = c
+		plan.changes[owner] = c
 	}
-	return out, undo, nil
+	return plan, nil
+}
+
+// applyManagedSetsLocked applies sets in memory and says what changed, by
+// owner. Nothing is written; on an error nothing has changed.
+func (s *Store) applyManagedSetsLocked(sets map[string][]model.Monitor, now time.Time) (map[string]ManagedMonitorChanges, managedUndo, error) {
+	undo := newManagedUndo()
+	plan, err := s.planManagedSetsLocked(sets, func(definitionID string) bool {
+		_, exists := s.state.CheckDefinitions[definitionID]
+		return exists
+	})
+	if err != nil {
+		return nil, undo, err
+	}
+	if err := s.deleteMonitorsLocked(plan.deletes, &undo); err != nil {
+		return nil, newManagedUndo(), err
+	}
+	at := now.UTC()
+	ids := make([]string, 0, len(plan.writes))
+	for id := range plan.writes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		next := plan.writes[id]
+		undo.remember(s, id)
+		next.CreatedAt, next.UpdatedAt = at, at
+		if current, exists := s.state.Monitors[id]; exists {
+			next.CreatedAt = current.CreatedAt
+		}
+		s.state.Monitors[id] = next
+	}
+	return plan.changes, undo, nil
 }
 
 // managedDesired is a desired monitor as the sync stores it: stamped with
@@ -299,39 +347,6 @@ func managedDesired(owner string, mon model.Monitor) model.Monitor {
 	mon.NodeIDs = slices.Clone(mon.NodeIDs)
 	sort.Strings(mon.NodeIDs)
 	return mon
-}
-
-// DiffManagedMonitors says what SyncManagedMonitors(owner, desired) would
-// do now, and writes nothing. A dry run reads it, so it judges by the same
-// comparison the sync writes by.
-func (s *Store) DiffManagedMonitors(owner string, desired []model.Monitor) ManagedMonitorChanges {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	want := make(map[string]model.Monitor, len(desired))
-	for _, mon := range desired {
-		want[mon.ID] = managedDesired(owner, mon)
-	}
-	var c ManagedMonitorChanges
-	for id, mon := range s.state.Monitors {
-		if _, ok := want[id]; !ok && mon.ManagedBy == owner {
-			c.Deleted = append(c.Deleted, id)
-		}
-	}
-	for id, next := range want {
-		current, exists := s.state.Monitors[id]
-		switch {
-		case exists && current.ManagedBy != owner:
-		case exists && managedMonitorEqual(current, next):
-		case exists:
-			c.Updated = append(c.Updated, id)
-		default:
-			c.Created = append(c.Created, id)
-		}
-	}
-	sort.Strings(c.Created)
-	sort.Strings(c.Updated)
-	sort.Strings(c.Deleted)
-	return c
 }
 
 // managedMonitorEqual compares every field an agent, the console or the

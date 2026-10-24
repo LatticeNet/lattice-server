@@ -31,7 +31,8 @@ import (
 // no node allowlist reads every definition; a restricted one reads only a
 // definition that names its nodes explicitly, every one of them a node it
 // may read, since a group or whole-fleet selector would tell it about nodes
-// outside its scope.
+// outside its scope. Excluded pairs and the adoption name nodes too, and a
+// target that left a migrated definition stays in its adoption.
 func checkDefinitionVisible(p principal, def model.CheckDefinition) bool {
 	if !principalHasNodeRestriction(p) {
 		return rbac.Allows(p.Principal, "monitor:read", "")
@@ -39,11 +40,16 @@ func checkDefinitionVisible(p principal, def model.CheckDefinition) bool {
 	if def.Type == model.MonitorTypeTLS || checkSelectorBroad(def.Sources) || checkSelectorBroad(def.Targets) {
 		return false
 	}
-	for _, list := range [][]string{def.Sources.Nodes, def.Sources.Exclude, def.Targets.Nodes, def.Targets.Exclude} {
-		for _, nodeID := range list {
-			if !latencyNodeVisible(p, nodeID) {
-				return false
-			}
+	named := slices.Concat(def.Sources.Nodes, def.Sources.Exclude, def.Targets.Nodes, def.Targets.Exclude)
+	for _, pair := range def.ExcludedPairs {
+		named = append(named, pair.Source, pair.Target)
+	}
+	for _, a := range def.Adopted {
+		named = append(named, a.TargetNode)
+	}
+	for _, nodeID := range named {
+		if !latencyNodeVisible(p, nodeID) {
+			return false
 		}
 	}
 	return true
@@ -141,27 +147,27 @@ func (s *Server) narrowDefinitionMonitorViews(p principal, monitors []model.Moni
 // checkDefinitionView is def as p reads it: secret values removed, counted
 // against what is stored now, with its monitors when asked, less any
 // monitor that names a node p may not read.
-func (s *Server) checkDefinitionView(p principal, def model.CheckDefinition, plan checkDefinitionPlan, monitors []model.Monitor, runs map[string]int, withMonitors bool) model.CheckDefinitionView {
+func (s *Server) checkDefinitionView(p principal, c *checkPlanContext, def model.CheckDefinition, plan checkDefinitionPlan, monitors []model.Monitor, runs map[string]int, withMonitors bool) model.CheckDefinitionView {
 	view := model.CheckDefinitionView{CheckDefinition: def}
 	view.Headers = redactMonitorHeaders(def.Headers)
-	inSet := map[string]bool{}
+	// measuring are the monitors that measure now; a monitor of a target
+	// still in the set that is not one of them holds an auto definition's
+	// earlier method, which is the pair's history, not a paused target.
+	measuring := map[string]bool{}
 	for _, e := range plan.entries {
-		inSet[e.monitorID] = true
+		measuring[e.monitorID] = true
 	}
+	inSet := plan.targetKeys()
 	owner := store.CheckDefinitionOwner(def.ID)
 	restricted := principalHasNodeRestriction(p)
 	for _, mon := range monitors {
-		if mon.ManagedBy != owner || (restricted && !checkMonitorReadable(p, mon)) {
+		if store.MonitorOwnerKey(mon) != owner || (restricted && !checkMonitorReadable(p, mon)) {
 			continue
 		}
 		view.Summary.Monitors++
-		if inSet[mon.ID] {
-			if mon.Type == model.MonitorTypeTLS {
-				view.Summary.Paths++
-			} else {
-				view.Summary.Paths += len(mon.NodeIDs)
-			}
-		} else {
+		switch {
+		case measuring[mon.ID]:
+		case !inSet[checkMonitorKey(mon)]:
 			view.Summary.PausedTargets++
 			view.Summary.PausedRuns += runs[mon.ID]
 		}
@@ -172,12 +178,29 @@ func (s *Server) checkDefinitionView(p principal, def model.CheckDefinition, pla
 			}
 			view.Monitors = append(view.Monitors, model.CheckDefinitionMonitor{
 				MonitorID: mon.ID, Method: mon.Type, Target: mon.Target, TargetNode: mon.TargetNode,
-				InSet: inSet[mon.ID], Enabled: mon.Enabled, Sources: sources, Runs: runs[mon.ID],
+				InSet: inSet[checkMonitorKey(mon)], Enabled: mon.Enabled, Sources: sources, Runs: runs[mon.ID],
 			})
 		}
 	}
 	if withMonitors && view.Monitors == nil {
 		view.Monitors = []model.CheckDefinitionMonitor{}
+	}
+	// Paths are the pairs measured now, judged as the matrix and the dry
+	// run judge them: a skipped or paused pair is not a path (design 32 R2).
+	for _, e := range plan.entries {
+		mon := plan.monitorOf(e)
+		if mon == nil || (restricted && !checkMonitorReadable(p, *mon)) {
+			continue
+		}
+		sources := mon.NodeIDs
+		if mon.Type == model.MonitorTypeTLS {
+			sources = []string{""}
+		}
+		for _, sourceID := range sources {
+			if model.PathMeasurement(model.PathStateUnknown, s.checkPairReason(c, e, mon, sourceID)) == model.PathMeasured {
+				view.Summary.Paths++
+			}
+		}
 	}
 	return view
 }
@@ -195,6 +218,11 @@ func (s *Server) checkFleetMesh(p principal, now time.Time) model.CheckFleetMesh
 	}
 	if out.Method == "" {
 		out.Method = model.LatencyMethodTCP
+	}
+	if m := plan.Config.Migrated; m != nil {
+		// The definitions in the list are Fleet mesh now (design 32 R1).
+		out.Migrated, out.Definitions = true, slices.Clone(m.Definitions)
+		return out
 	}
 	for _, n := range plan.Nodes {
 		if n.Source {
@@ -233,7 +261,7 @@ func (s *Server) handleCheckDefinitions(w http.ResponseWriter, r *http.Request, 
 		if wanted := strings.TrimSpace(r.URL.Query().Get("id")); wanted != "" {
 			for _, plan := range plans {
 				if plan.def.ID == wanted && checkDefinitionVisible(p, plan.def) {
-					writeJSON(w, http.StatusOK, s.checkDefinitionView(p, plan.def, plan, monitors, runs, true))
+					writeJSON(w, http.StatusOK, s.checkDefinitionView(p, c, plan.def, plan, monitors, runs, true))
 					return
 				}
 			}
@@ -243,7 +271,7 @@ func (s *Server) handleCheckDefinitions(w http.ResponseWriter, r *http.Request, 
 		list := model.CheckDefinitionList{Definitions: []model.CheckDefinitionView{}, FleetMesh: s.checkFleetMesh(p, now)}
 		for _, plan := range plans {
 			if checkDefinitionVisible(p, plan.def) {
-				list.Definitions = append(list.Definitions, s.checkDefinitionView(p, plan.def, plan, monitors, runs, false))
+				list.Definitions = append(list.Definitions, s.checkDefinitionView(p, c, plan.def, plan, monitors, runs, false))
 			}
 		}
 		slices.SortStableFunc(list.Definitions, func(a, b model.CheckDefinitionView) int {
@@ -314,13 +342,10 @@ func checkPlanBounds(plan checkDefinitionPlan) error {
 	if n := checkPairCount(plan); n > model.CheckDefinitionPairsMax {
 		return fmt.Errorf("the check would measure %d paths, at most %d: narrow its sources or targets", n, model.CheckDefinitionPairsMax)
 	}
-	inSet := map[string]bool{}
-	for _, e := range plan.entries {
-		inSet[e.monitorID] = true
-	}
+	inSet := plan.targetKeys()
 	paused := 0
 	for _, mon := range plan.desired {
-		if !inSet[mon.ID] {
+		if !inSet[checkMonitorKey(mon)] {
 			paused++
 		}
 	}
@@ -330,8 +355,9 @@ func checkPlanBounds(plan checkDefinitionPlan) error {
 	return nil
 }
 
-// checkPairCount is how many paths a plan measures: its sources times its
-// targets, less a node probing itself, and one per tls target.
+// checkPairCount is how many paths a plan measures: each entry's sources
+// (the definition's sources less a node probing itself and the excluded
+// pairs, split by method for auto), and one per tls target.
 func checkPairCount(plan checkDefinitionPlan) int {
 	n := 0
 	for _, e := range plan.entries {
@@ -339,11 +365,7 @@ func checkPairCount(plan checkDefinitionPlan) int {
 			n++
 			continue
 		}
-		for _, sourceID := range plan.sources {
-			if sourceID != e.targetNode {
-				n++
-			}
-		}
+		n += len(e.sources)
 	}
 	return n
 }
@@ -393,7 +415,7 @@ func (s *Server) saveCheckDefinition(w http.ResponseWriter, p principal, req mod
 	stored, changes, err := s.store.SaveCheckDefinition(def, expected, p.ActorID, c.sets(plans), now)
 	switch {
 	case errors.Is(err, store.ErrCheckDefinitionVersion):
-		writeError(w, http.StatusConflict, err)
+		writeError(w, http.StatusConflict, versionConflict(err))
 		return
 	case err != nil && stored.ID == "":
 		writeError(w, http.StatusInternalServerError, err)
@@ -429,7 +451,7 @@ func (s *Server) saveCheckDefinition(w http.ResponseWriter, p principal, req mod
 			plan = candidate
 		}
 	}
-	writeJSON(w, http.StatusOK, s.checkDefinitionView(p, stored, plan, s.store.Monitors(), s.checkMonitorRuns(), true))
+	writeJSON(w, http.StatusOK, s.checkDefinitionView(p, c, stored, plan, s.store.Monitors(), s.checkMonitorRuns(), true))
 }
 
 // handleCheckDefinitionPreview answers POST /api/monitors/definitions/preview:
@@ -510,7 +532,10 @@ func (s *Server) handleCheckDefinitionDelete(w http.ResponseWriter, r *http.Requ
 	case errors.Is(err, store.ErrCheckDefinitionNotFound):
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "check definition not found"))
 		return
-	case errors.Is(err, store.ErrCheckDefinitionVersion), errors.Is(err, store.ErrCheckDefinitionMonitors):
+	case errors.Is(err, store.ErrCheckDefinitionVersion):
+		writeError(w, http.StatusConflict, versionConflict(err))
+		return
+	case errors.Is(err, store.ErrCheckDefinitionMonitors):
 		writeError(w, http.StatusConflict, err)
 		return
 	case err != nil && deleted == nil:
@@ -555,15 +580,12 @@ func (s *Server) handleCheckDefinitionForget(w http.ResponseWriter, r *http.Requ
 	c := s.checkPlanContextAt(s.now())
 	inSet := map[string]bool{}
 	for _, plan := range c.planAll(s.store.CheckDefinitions(), nil) {
-		if plan.def.ID != def.ID {
-			continue
-		}
-		for _, e := range plan.entries {
-			inSet[e.monitorID] = true
+		if plan.def.ID == def.ID {
+			inSet = plan.targetKeys()
 		}
 	}
 	for _, monitorID := range req.MonitorIDs {
-		if inSet[monitorID] {
+		if mon, ok := s.store.Monitor(monitorID); ok && inSet[checkMonitorKey(mon)] {
 			writeError(w, http.StatusConflict, errors.New("monitor "+monitorID+" measures a target still in the set; only paused targets can be forgotten"))
 			return
 		}

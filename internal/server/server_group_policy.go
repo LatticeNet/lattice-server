@@ -220,10 +220,14 @@ func (s *Server) handleGroupPolicy(w http.ResponseWriter, r *http.Request, p pri
 				prior = &gp
 			}
 		}
-		if !s.authorizeOutboundPolicyWrite(w, p, "this outbound policy", scope, req.Rules, prior) {
+		if !s.authorizeOutboundPolicyWrite(w, p, "this outbound policy", scope, req.Rules, prior, true) {
 			return
 		}
 		view, err := s.upsertGroupPolicy(req, scope, p)
+		if errors.Is(err, store.ErrGroupPolicyVersion) {
+			writeError(w, http.StatusConflict, versionConflict(err))
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -252,19 +256,19 @@ func normalizePolicyScope(req model.GroupNetPolicy) (model.TargetSelector, error
 			Exclude: sortedNonEmptyUnique(req.Scope.Exclude),
 		}
 		if alias != "" && store.ScopeGroupAlias(sel) != alias {
-			return model.TargetSelector{}, fmt.Errorf("scope_group_id %q disagrees with scope; send the scope alone", alias)
+			return model.TargetSelector{}, fieldErrorf("scope_group_id", "scope_group_id %q disagrees with scope; send the scope alone", alias)
 		}
 	case alias != "":
 		sel = model.TargetSelector{Groups: []string{alias}}
 	}
 	if sel.All && (len(sel.Nodes) > 0 || len(sel.Groups) > 0) {
-		return model.TargetSelector{}, errors.New("a whole-fleet target names no nodes or node groups; use exclude to leave nodes out")
+		return model.TargetSelector{}, fieldErrorf("scope.all", "a whole-fleet target names no nodes or node groups; use exclude to leave nodes out")
 	}
 	if !sel.All && len(sel.Nodes) == 0 && len(sel.Groups) == 0 {
-		return model.TargetSelector{}, errors.New("an outbound policy needs a target: nodes, node groups or the whole fleet")
+		return model.TargetSelector{}, fieldErrorf("scope", "an outbound policy needs a target: nodes, node groups or the whole fleet")
 	}
 	if len(sel.Exclude) > 0 && !sel.All && len(sel.Groups) == 0 {
-		return model.TargetSelector{}, errors.New("exclude leaves nodes out of a node group or the whole fleet; with explicit nodes, list only the nodes to target")
+		return model.TargetSelector{}, fieldErrorf("scope.exclude", "exclude leaves nodes out of a node group or the whole fleet; with explicit nodes, list only the nodes to target")
 	}
 	excluded := make(map[string]struct{}, len(sel.Exclude))
 	for _, nodeID := range sel.Exclude {
@@ -272,7 +276,7 @@ func normalizePolicyScope(req model.GroupNetPolicy) (model.TargetSelector, error
 	}
 	for _, nodeID := range sel.Nodes {
 		if _, ok := excluded[nodeID]; ok {
-			return model.TargetSelector{}, fmt.Errorf("node %q is both a target and excluded", nodeID)
+			return model.TargetSelector{}, fieldErrorf(rawIndexPath("scope.exclude", req.Scope.Exclude, nodeID), "node %q is both a target and excluded", nodeID)
 		}
 	}
 	return sel, nil
@@ -291,12 +295,14 @@ func normalizePolicyScope(req model.GroupNetPolicy) (model.TargetSelector, error
 // must be readable, because compiling either embeds addresses into a plan the
 // author may read back. The policy being overwritten or deleted (prior) must
 // pass the same rule, so a confined caller cannot narrow or withdraw a group
-// or fleet policy either.
-func (s *Server) authorizeOutboundPolicyWrite(w http.ResponseWriter, p principal, what string, scope model.TargetSelector, rules []model.GroupNetRule, prior *model.GroupNetPolicy) bool {
+// or fleet policy either. requestFields says scope and rules are the
+// request's own, so a refusal may name the field at fault; a delete or a
+// convert sends neither.
+func (s *Server) authorizeOutboundPolicyWrite(w http.ResponseWriter, p principal, what string, scope model.TargetSelector, rules []model.GroupNetRule, prior *model.GroupNetPolicy, requestFields bool) bool {
 	if !principalHasNodeRestriction(p) {
 		return true
 	}
-	deny := func(reason, message string) bool {
+	deny := func(field, reason, message string) bool {
 		s.recordPrincipalAudit(p, model.AuditEvent{
 			ID:       id.New("audit"),
 			Action:   "authorize.nodeset",
@@ -304,11 +310,15 @@ func (s *Server) authorizeOutboundPolicyWrite(w http.ResponseWriter, p principal
 			Decision: "deny",
 			Reason:   reason,
 		})
-		writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, message))
+		err := apiError(model.APIErrorCapabilityDenied, message)
+		if requestFields {
+			err = fieldError(field, err)
+		}
+		writeError(w, http.StatusForbidden, err)
 		return false
 	}
 	if len(scope.Groups) > 0 || scope.All {
-		return deny("node-restricted token named a node group or the whole fleet as a policy target",
+		return deny("scope", "node-restricted token named a node group or the whole fleet as a policy target",
 			"an outbound policy that targets a node group or the whole fleet needs a token with fleet scope: a token confined to some nodes can create, change or delete only policies that target nodes it holds, because a group can grow to nodes outside your reach. Name the nodes, or ask an operator with fleet scope")
 	}
 	ids := append(append([]string(nil), scope.Nodes...), scope.Exclude...)
@@ -323,16 +333,16 @@ func (s *Server) authorizeOutboundPolicyWrite(w http.ResponseWriter, p principal
 	if len(ids) == 0 {
 		// Unreachable after normalizePolicyScope, kept so an empty set can
 		// never pass requireReadableNodes vacuously.
-		return deny("node-restricted token wrote a policy with no explicit node", what+" names no node")
+		return deny("scope", "node-restricted token wrote a policy with no explicit node", what+" names no node")
 	}
 	if !s.requireReadableNodes(w, p, "netpolicy:admin", what, ids) {
 		return false
 	}
 	remotes := make([]string, 0)
-	for _, rule := range rules {
+	for i, rule := range rules {
 		switch rule.Remote.Kind {
 		case model.NetRefGroup:
-			return deny("node-restricted token named a node group as a policy remote",
+			return deny(fieldIndex("rules", i)+".remote", "node-restricted token named a node group as a policy remote",
 				"a rule whose remote is a node group needs a token with fleet scope: a token confined to some nodes can name only nodes as remotes, because a group can grow to nodes outside your reach. Name the nodes, or ask an operator with fleet scope")
 		case model.NetRefNode:
 			remotes = append(remotes, rule.Remote.NodeID)
@@ -357,9 +367,15 @@ func (s *Server) refuseConfinedPolicyChange(w http.ResponseWriter, p principal) 
 }
 
 func (s *Server) upsertGroupPolicy(req model.GroupNetPolicy, scope model.TargetSelector, p principal) (groupPolicyView, error) {
+	// The paths name the lists as the request sent them; scope is the
+	// cleaned copy, so an id is found in the raw list by value.
+	var sent model.TargetSelector
+	if req.Scope != nil {
+		sent = *req.Scope
+	}
 	for _, nodeID := range scope.Nodes {
 		if _, ok := s.store.Node(nodeID); !ok {
-			return groupPolicyView{}, fmt.Errorf("node %q not found", nodeID)
+			return groupPolicyView{}, fieldErrorf(rawIndexPath("scope.nodes", sent.Nodes, nodeID), "node %q not found", nodeID)
 		}
 	}
 	// An exclusion is a veto and outlives the node it names (the node delete
@@ -377,17 +393,21 @@ func (s *Server) upsertGroupPolicy(req model.GroupNetPolicy, scope model.TargetS
 			continue
 		}
 		if _, kept := keptExclusions[nodeID]; !kept {
-			return groupPolicyView{}, fmt.Errorf("node %q not found", nodeID)
+			return groupPolicyView{}, fieldErrorf(rawIndexPath("scope.exclude", sent.Exclude, nodeID), "node %q not found", nodeID)
 		}
 	}
 	for _, groupID := range scope.Groups {
 		if _, ok := s.store.Group(groupID); !ok {
-			return groupPolicyView{}, fmt.Errorf("node group %q not found", groupID)
+			path := rawIndexPath("scope.groups", sent.Groups, groupID)
+			if req.Scope == nil {
+				path = "scope_group_id"
+			}
+			return groupPolicyView{}, fieldErrorf(path, "node group %q not found", groupID)
 		}
 	}
 	req.Name = strings.TrimSpace(req.Name)
 	if len(req.Name) > maxOutboundPolicyNameLen {
-		return groupPolicyView{}, fmt.Errorf("name is longer than %d bytes", maxOutboundPolicyNameLen)
+		return groupPolicyView{}, fieldErrorf("name", "name is longer than %d bytes", maxOutboundPolicyNameLen)
 	}
 	req.Scope = &scope
 	req.ScopeGroupID = store.ScopeGroupAlias(scope)
@@ -397,31 +417,35 @@ func (s *Server) upsertGroupPolicy(req model.GroupNetPolicy, scope model.TargetS
 	}
 	for i, rule := range req.Rules {
 		if err := s.validateGroupRule(rule); err != nil {
-			return groupPolicyView{}, fmt.Errorf("rule %d: %w", i+1, err)
+			return groupPolicyView{}, refieldError(fieldIndex("rules", i)+"."+apiErrorField(err), fmt.Errorf("rule %d: %w", i+1, err))
 		}
 		// Expansion renames a rule that collides with another policy's on
 		// the same node, but two rules of one policy sharing an id would be
 		// refused at plan time on every node it reaches.
 		if _, dup := ruleIDs[rule.ID]; dup {
-			return groupPolicyView{}, fmt.Errorf("rule %d: duplicate rule id %q", i+1, rule.ID)
+			return groupPolicyView{}, fieldErrorf(fieldIndex("rules", i)+".id", "rule %d: duplicate rule id %q", i+1, rule.ID)
 		}
 		ruleIDs[rule.ID] = struct{}{}
 	}
 	creating := strings.TrimSpace(req.ID) == ""
+	// The version the editor read. A create has none to compare, and an
+	// edit that sends none is not checked, as before the field existed.
+	expected := req.Version
 	if creating {
 		req.ID = id.New("gnp")
 		req.CreatedAt = time.Time{}
+		expected = 0
 	} else {
 		prior, ok := s.store.GroupPolicy(req.ID)
 		if !ok {
-			return groupPolicyView{}, fmt.Errorf("group policy %q not found", req.ID)
+			return groupPolicyView{}, fieldErrorf("id", "group policy %q not found", req.ID)
 		}
 		req.CreatedAt = prior.CreatedAt
 	}
-	if err := s.store.UpsertGroupPolicy(req); err != nil {
+	stored, err := s.store.SaveGroupPolicy(req, expected)
+	if err != nil {
 		return groupPolicyView{}, err
 	}
-	stored, _ := s.store.GroupPolicy(req.ID)
 	action := "group.policy.update"
 	if creating {
 		action = "group.policy.create"
@@ -450,21 +474,21 @@ func (s *Server) validateGroupRule(r model.GroupNetRule) error {
 	switch strings.ToLower(strings.TrimSpace(r.Action)) {
 	case "allow", "deny":
 	default:
-		return fmt.Errorf("action must be allow or deny, got %q", r.Action)
+		return fieldErrorf("action", "action must be allow or deny, got %q", r.Action)
 	}
 	switch strings.ToLower(strings.TrimSpace(r.Direction)) {
 	case "egress", "ingress":
 	default:
-		return fmt.Errorf("direction must be egress or ingress, got %q", r.Direction)
+		return fieldErrorf("direction", "direction must be egress or ingress, got %q", r.Direction)
 	}
 	switch r.Remote.Kind {
 	case model.NetRefNode, model.NetRefCIDR, model.NetRefDomain, model.NetRefAny:
 	case model.NetRefGroup:
 		if _, ok := s.store.Group(strings.TrimSpace(r.Remote.GroupID)); !ok {
-			return fmt.Errorf("remote group %q not found", r.Remote.GroupID)
+			return fieldErrorf("remote.group_id", "remote group %q not found", r.Remote.GroupID)
 		}
 	default:
-		return fmt.Errorf("invalid remote kind %q", r.Remote.Kind)
+		return fieldErrorf("remote.kind", "invalid remote kind %q", r.Remote.Kind)
 	}
 	return nil
 }
@@ -496,7 +520,7 @@ func (s *Server) handleDeleteGroupPolicy(w http.ResponseWriter, r *http.Request,
 		s.refuseConfinedPolicyChange(w, p)
 		return
 	}
-	if ok && !s.authorizeOutboundPolicyWrite(w, p, "deleting this outbound policy", gp.TargetScope(), nil, &gp) {
+	if ok && !s.authorizeOutboundPolicyWrite(w, p, "deleting this outbound policy", gp.TargetScope(), nil, &gp, false) {
 		return
 	}
 	if err := s.store.DeleteGroupPolicy(req.ID); err != nil {
@@ -833,6 +857,30 @@ type matrixGroup struct {
 	Color string `json:"color"`
 }
 
+type matrixExcludedNode struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
+// matrixExclusion is the members one policy leaves out of a row: nodes of
+// the row's group for a group row, any node for the fleet row. Nodes the
+// reader may not read under netpolicy:read are counted in Hidden, not named.
+type matrixExclusion struct {
+	From     string               `json:"from,omitempty"`
+	PolicyID string               `json:"policy_id"`
+	Label    string               `json:"label"`
+	Nodes    []matrixExcludedNode `json:"nodes"`
+	Hidden   int                  `json:"hidden,omitempty"`
+}
+
+// matrixFleetRow is the row of policies that target the whole fleet. It is
+// sent only when one exists, and its cells carry no source group.
+type matrixFleetRow struct {
+	Cells      []matrixCell      `json:"cells"`
+	External   int               `json:"external"`
+	Exclusions []matrixExclusion `json:"exclusions"`
+}
+
 func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -857,15 +905,67 @@ func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p
 	cells := map[string]*agg{} // key: from|to
 	external := map[string]int{}
 	// The matrix is the group-pair view of outbound policy: a row is a node
-	// group a policy targets. A policy that targets only nodes or the whole
-	// fleet has no group row and is read on the policy page instead, and a
-	// group row does not show a policy's exclusions, so it reads a cell as
-	// the group's even when some members are left out.
-	for _, gp := range s.store.GroupPolicies() {
-		if !gp.Enabled {
+	// group a policy targets, plus one fleet row (source "") for policies
+	// that target the whole fleet. A policy that targets only nodes has no
+	// row and is read on the policy page instead. Each row lists the members
+	// a policy excludes, so a cell is not read as the whole group's when some
+	// members are left out.
+	nodes := s.store.Nodes()
+	resolved := groups.ResolveAll(gs, nodes)
+	nodeNames, groupNames := nodeNamesOf(nodes), groupNamesOf(gs)
+	exclusions := make([]matrixExclusion, 0)
+	fleetExclusions := make([]matrixExclusion, 0)
+	hasFleet := false
+	policies := s.store.GroupPolicies()
+	sort.Slice(policies, func(i, j int) bool {
+		if policies[i].Priority != policies[j].Priority {
+			return policies[i].Priority < policies[j].Priority
+		}
+		return policies[i].ID < policies[j].ID
+	})
+	for _, gp := range policies {
+		if !gp.Enabled || !policyHasRuleIn(gp, direction) {
 			continue
 		}
-		for _, from := range gp.TargetScope().Groups {
+		sel := gp.TargetScope()
+		rows := append([]string(nil), sel.Groups...)
+		if sel.All {
+			hasFleet = true
+			rows = append(rows, "")
+		}
+		target, hidden := viewerTarget(p, sel)
+		label := outboundPolicyLabel(gp.Name, target, hidden, groupNames, nodeNames)
+		for _, from := range rows {
+			var members map[string]bool
+			if from != "" {
+				members = make(map[string]bool, len(resolved[from]))
+				for _, nodeID := range resolved[from] {
+					members[nodeID] = true
+				}
+			}
+			ex := matrixExclusion{From: from, PolicyID: gp.ID, Label: label, Nodes: make([]matrixExcludedNode, 0)}
+			for _, nodeID := range sel.Exclude {
+				// An exclusion outlives its node; one that names no member of
+				// the row changes nothing on it.
+				if _, known := nodeNames[nodeID]; !known || (members != nil && !members[nodeID]) {
+					continue
+				}
+				if rbac.Allows(p.Principal, "netpolicy:read", nodeID) {
+					ex.Nodes = append(ex.Nodes, matrixExcludedNode{ID: nodeID, Name: nodeNames[nodeID]})
+				} else {
+					ex.Hidden++
+				}
+			}
+			if len(ex.Nodes)+ex.Hidden == 0 {
+				continue
+			}
+			if from == "" {
+				fleetExclusions = append(fleetExclusions, ex)
+			} else {
+				exclusions = append(exclusions, ex)
+			}
+		}
+		for _, from := range rows {
 			for _, rule := range gp.Rules {
 				if rule.Disabled || strings.ToLower(rule.Direction) != direction {
 					continue
@@ -893,6 +993,7 @@ func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p
 	}
 
 	out := make([]matrixCell, 0, len(cells))
+	fleetCells := make([]matrixCell, 0)
 	for key, a := range cells {
 		parts := strings.SplitN(key, "|", 2)
 		action := "allow"
@@ -908,8 +1009,13 @@ func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p
 			RuleCount: a.count,
 			Mixed:     a.actions["allow"] && a.actions["deny"],
 		}
+		if cell.From == "" {
+			fleetCells = append(fleetCells, cell)
+			continue
+		}
 		out = append(out, cell)
 	}
+	sort.Slice(fleetCells, func(i, j int) bool { return fleetCells[i].To < fleetCells[j].To })
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].From != out[j].From {
 			return out[i].From < out[j].From
@@ -918,16 +1024,36 @@ func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p
 	})
 	ext := make([]map[string]any, 0, len(external))
 	for from, n := range external {
+		if from == "" {
+			continue
+		}
 		ext = append(ext, map[string]any{"from": from, "rule_count": n})
 	}
 	sort.Slice(ext, func(i, j int) bool { return ext[i]["from"].(string) < ext[j]["from"].(string) })
+	sort.SliceStable(exclusions, func(i, j int) bool { return exclusions[i].From < exclusions[j].From })
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"direction": direction,
-		"groups":    mgs,
-		"cells":     out,
-		"external":  ext,
-	})
+	body := map[string]any{
+		"direction":  direction,
+		"groups":     mgs,
+		"cells":      out,
+		"external":   ext,
+		"exclusions": exclusions,
+	}
+	if hasFleet {
+		body["fleet"] = matrixFleetRow{Cells: fleetCells, External: external[""], Exclusions: fleetExclusions}
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// policyHasRuleIn reports whether a policy has an enabled rule in the
+// matrix direction, which is what puts it on a row.
+func policyHasRuleIn(gp model.GroupNetPolicy, direction string) bool {
+	for _, rule := range gp.Rules {
+		if !rule.Disabled && strings.ToLower(rule.Direction) == direction {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys(m map[string]bool) []string {

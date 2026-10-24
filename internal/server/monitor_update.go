@@ -62,13 +62,16 @@ var errTLSDegraded = errors.New("a tls check measures a certificate, not latency
 // kind, and returns the thresholds' canonical form.
 func validMonitorAlertFor(kind, alert string, degraded *model.MonitorDegradedRule) (*model.MonitorDegradedRule, error) {
 	if !validMonitorAlert(alert) {
-		return nil, errMonitorAlert
+		return nil, fieldError("alert", errMonitorAlert)
 	}
-	if kind == model.MonitorTypeTLS && (alert == model.MonitorAlertDownAndDegraded || degraded != nil) {
-		return nil, errTLSDegraded
+	if kind == model.MonitorTypeTLS && alert == model.MonitorAlertDownAndDegraded {
+		return nil, fieldError("alert", errTLSDegraded)
+	}
+	if kind == model.MonitorTypeTLS && degraded != nil {
+		return nil, fieldError("degraded", errTLSDegraded)
 	}
 	if err := model.ValidateDegradedRule(degraded); err != nil {
-		return nil, err
+		return nil, fieldError("degraded", err)
 	}
 	return model.CanonicalDegradedRule(degraded), nil
 }
@@ -110,7 +113,7 @@ func degradedRuleSummary(r *model.MonitorDegradedRule) string {
 // reads as the default (store.MonitorAlertAfter).
 func validMonitorAlertAfter(n int) error {
 	if n < 0 || n > model.MonitorAlertAfterMax {
-		return fmt.Errorf("alert_after must be 1 to %d, or 0 for the default (%d)", model.MonitorAlertAfterMax, model.MonitorAlertAfterDefault)
+		return fieldErrorf("alert_after", "alert_after must be 1 to %d, or 0 for the default (%d)", model.MonitorAlertAfterMax, model.MonitorAlertAfterDefault)
 	}
 	return nil
 }
@@ -121,10 +124,10 @@ func validMonitorAlertAfter(n int) error {
 // model.MonitorTimeoutMaxSec), which the console mirrors.
 func validMonitorTiming(intervalSec, timeoutSec int) error {
 	if intervalSec < model.MonitorIntervalMinSec || intervalSec > model.MonitorIntervalMaxSec {
-		return fmt.Errorf("interval_sec must be %d to %d", model.MonitorIntervalMinSec, model.MonitorIntervalMaxSec)
+		return fieldErrorf("interval_sec", "interval_sec must be %d to %d", model.MonitorIntervalMinSec, model.MonitorIntervalMaxSec)
 	}
 	if timeoutSec < 1 || timeoutSec > model.MonitorTimeoutMaxSec || timeoutSec >= intervalSec {
-		return fmt.Errorf("timeout_sec must be 1 to %d and shorter than interval_sec", model.MonitorTimeoutMaxSec)
+		return fieldErrorf("timeout_sec", "timeout_sec must be 1 to %d and shorter than interval_sec", model.MonitorTimeoutMaxSec)
 	}
 	return nil
 }
@@ -182,7 +185,7 @@ func (s *Server) handleMonitorUpdate(w http.ResponseWriter, r *http.Request, p p
 	stored, err := s.store.UpdateMonitor(next, req.Version, now)
 	switch {
 	case errors.Is(err, store.ErrMonitorVersion):
-		writeError(w, http.StatusConflict, err)
+		writeError(w, http.StatusConflict, versionConflict(err))
 		return
 	case errors.Is(err, store.ErrMonitorManaged):
 		writeError(w, http.StatusConflict, err)
@@ -250,10 +253,10 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	}
 	tls := mon.Type == model.MonitorTypeTLS
 	if req.Type != nil && strings.TrimSpace(*req.Type) != mon.Type {
-		return model.Monitor{}, nil, false, errMonitorMethodChange("method")
+		return model.Monitor{}, nil, false, fieldError("type", errMonitorMethodChange("method"))
 	}
 	if req.TargetNode != nil && strings.TrimSpace(*req.TargetNode) != mon.TargetNode {
-		return model.Monitor{}, nil, false, errMonitorMethodChange("target_node")
+		return model.Monitor{}, nil, false, fieldError("target_node", errMonitorMethodChange("target_node"))
 	}
 	// A check that names a node has the target the control plane resolves,
 	// which may have moved since the editor read it; target_node is what
@@ -266,13 +269,13 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 			}
 		}
 		if target != mon.Target {
-			return model.Monitor{}, nil, false, errMonitorMethodChange("target")
+			return model.Monitor{}, nil, false, fieldError("target", errMonitorMethodChange("target"))
 		}
 	}
 	if req.Name != nil {
 		name := strings.TrimSpace(*req.Name)
 		if name == "" {
-			return model.Monitor{}, nil, false, errors.New("name cannot be empty")
+			return model.Monitor{}, nil, false, fieldErrorf("name", "name cannot be empty")
 		}
 		note("name", name != mon.Name)
 		next.Name = name
@@ -287,10 +290,10 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	}
 	if req.Packets != nil {
 		if !model.MonitorKindSendsPackets(mon.Type) {
-			return model.Monitor{}, nil, false, errMonitorPacketsKinds
+			return model.Monitor{}, nil, false, fieldError("packets", errMonitorPacketsKinds)
 		}
 		if *req.Packets < 1 || *req.Packets > model.MonitorPacketsMax {
-			return model.Monitor{}, nil, false, fmt.Errorf("packets must be 1 to %d", model.MonitorPacketsMax)
+			return model.Monitor{}, nil, false, fieldErrorf("packets", "packets must be 1 to %d", model.MonitorPacketsMax)
 		}
 		note("packets", *req.Packets != model.MonitorPackets(mon))
 		next.Packets = *req.Packets
@@ -300,7 +303,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 			return model.Monitor{}, nil, false, err
 		}
 		if err := validMonitorRun(next); err != nil {
-			return model.Monitor{}, nil, false, err
+			return model.Monitor{}, nil, false, fieldError("interval_sec", err)
 		}
 	}
 	// An empty expect_status echoed by an editor on another kind changes
@@ -308,7 +311,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	expectSent := req.ExpectStatus != nil && (mon.Type == model.MonitorTypeHTTP || strings.TrimSpace(*req.ExpectStatus) != "")
 	if expectSent || len(req.Headers) > 0 {
 		if mon.Type != model.MonitorTypeHTTP {
-			return model.Monitor{}, nil, false, errors.New("expect_status and headers apply to http checks only")
+			return model.Monitor{}, nil, false, fieldErrorf("expect_status", "expect_status and headers apply to http checks only")
 		}
 		if req.ExpectStatus != nil {
 			next.ExpectStatus = *req.ExpectStatus
@@ -328,10 +331,10 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	}
 	if req.ThresholdDays != nil {
 		if !tls {
-			return model.Monitor{}, nil, false, errors.New("threshold_days applies to tls checks only")
+			return model.Monitor{}, nil, false, fieldErrorf("threshold_days", "threshold_days applies to tls checks only")
 		}
 		if *req.ThresholdDays < 1 || *req.ThresholdDays > tlsMonitorMaxThresholdDays {
-			return model.Monitor{}, nil, false, fmt.Errorf("threshold_days must be between 1 and %d", tlsMonitorMaxThresholdDays)
+			return model.Monitor{}, nil, false, fieldErrorf("threshold_days", "threshold_days must be between 1 and %d", tlsMonitorMaxThresholdDays)
 		}
 		note("threshold_days", *req.ThresholdDays != mon.ThresholdDays)
 		next.ThresholdDays = *req.ThresholdDays
@@ -369,7 +372,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	}
 	if tls {
 		if (req.AssignAll != nil && *req.AssignAll) || (req.NodeIDs != nil && len(*req.NodeIDs) > 0) || (req.PausedNodeIDs != nil && len(*req.PausedNodeIDs) > 0) {
-			return model.Monitor{}, nil, false, errors.New("a tls check runs on the control plane: it has no sources to assign or pause")
+			return model.Monitor{}, nil, false, fieldErrorf("node_ids", "a tls check runs on the control plane: it has no sources to assign or pause")
 		}
 		return next, changed, false, nil
 	}
@@ -385,7 +388,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 		list := cleanNodeList(*req.NodeIDs)
 		for _, nodeID := range list {
 			if !nodes[nodeID] && !slices.Contains(mon.NodeIDs, nodeID) {
-				return model.Monitor{}, nil, false, fmt.Errorf("node_ids names %q, which is not a node", nodeID)
+				return model.Monitor{}, nil, false, fieldErrorf("node_ids", "node_ids names %q, which is not a node", nodeID)
 			}
 		}
 		note("node_ids", !slices.Equal(list, cleanNodeList(mon.NodeIDs)))
@@ -405,7 +408,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 				return model.Monitor{}, nil, true, nil
 			}
 		case len(next.NodeIDs) == 0:
-			return model.Monitor{}, nil, false, errors.New("set assign_all or provide node_ids")
+			return model.Monitor{}, nil, false, fieldErrorf("node_ids", "set assign_all or provide node_ids")
 		default:
 			// Every source the edit names, kept or added, needs the
 			// caller's admin scope, as creating the check did.
@@ -424,7 +427,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 		list := cleanNodeList(*req.PausedNodeIDs)
 		for _, nodeID := range list {
 			if !assigned(nodeID) {
-				return model.Monitor{}, nil, false, fmt.Errorf("paused_node_ids names %q, which is not one of the check's sources", nodeID)
+				return model.Monitor{}, nil, false, fieldErrorf("paused_node_ids", "paused_node_ids names %q, which is not one of the check's sources", nodeID)
 			}
 			if !rbac.Allows(p.Principal, "monitor:admin", nodeID) {
 				writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied, "forbidden"))
@@ -458,7 +461,7 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 	})
 	if model.MonitorKindSendsPackets(next.Type) && next.Enabled && loadChanged {
 		if err := s.monitorTargetsAt(s.now()).checkPacketBudget(s.store.Monitors(), next); err != nil {
-			return model.Monitor{}, nil, false, err
+			return model.Monitor{}, nil, false, fieldError("interval_sec", err)
 		}
 	}
 	return next, changed, false, nil

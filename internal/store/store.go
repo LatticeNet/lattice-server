@@ -124,6 +124,14 @@ type State struct {
 	// check_definitions.go), by id. Written only on an edit; the monitors
 	// they expand into live in Monitors.
 	CheckDefinitions map[string]model.CheckDefinition `json:"check_definitions,omitempty"`
+	// CheckDefinitionsEnabled is the rollback projection of the definitions
+	// that adopted the path set's monitors (design 32 R1, fleet_mesh.go):
+	// on disk such a definition reads enabled false and its own setting
+	// lives here, so the release before the migration, which knows neither
+	// this map nor the adoption, plans it as a paused definition and
+	// re-owns the path set's ids instead of measuring every pair twice.
+	// Read back into the definitions on load; never set in memory.
+	CheckDefinitionsEnabled map[string]bool `json:"check_definitions_enabled,omitempty"`
 	// MonitorSettings is the operator's monitor history setting
 	// (monitor_settings.go), nil until one is saved. Written only on an edit.
 	MonitorSettings *model.MonitorSettings `json:"monitor_settings,omitempty"`
@@ -523,6 +531,7 @@ func openWithCipher(path string, cph secret.Cipher, syncParentDir func(string) e
 		return nil, err
 	}
 	migrateSubscriptionSecrets := subscriptionSecretsNeedMigration(s.state, s.cipher)
+	restoreProjection(&s.state)
 	if err := decryptState(&s.state, s.cipher); err != nil {
 		return nil, fmt.Errorf("store: %w", err)
 	}
@@ -1157,6 +1166,15 @@ func (st *State) ensureMaps() {
 	if st.GroupPolicies == nil {
 		st.GroupPolicies = map[string]model.GroupNetPolicy{}
 	}
+	// A policy stored before versions existed reads as version 1, so two
+	// editors who read it before its first save still conflict instead of
+	// the later one silently winning. Kept in memory; the next save writes it.
+	for id, gp := range st.GroupPolicies {
+		if gp.Version < 1 {
+			gp.Version = 1
+			st.GroupPolicies[id] = gp
+		}
+	}
 	if st.GeoRouting == nil {
 		st.GeoRouting = map[string]model.GeoRouting{}
 	}
@@ -1244,7 +1262,7 @@ func (s *Store) persistState(st State) (committed bool, err error) {
 	if err = os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return false, err
 	}
-	persist, err := encryptedState(st, s.cipher)
+	persist, err := encryptedState(projectedState(st), s.cipher)
 	if err != nil {
 		return false, fmt.Errorf("encrypt state: %w", err)
 	}
@@ -5248,18 +5266,52 @@ func (s *Store) DeleteGroup(id string) error {
 	return s.Save()
 }
 
-// UpsertGroupPolicy creates or updates a group-scoped network policy. The
-// policy ID is the key; callers mint it as "gnp_<id>" (see internal/id). Rules
-// (and their Ports) are deep-copied on store.
+// ErrGroupPolicyVersion is returned when an outbound policy save names a
+// version other than the stored one: the policy changed, or was deleted,
+// since the caller read it.
+var ErrGroupPolicyVersion = errors.New("outbound policy changed since it was read")
+
+// UpsertGroupPolicy creates or updates a group-scoped network policy without
+// a version check. The policy ID is the key; callers mint it as "gnp_<id>"
+// (see internal/id). Rules (and their Ports) are deep-copied on store.
 func (s *Store) UpsertGroupPolicy(p model.GroupNetPolicy) error {
+	_, err := s.SaveGroupPolicy(p, 0)
+	return err
+}
+
+// SaveGroupPolicy stores an outbound policy and returns it as stored. With
+// expected above zero the stored policy must exist at that version, or the
+// save is refused with ErrGroupPolicyVersion and nothing is written; zero
+// skips the check for clients that send no version. Every save moves the
+// version on by one.
+func (s *Store) SaveGroupPolicy(p model.GroupNetPolicy, expected int64) (model.GroupNetPolicy, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	prior, exists := s.state.GroupPolicies[p.ID]
+	if expected > 0 && (!exists || prior.Version != expected) {
+		return model.GroupNetPolicy{}, ErrGroupPolicyVersion
+	}
+	p.Version = prior.Version + 1
 	p.UpdatedAt = time.Now().UTC()
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = p.UpdatedAt
 	}
-	s.state.GroupPolicies[p.ID] = cloneGroupPolicy(p)
-	return s.Save()
+	// Staged, so a save that fails to persist leaves the version the caller
+	// read in place and its retry is not refused as stale.
+	staged := s.state
+	staged.GroupPolicies = make(map[string]model.GroupNetPolicy, len(s.state.GroupPolicies)+1)
+	for id, gp := range s.state.GroupPolicies {
+		staged.GroupPolicies[id] = gp
+	}
+	staged.GroupPolicies[p.ID] = cloneGroupPolicy(p)
+	committed, err := s.persistState(s.jsonPersistStateFrom(staged))
+	if committed {
+		s.state = staged
+	}
+	if err != nil {
+		return model.GroupNetPolicy{}, err
+	}
+	return cloneGroupPolicy(p), nil
 }
 
 // GroupPolicy returns a group policy by id (deep-copied).

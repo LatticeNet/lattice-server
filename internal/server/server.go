@@ -939,6 +939,11 @@ func New(opts Options) (*Server, error) {
 		}
 		s.startShareFetchStatsFlush()
 		s.startLineClientTemplateSync()
+		// Before the sweeps: the path set becomes check definitions once
+		// (design 32 R1), so the first sweep already plans them.
+		if _, err := s.migratePathSet(s.now()); err != nil {
+			s.logger.Printf("latency probes: %v", err)
+		}
 		s.startLatencyProbeSync()
 		s.startMonitorHistoryPrune()
 		s.startPathDegradedEvaluator()
@@ -1405,6 +1410,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))
 	mux.HandleFunc("/api/nodes/terminal-transport", s.withAuth("", s.handleNodeTerminalTransport))
 	mux.HandleFunc("/api/nodes/ip-config", s.withAuth("", s.handleNodeIPConfig))
+	// network is the node's effective network (design 32 D4): node:read on
+	// the node, then each section under its own read scope, refused whole.
+	mux.HandleFunc("/api/nodes/network", s.withAuth("", s.handleNodeNetwork))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
 	mux.HandleFunc("/api/tasks/counts", s.withAuth("", s.handleTaskCounts))
 	mux.HandleFunc("/api/tasks/cancel", s.withAuth("", s.handleCancelTask))
@@ -5513,8 +5521,12 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		s.monitorSaves.Lock()
 		defer s.monitorSaves.Unlock()
 		req.TargetNode = strings.TrimSpace(req.TargetNode)
-		if strings.TrimSpace(req.Name) == "" || (strings.TrimSpace(req.Target) == "" && req.TargetNode == "") {
-			writeError(w, http.StatusBadRequest, errors.New("name and target (or target_node) are required"))
+		if strings.TrimSpace(req.Name) == "" {
+			writeError(w, http.StatusBadRequest, fieldErrorf("name", "name and target (or target_node) are required"))
+			return
+		}
+		if strings.TrimSpace(req.Target) == "" && req.TargetNode == "" {
+			writeError(w, http.StatusBadRequest, fieldErrorf("target", "name and target (or target_node) are required"))
 			return
 		}
 		req.Alert = strings.TrimSpace(req.Alert)
@@ -5538,7 +5550,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		switch req.Type {
 		case model.MonitorTypeTCP, model.MonitorTypeHTTP, model.MonitorTypeICMP, model.MonitorTypeBeacon:
 			if !req.AssignAll && len(req.NodeIDs) == 0 {
-				writeError(w, http.StatusBadRequest, errors.New("set assign_all or provide node_ids"))
+				writeError(w, http.StatusBadRequest, fieldErrorf("node_ids", "set assign_all or provide node_ids"))
 				return
 			}
 			if req.AssignAll && principalHasNodeRestriction(p) {
@@ -5577,11 +5589,15 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 				err = validMonitorTiming(req.IntervalSec, req.TimeoutSec)
 			}
 			if err == nil {
-				err = validMonitorRun(req)
+				err = fieldError("interval_sec", validMonitorRun(req))
 			}
 			if err == nil && model.MonitorKindSendsPackets(req.Type) {
 				req.Enabled = true
-				err = targets.checkPacketBudget(s.store.Monitors(), req)
+				err = fieldError("interval_sec", targets.checkPacketBudget(s.store.Monitors(), req))
+			}
+			if err != nil && apiErrorField(err) == "" {
+				// The kind's own target rules: the address, or the node it names.
+				err = fieldError(map[bool]string{true: "target_node", false: "target"}[req.TargetNode != ""], err)
 			}
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err)
@@ -5589,7 +5605,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			}
 		case model.MonitorTypeTLS:
 			if req.TargetNode != "" || req.Packets != 0 || req.ExpectStatus != "" || len(req.Headers) > 0 {
-				writeError(w, http.StatusBadRequest, errors.New("a tls check takes a host:port target and a warning window; target_node, packets, expect_status and headers do not apply"))
+				writeError(w, http.StatusBadRequest, fieldErrorf("type", "a tls check takes a host:port target and a warning window; target_node, packets, expect_status and headers do not apply"))
 				return
 			}
 			// A tls monitor has no node to be restricted to, so a token that
@@ -5600,12 +5616,12 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			}
 			normalized, err := normalizeTLSMonitor(req)
 			if err != nil {
-				writeError(w, http.StatusBadRequest, err)
+				writeError(w, http.StatusBadRequest, fieldError("target", err))
 				return
 			}
 			req = normalized
 		default:
-			writeError(w, http.StatusBadRequest, errors.New("only tcp, http, icmp, beacon and tls monitors are supported"))
+			writeError(w, http.StatusBadRequest, fieldErrorf("type", "only tcp, http, icmp, beacon and tls monitors are supported"))
 			return
 		}
 		if err := validMonitorTiming(req.IntervalSec, req.TimeoutSec); err != nil {
@@ -10920,6 +10936,7 @@ func writeError(w http.ResponseWriter, status int, err error) {
 			Code:      publicAPIErrorCode(status, err),
 			Message:   apiErrorMessage(status, err),
 			RequestID: requestID,
+			Field:     apiErrorField(err),
 		},
 	})
 }

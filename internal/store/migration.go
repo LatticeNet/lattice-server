@@ -32,6 +32,7 @@ func LoadJSONState(path string, cph secret.Cipher) (State, error) {
 	if err := json.Unmarshal(data, &st); err != nil {
 		return State{}, err
 	}
+	restoreProjection(&st)
 	if err := decryptState(&st, cph); err != nil {
 		return State{}, fmt.Errorf("load json state: %w", err)
 	}
@@ -52,7 +53,7 @@ func WriteJSONState(path string, st State, cph secret.Cipher, opts MigrationOpti
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	persist, err := encryptedState(st, cph)
+	persist, err := encryptedState(projectedState(st), cph)
 	if err != nil {
 		return fmt.Errorf("encrypt json state: %w", err)
 	}

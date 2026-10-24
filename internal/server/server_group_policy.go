@@ -199,7 +199,7 @@ func (s *Server) handleGroupPolicy(w http.ResponseWriter, r *http.Request, p pri
 				// The same refusal as for a policy out of reach, so a
 				// confined caller cannot tell an unknown id from one it
 				// may not touch (security review of S3a).
-				s.refuseConfinedPolicyChange(w, p, "this outbound policy")
+				s.refuseConfinedPolicyChange(w, p)
 				return
 			}
 			if ok {
@@ -295,13 +295,13 @@ func (s *Server) authorizeOutboundPolicyWrite(w http.ResponseWriter, p principal
 	}
 	if len(scope.Groups) > 0 || scope.All {
 		return deny("node-restricted token named a node group or the whole fleet as a policy target",
-			what+" targets a node group or the whole fleet, which a token carrying a server allowlist cannot do; name the nodes instead")
+			"an outbound policy that targets a node group or the whole fleet needs a token with fleet scope: a token confined to some nodes can create, change or delete only policies that target nodes it holds, because a group can grow to nodes outside your reach. Name the nodes, or ask an operator with fleet scope")
 	}
 	ids := append(append([]string(nil), scope.Nodes...), scope.Exclude...)
 	if prior != nil {
 		priorScope := prior.TargetScope()
 		if len(priorScope.Groups) > 0 || priorScope.All {
-			s.refuseConfinedPolicyChange(w, p, what)
+			s.refuseConfinedPolicyChange(w, p)
 			return false
 		}
 		ids = append(append(ids, priorScope.Nodes...), priorScope.Exclude...)
@@ -319,7 +319,7 @@ func (s *Server) authorizeOutboundPolicyWrite(w http.ResponseWriter, p principal
 		switch rule.Remote.Kind {
 		case model.NetRefGroup:
 			return deny("node-restricted token named a node group as a policy remote",
-				what+" names a node group as a remote, which a token carrying a server allowlist cannot do; name the nodes instead")
+				"a rule whose remote is a node group needs a token with fleet scope: a token confined to some nodes can name only nodes as remotes, because a group can grow to nodes outside your reach. Name the nodes, or ask an operator with fleet scope")
 		case model.NetRefNode:
 			remotes = append(remotes, rule.Remote.NodeID)
 		}
@@ -330,7 +330,7 @@ func (s *Server) authorizeOutboundPolicyWrite(w http.ResponseWriter, p principal
 // refuseConfinedPolicyChange answers a node-restricted caller that names an
 // existing group or fleet policy, or an id that resolves to nothing, with one
 // refusal, so the answer does not say which.
-func (s *Server) refuseConfinedPolicyChange(w http.ResponseWriter, p principal, what string) {
+func (s *Server) refuseConfinedPolicyChange(w http.ResponseWriter, p principal) {
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:       id.New("audit"),
 		Action:   "authorize.nodeset",
@@ -339,7 +339,7 @@ func (s *Server) refuseConfinedPolicyChange(w http.ResponseWriter, p principal, 
 		Reason:   "node-restricted token named a policy it cannot change",
 	})
 	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied,
-		what+" is not one a token carrying a server allowlist can change"))
+		"a token confined to some nodes cannot change or delete this outbound policy: either it does not exist, or it targets a node group or the whole fleet, which can grow to nodes outside your reach. Ask an operator with fleet scope"))
 }
 
 func (s *Server) upsertGroupPolicy(req model.GroupNetPolicy, scope model.TargetSelector, p principal) (groupPolicyView, error) {
@@ -478,7 +478,7 @@ func (s *Server) handleDeleteGroupPolicy(w http.ResponseWriter, r *http.Request,
 	// this check could turn into an oracle.
 	gp, ok := s.store.GroupPolicy(req.ID)
 	if !ok && principalHasNodeRestriction(p) {
-		s.refuseConfinedPolicyChange(w, p, "deleting this outbound policy")
+		s.refuseConfinedPolicyChange(w, p)
 		return
 	}
 	if ok && !s.authorizeOutboundPolicyWrite(w, p, "deleting this outbound policy", gp.TargetScope(), nil, &gp) {

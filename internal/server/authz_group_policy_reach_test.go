@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -12,8 +13,9 @@ import (
 // TestGroupPolicyGroupTargetsNeedAnUnrestrictedPrincipal pins the current
 // disposition of finding E (2026-09-01 multi-operator audit). The first fix
 // refused every node-restricted token from group policy writes; the follow-up
-// let a confined token define and delete policy for a group it fully reached
-// at write time. Design 32 replaced that reach rule: a stored group selector
+// decision (revised after the 2026-09-07 review) let a confined token define
+// and delete policy for a group it fully reached at write time. Design 32
+// reverses that follow-up decision: a stored group selector
 // is expanded at plan time by whoever plans, the fleet-wide plan an
 // unrestricted operator runs applies a confined author's group policy to
 // every node the group resolves to then, and a selector-backed group grows on
@@ -38,7 +40,7 @@ func TestGroupPolicyGroupTargetsNeedAnUnrestrictedPrincipal(t *testing.T) {
 	confined := createPAT(t, handler, cookies, csrf, []string{"netpolicy:admin", "netpolicy:read"}, []string{"node-a"})
 	unrestricted := createPAT(t, handler, cookies, csrf, []string{"netpolicy:admin", "netpolicy:read"}, nil)
 
-	upsert := func(token, groupID string) (int, string) {
+	upsert := func(token, groupID string) (int, string, string) {
 		res := doBearerJSON(t, handler, http.MethodPost, "/api/group-policies",
 			`{"scope_group_id":"`+groupID+`","enabled":true}`, token)
 		defer res.Body.Close()
@@ -48,18 +50,34 @@ func TestGroupPolicyGroupTargetsNeedAnUnrestrictedPrincipal(t *testing.T) {
 			ID string `json:"id"`
 		}
 		json.Unmarshal(body.Bytes(), &out)
-		return res.StatusCode, out.ID
+		return res.StatusCode, out.ID, body.String()
 	}
-	del := func(token, policyID string) int {
+	del := func(token, policyID string) (int, string) {
 		res := doBearerJSON(t, handler, http.MethodPost, "/api/group-policies/delete",
 			`{"id":"`+policyID+`"}`, token)
-		res.Body.Close()
-		return res.StatusCode
+		defer res.Body.Close()
+		body := new(bytes.Buffer)
+		body.ReadFrom(res.Body)
+		return res.StatusCode, body.String()
+	}
+	// A refusal says why and what the caller can do instead.
+	explains := func(t *testing.T, raw string) {
+		t.Helper()
+		for _, want := range []string{"outside your reach", "ask an operator with fleet scope"} {
+			if !strings.Contains(strings.ToLower(raw), want) {
+				t.Fatalf("refusal must say %q, got %s", want, raw)
+			}
+		}
 	}
 
 	for _, groupID := range []string{"g-in", "g-span"} {
-		if code, _ := upsert(confined, groupID); code != http.StatusForbidden {
+		code, _, raw := upsert(confined, groupID)
+		if code != http.StatusForbidden {
 			t.Fatalf("confined token must be refused a group target (%s), got %d", groupID, code)
+		}
+		explains(t, raw)
+		if !strings.Contains(strings.ToLower(raw), "name the nodes") {
+			t.Fatalf("a refused group target must point at naming the nodes, got %s", raw)
 		}
 	}
 	if policies := st.GroupPolicies(); len(policies) != 0 {
@@ -67,24 +85,26 @@ func TestGroupPolicyGroupTargetsNeedAnUnrestrictedPrincipal(t *testing.T) {
 	}
 
 	// An unrestricted token with the same scopes proceeds, on either group.
-	code, inID := upsert(unrestricted, "g-in")
+	code, inID, _ := upsert(unrestricted, "g-in")
 	if code != http.StatusOK {
 		t.Fatalf("unrestricted token must define the in-reach group policy, got %d", code)
 	}
-	code, spanID := upsert(unrestricted, "g-span")
+	code, spanID, _ := upsert(unrestricted, "g-span")
 	if code != http.StatusOK {
 		t.Fatalf("unrestricted token must define the spanning policy, got %d", code)
 	}
 
 	// Delete follows the same rule.
 	for _, policyID := range []string{inID, spanID} {
-		if code := del(confined, policyID); code != http.StatusForbidden {
+		code, raw := del(confined, policyID)
+		if code != http.StatusForbidden {
 			t.Fatalf("confined token must not delete a group policy, got %d", code)
 		}
+		explains(t, raw)
 		if _, ok := st.GroupPolicy(policyID); !ok {
 			t.Fatal("the refused delete must not land")
 		}
-		if code := del(unrestricted, policyID); code != http.StatusOK {
+		if code, _ := del(unrestricted, policyID); code != http.StatusOK {
 			t.Fatalf("unrestricted token must delete the group policy, got %d", code)
 		}
 	}

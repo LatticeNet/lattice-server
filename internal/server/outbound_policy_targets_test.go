@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -419,5 +420,41 @@ func TestOutboundPolicyKeepsAStaleExclusionOnEdit(t *testing.T) {
 	}
 	if code, _, _ := postPolicy(t, handler, cookies, csrf, `{"id":"`+view.ID+`","scope":{"all":true,"exclude":["n2","ghost"]},"enabled":false}`); code != http.StatusBadRequest {
 		t.Fatalf("a new unknown exclusion must be refused, got %d", code)
+	}
+}
+
+// The group plan's clobber guard holds for every target shape: a node that
+// keeps a manual policy is reported as a conflict and left alone whether a
+// group, explicit nodes or the whole fleet reaches it, and the manual
+// document survives the plan. Without the guard reading the selector, the
+// node-targeted and fleet policies below would plan n1 and overwrite it.
+func TestOutboundPolicyPlanSkipsNodesWithAManualPolicy(t *testing.T) {
+	for _, scope := range []string{`{"nodes":["n1","n2"]}`, `{"all":true}`, `{"groups":["GROUP"]}`} {
+		t.Run(scope, func(t *testing.T) {
+			handler, st, cookies, csrf := outboundFleet(t, "n1", "n2")
+			group := decodeGroup(t, doJSON(t, handler, http.MethodPost, "/api/groups",
+				`{"name":"Both","slug":"both","members":["n1","n2"]}`, cookies, csrf))
+			manual := doJSON(t, handler, http.MethodPost, "/api/netpolicy", `{"target_node_id":"n1","enabled":true,"rules":[
+				{"id":"m1","action":"allow","direction":"egress","protocol":"tcp","ports":[5432],"remote":{"kind":"node","node_id":"n2"}}]}`, cookies, csrf)
+			if manual.StatusCode != http.StatusOK {
+				t.Fatalf("manual policy = %d %s", manual.StatusCode, readBody(t, manual))
+			}
+			manual.Body.Close()
+			body := `{"scope":` + strings.ReplaceAll(scope, "GROUP", group.ID) + `,"enabled":true,"rules":[{"id":"r1","action":"allow","direction":"egress","protocol":"tcp","ports":[443],"remote":{"kind":"any"}}]}`
+			if code, _, raw := postPolicy(t, handler, cookies, csrf, body); code != http.StatusOK {
+				t.Fatalf("policy = %d %s", code, raw)
+			}
+			plan := planOutbound(t, handler, cookies, csrf)
+			if got := affectedNodes(plan); !reflect.DeepEqual(got, []string{"n2"}) {
+				t.Fatalf("only n2 may be planned, got %v", got)
+			}
+			if len(plan.Conflicts) != 1 || plan.Conflicts[0].NodeID != "n1" {
+				t.Fatalf("n1 must be reported as a conflict, got %+v", plan.Conflicts)
+			}
+			kept, ok := st.NetPolicy("n1")
+			if !ok || kept.GroupDerived || len(kept.Rules) != 1 || kept.Rules[0].ID != "m1" {
+				t.Fatalf("the manual policy on n1 must survive the plan, got %+v (found %v)", kept, ok)
+			}
+		})
 	}
 }

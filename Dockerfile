@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 
-FROM golang:1.26-bookworm AS build
+# The Go stage runs on the build machine and cross-compiles (CGO is off), so
+# the arm64 variant is not compiled under emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
 
 WORKDIR /src
 
@@ -16,8 +18,10 @@ WORKDIR /src/lattice-server
 ARG VERSION=dev
 ARG COMMIT=unknown
 ARG DATE=unknown
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+# No defaults: BuildKit fills these per platform, and a default here would
+# override that and put an amd64 binary into the arm64 image.
+ARG TARGETOS
+ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     -trimpath \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \

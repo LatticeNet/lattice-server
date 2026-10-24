@@ -1410,6 +1410,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/nodes/debug", s.withAuth("", s.handleNodeDebugPolicy))
 	mux.HandleFunc("/api/nodes/terminal-transport", s.withAuth("", s.handleNodeTerminalTransport))
 	mux.HandleFunc("/api/nodes/ip-config", s.withAuth("", s.handleNodeIPConfig))
+	// network is the node's effective network (design 32 D4): node:read on
+	// the node, then each section under its own read scope, refused whole.
+	mux.HandleFunc("/api/nodes/network", s.withAuth("", s.handleNodeNetwork))
 	mux.HandleFunc("/api/tasks", s.withAuth("", s.handleTasks))
 	mux.HandleFunc("/api/tasks/counts", s.withAuth("", s.handleTaskCounts))
 	mux.HandleFunc("/api/tasks/cancel", s.withAuth("", s.handleCancelTask))

@@ -5,6 +5,7 @@
 #   knock [-u] [-d MS] [-v] HOST PORT PORT PORT
 #   knock [-d MS] HOST PORT,PORT,PORT
 #   knock HOST                     sequence from the config file
+#   knock -c PORT HOST ...         also check that ssh answers on PORT
 #   knock --version | --help
 #
 # The first form is the argument shape of the packaged knock client (the
@@ -24,9 +25,16 @@
 # - It never prints the sequence, and by default it sends from inside bash
 #   through /dev/udp, so no child process carries a port in its argv where ps,
 #   /proc or execve auditing could read it. The sequence is a credential.
+# - When it knows the ssh port (an ssh alias, or -c PORT), it waits for the
+#   ssh server's identification line before saying the gate opened, and exits
+#   4 when none comes. A knock can arrive and still open nothing for you: a
+#   carrier NAT that sends UDP and TCP from different public addresses opens
+#   the gate for the knock's address while ssh connects from the other. A TCP
+#   connect alone proves nothing, because a proxy client's TUN completes the
+#   handshake itself and only closes once its upstream fails.
 set -u
 
-KNOCK_VERSION="0.1.0-alpha.1"
+KNOCK_VERSION="0.1.0-alpha.2"
 
 CONF="${KNOCK_CONF:-$HOME/.config/lattice/knock.conf}"
 WANT="${KNOCK_PORTS:-3}"
@@ -34,6 +42,10 @@ DELAY_MS="${KNOCK_DELAY_MS:-500}"
 SETTLE_MS="${KNOCK_SETTLE_MS:-1000}"
 SENDER="${KNOCK_SENDER:-auto}"
 QUIET="${KNOCK_QUIET:-0}"
+CHECK_PORT="${KNOCK_CHECK_PORT:-}"
+CHECK_SECS="${KNOCK_CHECK_TIMEOUT:-5}"
+SSH_BIN="${KNOCK_SSH:-ssh}"
+NO_CHECK=0
 VERBOSE=0
 
 die() {
@@ -54,6 +66,10 @@ Usage:
   knock HOST                   sequence looked up in the config file
 
 Options:
+  -c, --check PORT check that an ssh server answers on PORT after the knock;
+                   exit 4 when none does (an ssh alias is checked on its own
+                   port without this)
+      --no-check   skip that check
   -u, --udp        accepted for the packaged client's syntax; knocks are always UDP
   -d, --delay MS   milliseconds between knocks (default 500)
   -v, --verbose    say which address and sender are used (never the ports)
@@ -71,11 +87,17 @@ Environment:
   KNOCK_BEFORE     command run before any packet leaves, with the host and the
                    resolved address as arguments; a non-zero exit stops the knock
   KNOCK_QUIET      1 to drop the note about ports on the command line
+  KNOCK_CHECK_PORT default for -c
+  KNOCK_CHECK_TIMEOUT
+                   seconds to wait for the ssh server's line, default 5
+  KNOCK_SSH        the ssh used to expand aliases, default ssh
 
 Ports typed on the command line stay in your shell history. The config file
 keeps them out of it; so does a leading space, in shells set to ignore such
 lines. Knock from the address you will connect from: the gate opens for the
-source the knock arrived from.
+source the knock arrived from. Exit status: 0 knocked (and ssh answered, when
+checked), 1 an error, 2 a usage error, 3 KNOCK_BEFORE stopped it, 4 knocked
+but ssh did not answer.
 EOF
 }
 
@@ -90,6 +112,11 @@ while [ $# -gt 0 ]; do
       DELAY_MS="$2"; shift 2 ;;
     --delay=*) DELAY_MS="${1#--delay=}"; shift ;;
     -d[0-9]*) DELAY_MS="${1#-d}"; shift ;;
+    -c|--check)
+      [ $# -ge 2 ] || die "$1 needs the ssh port" 2
+      CHECK_PORT="$2"; shift 2 ;;
+    --check=*) CHECK_PORT="${1#--check=}"; shift ;;
+    --no-check) NO_CHECK=1; shift ;;
     -6|--ipv6) die "the knock gate admits IPv4 sources only; -6 cannot open it" 2 ;;
     --) shift; break ;;
     -*) die "unknown option $1 (see knock --help)" 2 ;;
@@ -100,6 +127,14 @@ done
 case "$DELAY_MS" in ''|*[!0-9]*) die "-d takes whole milliseconds, got '$DELAY_MS'" 2 ;; esac
 case "$SETTLE_MS" in ''|*[!0-9]*) die "KNOCK_SETTLE_MS takes whole milliseconds" 2 ;; esac
 case "$WANT" in ''|*[!0-9]*|0) die "KNOCK_PORTS must be a positive whole number" 2 ;; esac
+case "$CHECK_SECS" in ''|*[!0-9]*|0) die "KNOCK_CHECK_TIMEOUT takes whole seconds above zero" 2 ;; esac
+valid_port() {
+  case "$1" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+if [ -n "$CHECK_PORT" ]; then
+  valid_port "$CHECK_PORT" || die "-c takes a port from 1 to 65535, got '$CHECK_PORT'" 2
+fi
 [ $# -ge 1 ] || { usage >&2; exit 2; }
 
 HOST="$1"
@@ -109,10 +144,27 @@ shift
 case "$HOST" in -*) die "a host cannot start with '-': $HOST" 2 ;; esac
 
 # The ssh alias first: `ssh -G` expands ~/.ssh/config, so `knock prod` knocks
-# the machine `ssh prod` would reach.
+# the machine `ssh prod` would reach. The same expansion without any config
+# tells whether ~/.ssh/config shaped this host at all: if it changed the
+# hostname or the port, `ssh HOST` is how it is reached, and that port is the
+# one to check.
+ssh_field() {
+  printf '%s\n' "$1" | awk -v k="$2" '$1 == k { print $2; exit }'
+}
 TARGET=""
-if command -v ssh >/dev/null 2>&1; then
-  TARGET=$(ssh -G "$HOST" 2>/dev/null | awk '/^hostname /{print $2; exit}')
+ALIAS_PORT=""
+if command -v "$SSH_BIN" >/dev/null 2>&1; then
+  SSH_CFG=$("$SSH_BIN" -G "$HOST" 2>/dev/null)
+  SSH_RAW=$("$SSH_BIN" -F /dev/null -G "$HOST" 2>/dev/null)
+  TARGET=$(ssh_field "$SSH_CFG" hostname)
+  shaped_port=$(ssh_field "$SSH_CFG" port)
+  if [ -n "$TARGET" ] &&
+    [ "$TARGET:$shaped_port" != "$(ssh_field "$SSH_RAW" hostname):$(ssh_field "$SSH_RAW" port)" ] &&
+    [ -z "$(ssh_field "$SSH_CFG" proxyjump)" ] && [ -z "$(ssh_field "$SSH_CFG" proxycommand)" ]; then
+    # Behind a jump host ssh never dials the target from here, so a check
+    # from here would test the wrong path.
+    ALIAS_PORT="$shaped_port"
+  fi
 fi
 [ -n "$TARGET" ] || TARGET="$HOST"
 case "$TARGET" in -*) die "ssh resolves $HOST to a name starting with '-'" 2 ;; esac
@@ -195,7 +247,17 @@ case "$SENDER" in
   nc) command -v nc >/dev/null 2>&1 || die "KNOCK_SENDER=nc, but nc is not installed" ;;
   *) die "KNOCK_SENDER must be bash or nc" 2 ;;
 esac
-say "host $HOST, address $ADDR, sender $SENDER, ${#PORTS[@]} ports, ${DELAY_MS}ms apart"
+if [ "$NO_CHECK" -eq 1 ]; then
+  CHECK_PORT=""
+elif [ -z "$CHECK_PORT" ] && valid_port "$ALIAS_PORT"; then
+  CHECK_PORT="$ALIAS_PORT"
+fi
+if [ -n "$CHECK_PORT" ] && ! bash_udp_works; then
+  # The same build switch gives bash /dev/tcp and /dev/udp.
+  printf 'knock: this bash cannot open TCP connections, so whether ssh answers is not checked\n' >&2
+  CHECK_PORT=""
+fi
+say "host $HOST, address $ADDR, sender $SENDER, ${#PORTS[@]} ports, ${DELAY_MS}ms apart${CHECK_PORT:+, then an ssh check}"
 
 if [ -n "${KNOCK_BEFORE:-}" ]; then
   sh -c "$KNOCK_BEFORE" knock-before "$HOST" "$ADDR" || die "KNOCK_BEFORE stopped the knock" 3
@@ -221,4 +283,39 @@ for i in "${!PORTS[@]}"; do
 done
 wait
 sleep "$settle"
+
+# ssh_answers ADDR PORT SECONDS: succeeds when the peer sends an ssh
+# identification line ("SSH-") within SECONDS.
+ssh_answers() {
+  local pid timer rc
+  (
+    exec 3<>"/dev/tcp/$1/$2" || exit 1
+    IFS= read -r -t "$3" line <&3 || exit 1
+    case "$line" in SSH-*) exit 0 ;; *) exit 1 ;; esac
+  ) 2>/dev/null &
+  pid=$!
+  # /dev/tcp has no connect timeout of its own, and a dropped SYN waits out
+  # the kernel's, over a minute on macOS. The timer's sleep must not hold
+  # the caller's stdout, or $(knock ...) waits for it.
+  (sleep "$3"; kill "$pid") >/dev/null 2>&1 </dev/null &
+  timer=$!
+  wait "$pid"
+  rc=$?
+  kill "$timer" 2>/dev/null
+  wait "$timer" 2>/dev/null
+  return "$rc"
+}
+
+if [ -n "$CHECK_PORT" ]; then
+  if ssh_answers "$ADDR" "$CHECK_PORT" "$CHECK_SECS"; then
+    printf 'knocked %s (%s), ssh answers\n' "$HOST" "$ADDR"
+    exit 0
+  fi
+  printf 'knock: knocked %s (%s), but no ssh server answered within %ss.\n' "$HOST" "$ADDR" "$CHECK_SECS" >&2
+  printf '       If the sequence is right, this network may send UDP and TCP from\n' >&2
+  printf '       different public addresses (a carrier NAT can), so the gate opened\n' >&2
+  printf '       for an address ssh does not use. Knock and ssh through one relay, or\n' >&2
+  printf '       use another network. --no-check skips this test.\n' >&2
+  exit 4
+fi
 printf 'knocked %s (%s)\n' "$HOST" "$ADDR"

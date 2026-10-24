@@ -455,6 +455,7 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 				kept = append(kept, rule)
 			}
 			gp.Rules = kept
+			gp.Version++
 			s.state.GroupPolicies[key] = gp
 		}
 	}
@@ -476,6 +477,7 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 			clone := cloneGroupPolicy(gp)
 			clone.Scope.Nodes = withoutString(clone.Scope.Nodes, nodeID)
 			clone.ScopeGroupID = ScopeGroupAlias(*clone.Scope)
+			clone.Version++
 			s.state.GroupPolicies[key] = clone
 		}
 	}

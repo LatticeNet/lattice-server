@@ -280,6 +280,63 @@ func TestNodeRemoteResolvesToNodeAddresses(t *testing.T) {
 	}
 }
 
+// A node group remote expands at compile time to every member's own
+// addresses (design 32 D3): members sorted, each pinned to /32 like a node
+// remote, an address shared by two members once. A member that is gone or
+// has no address yet adds nothing, and a group with no addressable member
+// drops the rule rather than leave it matching every source. An unknown
+// group fails closed.
+func TestGroupRemoteExpandsToMemberAddresses(t *testing.T) {
+	nodes := map[string]model.Node{
+		"b": {ID: "b", WireGuardIP: "10.66.0.3/32", PublicIP: "198.51.100.3"},
+		"a": {ID: "a", WireGuardIP: "10.66.0.2/16", PublicIP: "198.51.100.2"},
+		"c": {ID: "c"},
+	}
+	resolve := func(id string) (model.Node, bool) {
+		n, ok := nodes[id]
+		return n, ok
+	}
+	members := map[string][]string{"web": {"a", "b", "c", "gone"}, "empty": {"c"}}
+	groupMembers := func(id string) ([]string, bool) {
+		m, ok := members[id]
+		return m, ok
+	}
+	rule := func(group string, action string) model.GuardRule {
+		return model.GuardRule{ID: "from-" + group, Action: action, Direction: model.NetDirIngress,
+			Protocol: model.NetProtoTCP, Ports: []model.GuardPortRange{{From: 9100, To: 9100}},
+			Remote: model.NetEndpoint{Kind: model.NetRefGroup, GroupID: group}}
+	}
+	compile := func(rules ...model.GuardRule) (string, error) {
+		return CompileRuleset(CompileInput{
+			Binding:      model.NodeGuardBinding{NodeID: "n1", Managed: true},
+			Groups:       []model.SecurityGroup{{ID: "sg", Rules: rules}},
+			Zones:        ZoneMap(nil),
+			Resolve:      resolve,
+			GroupMembers: groupMembers,
+		})
+	}
+	ruleset, err := compile(rule("web", model.NetRuleAllow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ruleset, `ip saddr { 10.66.0.2, 10.66.0.3, 198.51.100.2, 198.51.100.3 } tcp dport { 9100 } accept`) {
+		t.Fatalf("group remote did not expand to its members' addresses:\n%s", ruleset)
+	}
+	if strings.Contains(ruleset, "10.66.0.0/16") {
+		t.Fatalf("a member's advertised prefix must not widen the rule:\n%s", ruleset)
+	}
+	empty, err := compile(rule("empty", model.NetRuleDeny))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(empty, "from-empty") || strings.Contains(empty, "tcp dport { 9100 } drop") {
+		t.Fatalf("a group with no addressable member must add no rule:\n%s", empty)
+	}
+	if _, err := compile(rule("ghost", model.NetRuleAllow)); err == nil || !strings.Contains(err.Error(), `remote node group "ghost" not found`) {
+		t.Fatalf("unknown group remote = %v, want fail-closed", err)
+	}
+}
+
 func TestCompileFailsClosedOnUnsupportedShapes(t *testing.T) {
 	base := func(rule model.GuardRule) error {
 		_, err := Compile(CompileInput{
@@ -303,7 +360,7 @@ func TestCompileFailsClosedOnUnsupportedShapes(t *testing.T) {
 		{"icmpv6", model.GuardRule{ID: "r", Action: model.NetRuleDeny, Direction: model.NetDirIngress, Protocol: model.GuardProtoICMPv6, Remote: pub}, "not operator-editable"},
 		{"log", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: pub, Log: true}, "log is not supported"},
 		{"domain remote", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: model.NetEndpoint{Kind: model.NetRefDomain, Domain: "x.example"}}, "egress-only"},
-		{"group remote", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: model.NetEndpoint{Kind: model.NetRefGroup, GroupID: "g"}}, "expanded to node refs"},
+		{"group remote without members", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: model.NetEndpoint{Kind: model.NetRefGroup, GroupID: "g"}}, "need the node group's members"},
 		{"bad action", model.GuardRule{ID: "r", Action: "maybe", Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: pub}, "invalid action"},
 		{"any protocol with ports", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoAny, Ports: p80, Remote: pub}, "cannot carry ports"},
 		{"unknown zone", model.GuardRule{ID: "r", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP, Ports: p80, Remote: model.NetEndpoint{Kind: model.NetRefZone, ZoneID: "ghost"}}, "not found"},

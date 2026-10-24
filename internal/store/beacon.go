@@ -409,6 +409,10 @@ func (s *Store) CompleteBeaconCompanionTask(approvalID, rulesetSHA, managedSHA, 
 			binding.LastAppliedAt = finishedAt
 			binding.AppliedTableSHA = managedSHA
 			binding.LastError = ""
+			// The companion recompiled the whole table, derived groups included.
+			if node, ok := s.state.Nodes[approval.NodeID]; ok && binding.Managed {
+				binding.AppliedDerived = derivedOf(s.derivedGuardGroupsLocked(node, binding.GroupIDs))
+			}
 		} else {
 			binding.LastError = approval.Reason
 		}

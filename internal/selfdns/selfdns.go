@@ -5,6 +5,7 @@
 package selfdns
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -26,6 +27,27 @@ const (
 	NFTGuardPath = "/etc/lattice/guard.nft"
 	CoreDNSPath  = "/usr/local/bin/coredns"
 )
+
+// ApplyAction is the action of a self-host DNS approval; the deployment's
+// id follows ApplyActionPrefix, base64url without padding, so an approval
+// names the one deployment it applies.
+const (
+	ApplyAction       = "apply-config"
+	ApplyActionPrefix = ApplyAction + ":"
+)
+
+// DeploymentIDOf reads the deployment id an approval action carries.
+func DeploymentIDOf(action string) (string, bool) {
+	encoded, ok := strings.CutPrefix(action, ApplyActionPrefix)
+	if !ok {
+		return "", false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(raw) == 0 {
+		return "", false
+	}
+	return string(raw), true
+}
 
 var dnsLabelRe = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)
 var (

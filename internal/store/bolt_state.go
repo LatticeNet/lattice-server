@@ -2975,7 +2975,7 @@ func (bs *BoltStateStore) DeleteGroup(id string) error {
 		for _, def := range defMap {
 			defs = append(defs, def)
 		}
-		if err := groupInUse(id, groups, policies, defs); err != nil {
+		if err := groupInUse(id, groups, policies, defs, groupGuardUses{}); err != nil {
 			return err
 		}
 		return deleteRecord(tx, boltBucketGroups, id)

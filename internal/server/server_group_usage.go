@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
@@ -26,8 +27,9 @@ type groupUse struct {
 }
 
 const (
-	groupUseOutboundPolicy = "outbound_policy"
-	groupUseCheck          = "check"
+	groupUseOutboundPolicy       = "outbound_policy"
+	groupUseCheck                = "check"
+	groupUseSecurityGroupBinding = "security_group_binding"
 )
 
 // groupUseSource is one kind of object that can name a node group, with the
@@ -46,6 +48,53 @@ type groupUseSource struct {
 var groupUseSources = []groupUseSource{
 	{kind: groupUseCheck, scope: "monitor:read", collect: (*Server).checkDefinitionGroupUses},
 	{kind: groupUseOutboundPolicy, scope: "netpolicy:read", collect: (*Server).outboundPolicyGroupUses},
+	{kind: groupUseSecurityGroupBinding, scope: "netguard:read", collect: (*Server).securityGroupBindingGroupUses},
+}
+
+// securityGroupBindingGroupUses lists what NetGuard holds that names the
+// group (S4): each security group its binding applies to its members, as
+// target, and each security group or node binding whose rules take the
+// group as a remote, as remote. NetGuard's catalogue is read by an
+// unrestricted principal only (requireGlobalNetGuardScope), so a viewer
+// confined to some nodes is given the count.
+func (s *Server) securityGroupBindingGroupUses(groupID string, viewer *principal) ([]groupUse, int) {
+	out := make([]groupUse, 0)
+	if b, ok := s.store.NodeGroupGuardBinding(groupID); ok {
+		for _, sgID := range b.SecurityGroupIDs {
+			label := sgID
+			if sg, ok := s.store.SecurityGroup(sgID); ok && sg.Name != "" {
+				label = sg.Name
+			}
+			out = append(out, groupUse{Kind: groupUseSecurityGroupBinding, ID: sgID, Label: label, Role: "target"})
+		}
+	}
+	for _, sg := range s.store.SecurityGroups() {
+		if guardRulesNameNodeGroup(sg.Rules, groupID) {
+			out = append(out, groupUse{Kind: groupUseSecurityGroupBinding, ID: sg.ID, Label: sg.Name, Role: "remote"})
+		}
+	}
+	for _, binding := range s.store.NodeGuardBindings() {
+		if guardRulesNameNodeGroup(binding.Overrides, groupID) {
+			name := s.nodeName(binding.NodeID)
+			if name == "" {
+				name = binding.NodeID
+			}
+			out = append(out, groupUse{Kind: groupUseSecurityGroupBinding, ID: binding.NodeID, Label: "override on " + name, Role: "remote"})
+		}
+	}
+	if viewer != nil && principalHasNodeRestriction(*viewer) {
+		return []groupUse{}, len(out)
+	}
+	return out, 0
+}
+
+func guardRulesNameNodeGroup(rules []model.GuardRule, groupID string) bool {
+	for _, rule := range rules {
+		if rule.Remote.Kind == model.NetRefGroup && rule.Remote.GroupID == groupID {
+			return true
+		}
+	}
+	return false
 }
 
 // checkDefinitionGroupUses lists the check definitions (design 32 D1) that
@@ -207,6 +256,11 @@ func groupUseNoun(kind string, n int) string {
 			return "check definitions"
 		}
 		return "check definition"
+	case groupUseSecurityGroupBinding:
+		if n != 1 {
+			return "security-group bindings"
+		}
+		return "security-group binding"
 	}
 	return strings.ReplaceAll(kind, "_", " ")
 }

@@ -10,12 +10,19 @@ import (
 )
 
 // GroupInUseError is DeleteGroup's refusal: the group still has children, or
-// outbound policies or check definitions still name it. The ids are sorted.
+// outbound policies, check definitions or NetGuard records still name it.
+// The ids are sorted.
 type GroupInUseError struct {
 	GroupID            string
 	ChildIDs           []string
 	PolicyIDs          []string
 	CheckDefinitionIDs []string
+	// GuardBinding is true when the group binds security groups (S4).
+	GuardBinding bool
+	// SecurityGroupIDs have a rule whose remote is the group, and
+	// GuardOverrideNodeIDs a binding override that does.
+	SecurityGroupIDs     []string
+	GuardOverrideNodeIDs []string
 }
 
 func (e *GroupInUseError) Error() string {
@@ -29,7 +36,45 @@ func (e *GroupInUseError) Error() string {
 	if len(e.CheckDefinitionIDs) > 0 {
 		parts = append(parts, "check definition "+strings.Join(e.CheckDefinitionIDs, ", "))
 	}
+	if e.GuardBinding {
+		parts = append(parts, "its security-group binding")
+	}
+	if len(e.SecurityGroupIDs) > 0 {
+		parts = append(parts, "security group "+strings.Join(e.SecurityGroupIDs, ", "))
+	}
+	if len(e.GuardOverrideNodeIDs) > 0 {
+		parts = append(parts, "the guard binding of node "+strings.Join(e.GuardOverrideNodeIDs, ", "))
+	}
 	return fmt.Sprintf("group %q is in use by %s; reparent the children and change or delete the rest first", e.GroupID, strings.Join(parts, " and "))
+}
+
+// groupGuardUses is what NetGuard holds that names a node group: the
+// group's own security-group binding, and rules whose remote is the group.
+// Only the JSON state store holds NetGuard records; the bolt one passes the
+// zero value.
+type groupGuardUses struct {
+	binding          bool
+	securityGroupIDs []string
+	overrideNodeIDs  []string
+}
+
+// guardUsesOfGroupLocked collects groupGuardUses from the live state.
+func (s *Store) guardUsesOfGroupLocked(groupID string) groupGuardUses {
+	var uses groupGuardUses
+	if b, ok := s.state.NodeGroupGuardBindings[groupID]; ok && len(b.SecurityGroupIDs) > 0 {
+		uses.binding = true
+	}
+	for id, sg := range s.state.SecurityGroups {
+		if guardRulesReferenceGroup(sg.Rules, groupID) {
+			uses.securityGroupIDs = append(uses.securityGroupIDs, id)
+		}
+	}
+	for nodeID, binding := range s.state.GuardBindings {
+		if guardRulesReferenceGroup(binding.Overrides, groupID) {
+			uses.overrideNodeIDs = append(uses.overrideNodeIDs, nodeID)
+		}
+	}
+	return uses
 }
 
 // GroupPolicyNamesGroup reports whether an outbound policy names a node
@@ -55,8 +100,9 @@ func CheckDefinitionNamesGroup(def model.CheckDefinition, groupID string) (sourc
 }
 
 // groupInUse is the shared in-use test of both state stores.
-func groupInUse(id string, groups []model.Group, policies []model.GroupNetPolicy, defs []model.CheckDefinition) error {
-	inUse := &GroupInUseError{GroupID: id}
+func groupInUse(id string, groups []model.Group, policies []model.GroupNetPolicy, defs []model.CheckDefinition, guard groupGuardUses) error {
+	inUse := &GroupInUseError{GroupID: id, GuardBinding: guard.binding,
+		SecurityGroupIDs: guard.securityGroupIDs, GuardOverrideNodeIDs: guard.overrideNodeIDs}
 	for _, child := range groups {
 		if child.ParentID == id {
 			inUse.ChildIDs = append(inUse.ChildIDs, child.ID)
@@ -72,11 +118,14 @@ func groupInUse(id string, groups []model.Group, policies []model.GroupNetPolicy
 			inUse.CheckDefinitionIDs = append(inUse.CheckDefinitionIDs, def.ID)
 		}
 	}
-	if len(inUse.ChildIDs) == 0 && len(inUse.PolicyIDs) == 0 && len(inUse.CheckDefinitionIDs) == 0 {
+	if len(inUse.ChildIDs) == 0 && len(inUse.PolicyIDs) == 0 && len(inUse.CheckDefinitionIDs) == 0 &&
+		!inUse.GuardBinding && len(inUse.SecurityGroupIDs) == 0 && len(inUse.GuardOverrideNodeIDs) == 0 {
 		return nil
 	}
 	sort.Strings(inUse.ChildIDs)
 	sort.Strings(inUse.PolicyIDs)
 	sort.Strings(inUse.CheckDefinitionIDs)
+	sort.Strings(inUse.SecurityGroupIDs)
+	sort.Strings(inUse.GuardOverrideNodeIDs)
 	return inUse
 }

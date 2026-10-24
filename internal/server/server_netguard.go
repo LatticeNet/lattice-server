@@ -16,7 +16,6 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/netguard"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
-	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -473,7 +472,6 @@ func (s *Server) compileInputSnapshotFor(p principal, nodeID string) (netguard.C
 		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
 		Resolve: resolver.Resolve,
 		Beacon:  s.beaconCompanionFor(nodeID),
-		DNS:     s.dnsListenersFor(nodeID, nil),
 	}, snapshot, resolver, nil
 }
 
@@ -487,81 +485,6 @@ func (s *Server) beaconCompanionFor(nodeID string) *netguard.BeaconCompanion {
 		return nil
 	}
 	return &netguard.BeaconCompanion{Bind: t.Companion.Bind, Port: t.Companion.Port, Allow: append([]string(nil), t.Companion.Allow...)}
-}
-
-// dnsListenersFor is the self-host DNS listener set in force on the node,
-// read from what was approved rather than from the stored deployment: for
-// each CoreDNS deployment on this node the most recently decided selfdns
-// approval that is applied, or approved with its apply task queued, names
-// the listeners its plan opened. An edit to a running deployment changes
-// nothing here until its new plan is approved and queued, an approval never
-// queued opens nothing, and a failed re-apply (rejected) falls back to the
-// plan that last applied, whose resolver the apply script left running.
-// Every NetGuard compile of the node carries the set, so a NetGuard plan
-// keeps a running resolver's ports open.
-//
-// A disabled deployment, one moved to another node, and a deleted one hold
-// nothing open: the operator asked for the resolver to stop serving there,
-// so the next NetGuard plan may close its ports before a DNS plan does.
-//
-// planned, when set, is the deployment a DNS plan is being rendered for on
-// its node: it contributes its current listeners in place of its approved
-// ones, so the plan opens the ports the plan itself starts. The approve that
-// follows makes that plan the newest decided one, and from then on every
-// compile agrees.
-func (s *Server) dnsListenersFor(nodeID string, planned *model.DNSDeployment) []netguard.DNSListener {
-	override := planned != nil && planned.NodeID == nodeID
-	newest := map[string]model.Approval{}
-	for _, decided := range s.store.DecidedApprovals("selfdns", nodeID) {
-		approval := decided.Approval
-		if approval.Status == model.ApprovalApproved && !decided.Queued {
-			continue
-		}
-		depID, err := selfDNSApprovalDeploymentID(approval.Action)
-		if err != nil || (override && depID == planned.ID) {
-			continue
-		}
-		// Decision order, not plan order: an older plan approved after a
-		// newer one is what the node ran last.
-		if current, ok := newest[depID]; ok && (approval.UpdatedAt.Before(current.UpdatedAt) ||
-			(approval.UpdatedAt.Equal(current.UpdatedAt) && approval.ID < current.ID)) {
-			continue
-		}
-		newest[depID] = approval
-	}
-	depIDs := make([]string, 0, len(newest))
-	for depID := range newest {
-		depIDs = append(depIDs, depID)
-	}
-	sort.Strings(depIDs)
-	var listeners []selfdns.Listener
-	for _, depID := range depIDs {
-		dep, ok := s.store.DNSDeployment(depID)
-		if !ok || dep.Engine != model.DNSEngineCoreDNS || dep.Disabled || dep.NodeID != nodeID {
-			continue
-		}
-		approval := newest[depID]
-		firewall, err := selfdns.ParsePlanFirewall(approval.Plan)
-		if err != nil {
-			s.logger.Printf("netguard: dns approval %s on node %s has no readable listener set, so it opens no ports: %v", approval.ID, nodeID, err)
-			continue
-		}
-		listeners = append(listeners, firewall.Listeners...)
-	}
-	if override {
-		listeners = append(listeners, selfdns.Listeners(*planned)...)
-	}
-	return netGuardDNSListeners(listeners)
-}
-
-// netGuardDNSListeners maps the sockets a DNS plan opens onto the NetGuard
-// compile input.
-func netGuardDNSListeners(in []selfdns.Listener) []netguard.DNSListener {
-	out := make([]netguard.DNSListener, 0, len(in))
-	for _, l := range in {
-		out = append(out, netguard.DNSListener{Mesh: l.Exposure == model.DNSExposureMesh, Protocol: l.Protocol, Port: l.Port})
-	}
-	return out
 }
 
 // compileInputForSystem is compileInputFor without a principal, for the
@@ -583,7 +506,6 @@ func (s *Server) compileInputForSystem(nodeID string) (netguard.CompileInput, er
 		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
 		Resolve: resolver.Resolve,
 		Beacon:  s.beaconCompanionFor(nodeID),
-		DNS:     s.dnsListenersFor(nodeID, nil),
 	}, nil
 }
 

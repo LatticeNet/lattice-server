@@ -38,10 +38,6 @@ type dnsDriftView struct {
 }
 
 func (s *Server) normalizeExternalDNSDeployment(req, existing model.DNSDeployment, hadExisting bool) (model.DNSDeployment, error) {
-	// Nothing renders an observed engine, so a client acl has nowhere to go;
-	// keeping the field would store unvalidated text that reads like a
-	// restriction.
-	req.AllowedClientNetworks = nil
 	if req.ID == "" {
 		req.ID = id.New("dns")
 	}

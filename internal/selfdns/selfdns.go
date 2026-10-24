@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -89,156 +88,6 @@ func (src CoreDNSBinarySource) Normalize() (CoreDNSBinarySource, error) {
 
 type ApprovalPlanOptions struct {
 	CoreDNSBinary CoreDNSBinarySource
-	// FirewallSource names who composed the plan's lattice_guard candidate:
-	// FirewallSourceNetGuard on a node NetGuard manages, FirewallSourceLegacy
-	// otherwise. It is recorded in the plan so the approve can hold a
-	// NetGuard-composed plan to NetGuard's gates.
-	FirewallSource string
-}
-
-const (
-	FirewallSourceNetGuard = "netguard"
-	FirewallSourceLegacy   = "legacy"
-)
-
-// Listener is one socket a CoreDNS deployment's plan opens in lattice_guard.
-type Listener struct {
-	Exposure string // mesh | public
-	Protocol string // udp | tcp
-	Port     int
-}
-
-// Listeners is the socket set a deployment's plan opens: none for a disabled
-// deployment or an engine Lattice does not render, as ComposeFirewallPlan
-// treats them.
-func Listeners(dep model.DNSDeployment) []Listener {
-	if dep.Engine != model.DNSEngineCoreDNS || dep.Disabled {
-		return nil
-	}
-	var out []Listener
-	if dep.EnableUDP {
-		out = append(out, Listener{Exposure: dep.Exposure, Protocol: "udp", Port: dep.ListenPort})
-	}
-	if dep.EnableTCP {
-		out = append(out, Listener{Exposure: dep.Exposure, Protocol: "tcp", Port: dep.ListenPort})
-	}
-	return out
-}
-
-// PlanFirewall is what an approved DNS plan says about its firewall: who
-// composed the lattice_guard candidate and which listeners it opens.
-type PlanFirewall struct {
-	// Source is FirewallSourceNetGuard or FirewallSourceLegacy, or empty for a
-	// plan made before the source was recorded.
-	Source    string
-	Listeners []Listener
-}
-
-const (
-	firewallHeading  = "## Firewall source"
-	firewallLanguage = "lattice-dns-firewall"
-)
-
-// ParsePlanFirewall reads the firewall section of a DNS approval plan. A plan
-// made before the section existed falls back to its header's exposure and
-// listen lines, which the renderer has always written, and to the disabled
-// marker of its firewall delta.
-func ParsePlanFirewall(plan string) (PlanFirewall, error) {
-	section, ok, err := optionalFencedSection(plan, firewallHeading, firewallLanguage)
-	if err != nil {
-		return PlanFirewall{}, err
-	}
-	if !ok {
-		return planFirewallFromHeader(plan)
-	}
-	var out PlanFirewall
-	for _, line := range strings.Split(section, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case line == "":
-		case strings.HasPrefix(line, "source: "):
-			out.Source = strings.TrimPrefix(line, "source: ")
-			if out.Source != FirewallSourceNetGuard && out.Source != FirewallSourceLegacy {
-				return PlanFirewall{}, fmt.Errorf("unknown firewall source %q", out.Source)
-			}
-		case strings.HasPrefix(line, "listen: "):
-			l, err := parseListener(strings.Fields(strings.TrimPrefix(line, "listen: ")))
-			if err != nil {
-				return PlanFirewall{}, err
-			}
-			out.Listeners = append(out.Listeners, l)
-		default:
-			return PlanFirewall{}, fmt.Errorf("unexpected firewall line %q", line)
-		}
-	}
-	return out, nil
-}
-
-func parseListener(fields []string) (Listener, error) {
-	if len(fields) != 3 {
-		return Listener{}, fmt.Errorf("listener %q is not exposure protocol port", strings.Join(fields, " "))
-	}
-	port, err := strconv.Atoi(fields[2])
-	if err != nil || port < 1 || port > 65535 {
-		return Listener{}, fmt.Errorf("listener port %q out of range", fields[2])
-	}
-	if fields[0] != model.DNSExposureMesh && fields[0] != model.DNSExposurePublic {
-		return Listener{}, fmt.Errorf("listener exposure %q", fields[0])
-	}
-	if fields[1] != "udp" && fields[1] != "tcp" {
-		return Listener{}, fmt.Errorf("listener protocol %q", fields[1])
-	}
-	return Listener{Exposure: fields[0], Protocol: fields[1], Port: port}, nil
-}
-
-// planFirewallFromHeader reads a plan rendered before the firewall section:
-// its header (up to the first section) carries "exposure: X" and
-// "listen: udp=B tcp=B port=N", and a disabled deployment's firewall delta
-// says it added no ports.
-func planFirewallFromHeader(plan string) (PlanFirewall, error) {
-	header := plan
-	if i := strings.Index(plan, "\n## "); i >= 0 {
-		header = plan[:i]
-	}
-	if strings.Contains(plan, "\n- disabled deployment: no DNS listener ports added\n") {
-		return PlanFirewall{}, nil
-	}
-	exposure, listen := "", ""
-	for _, line := range strings.Split(header, "\n") {
-		if v, ok := strings.CutPrefix(line, "exposure: "); ok {
-			exposure = strings.TrimSpace(v)
-		}
-		if v, ok := strings.CutPrefix(line, "listen: "); ok {
-			listen = strings.TrimSpace(v)
-		}
-	}
-	var udp, tcp bool
-	var port int
-	if _, err := fmt.Sscanf(listen, "udp=%t tcp=%t port=%d", &udp, &tcp, &port); err != nil {
-		return PlanFirewall{}, fmt.Errorf("plan header has no listen line: %w", err)
-	}
-	dep := model.DNSDeployment{Engine: model.DNSEngineCoreDNS, Exposure: exposure, EnableUDP: udp, EnableTCP: tcp, ListenPort: port}
-	var out PlanFirewall
-	for _, l := range Listeners(dep) {
-		if _, err := parseListener([]string{l.Exposure, l.Protocol, strconv.Itoa(l.Port)}); err != nil {
-			return PlanFirewall{}, err
-		}
-		out.Listeners = append(out.Listeners, l)
-	}
-	return out, nil
-}
-
-// planField keeps a free-text value on its one header line. Deployment and
-// node names are operator text; a line break in one could otherwise plant a
-// section heading ahead of the real Corefile or firewall section, which the
-// apply script and the approve read by heading.
-func planField(value string) string {
-	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return ' '
-		}
-		return r
-	}, value)
 }
 
 type ZoneFile struct {
@@ -272,11 +121,6 @@ func GenerateConfig(dep model.DNSDeployment, opts RenderOptions) (ConfigBundle, 
 		bindIP = parsed
 	}
 
-	clientNets, err := NormalizeClientNetworks(dep.AllowedClientNetworks)
-	if err != nil {
-		return ConfigBundle{}, err
-	}
-
 	var core strings.Builder
 	zoneFiles := []ZoneFile{}
 	for i, zone := range dep.Zones {
@@ -293,15 +137,6 @@ func GenerateConfig(dep model.DNSDeployment, opts RenderOptions) (ConfigBundle, 
 		fmt.Fprintf(&core, "%s:%d {\n", suffix, dep.ListenPort)
 		if bindIP != "" {
 			fmt.Fprintf(&core, "  bind %s\n", bindIP)
-		}
-		// Every server block shares the deployment's listener, so each one
-		// carries the acl. block answers REFUSED, which is no larger than the
-		// query and so gives a spoofed source nothing to amplify.
-		if len(clientNets) > 0 {
-			core.WriteString("  acl {\n")
-			fmt.Fprintf(&core, "    allow net %s\n", strings.Join(clientNets, " "))
-			core.WriteString("    block\n")
-			core.WriteString("  }\n")
 		}
 		core.WriteString("  errors\n")
 		core.WriteString("  log\n")
@@ -391,11 +226,11 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 	}
 	var b strings.Builder
 	b.WriteString("# Lattice Self-host DNS plan\n\n")
-	fmt.Fprintf(&b, "deployment_id: %s\n", planField(dep.ID))
-	fmt.Fprintf(&b, "name: %s\n", planField(dep.Name))
-	fmt.Fprintf(&b, "node_id: %s\n", planField(dep.NodeID))
+	fmt.Fprintf(&b, "deployment_id: %s\n", dep.ID)
+	fmt.Fprintf(&b, "name: %s\n", dep.Name)
+	fmt.Fprintf(&b, "node_id: %s\n", dep.NodeID)
 	if nodeName != "" {
-		fmt.Fprintf(&b, "node_name: %s\n", planField(nodeName))
+		fmt.Fprintf(&b, "node_name: %s\n", nodeName)
 	}
 	fmt.Fprintf(&b, "engine: %s\n", dep.Engine)
 	fmt.Fprintf(&b, "exposure: %s\n", dep.Exposure)
@@ -408,22 +243,8 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 	}
 	b.WriteString("\n## Firewall delta\n")
 	for _, line := range firewallSummary {
-		fmt.Fprintf(&b, "- %s\n", planField(line))
+		fmt.Fprintf(&b, "- %s\n", line)
 	}
-	source := opts.FirewallSource
-	if source == "" {
-		source = FirewallSourceLegacy
-	}
-	if source != FirewallSourceNetGuard && source != FirewallSourceLegacy {
-		return "", fmt.Errorf("unknown firewall source %q", source)
-	}
-	b.WriteString("\n" + firewallHeading + "\n")
-	b.WriteString("```" + firewallLanguage + "\n")
-	fmt.Fprintf(&b, "source: %s\n", source)
-	for _, l := range Listeners(dep) {
-		fmt.Fprintf(&b, "listen: %s %s %d\n", l.Exposure, l.Protocol, l.Port)
-	}
-	b.WriteString("```\n")
 	if binary.Enabled() {
 		b.WriteString("\n## CoreDNS binary\n")
 		b.WriteString("```lattice-coredns-binary\n")
@@ -867,140 +688,7 @@ func validateDeployment(dep model.DNSDeployment, opts RenderOptions) error {
 			return fmt.Errorf("zone %d unsupported mode %q", i+1, zone.Mode)
 		}
 	}
-	if _, err := NormalizeClientNetworks(dep.AllowedClientNetworks); err != nil {
-		return err
-	}
-	return RefuseOpenResolver(dep)
-}
-
-// RefuseOpenResolver refuses a public deployment with a forward zone that
-// names no allowed client networks: it would recurse for anyone who reaches
-// the listener, which makes the node an open resolver and a reflection source.
-func RefuseOpenResolver(dep model.DNSDeployment) error {
-	if dep.Exposure != model.DNSExposurePublic || len(dep.AllowedClientNetworks) > 0 {
-		return nil
-	}
-	for _, zone := range dep.Zones {
-		if strings.ToLower(strings.TrimSpace(zone.Mode)) == model.DNSZoneForward {
-			return errors.New("public exposure with a forward zone answers recursive queries from anyone, which makes the node an open resolver; set allowed_client_networks to the networks that should use it")
-		}
-	}
 	return nil
-}
-
-// MaxAllowedClientNetworks bounds the acl so the reviewed Corefile stays
-// readable.
-const MaxAllowedClientNetworks = 64
-
-// NormalizeClientNetworks canonicalizes a deployment's allowed client
-// networks in the order given: a bare address becomes its host prefix and
-// duplicates collapse. A prefix with host bits set is refused rather than
-// silently widened, and so is a /0, which would allow every client and turn
-// the acl back into an open resolver.
-func NormalizeClientNetworks(input []string) ([]string, error) {
-	if len(input) > MaxAllowedClientNetworks {
-		return nil, fmt.Errorf("at most %d allowed client networks", MaxAllowedClientNetworks)
-	}
-	seen := map[netip.Prefix]bool{}
-	out := make([]string, 0, len(input))
-	for _, raw := range input {
-		value := strings.TrimSpace(raw)
-		prefix, err := parseClientNetwork(value)
-		if err != nil {
-			return nil, fmt.Errorf("allowed client network %q: %w", value, err)
-		}
-		if seen[prefix] {
-			continue
-		}
-		seen[prefix] = true
-		out = append(out, prefix.String())
-	}
-	if family := coveredFamily(seen); family != "" {
-		return nil, fmt.Errorf("allowed client networks together cover all of %s, which allows every client; name the networks that should use this resolver", family)
-	}
-	return out, nil
-}
-
-// coveredFamily names the address family a prefix set covers whole, such as
-// 0.0.0.0/1 plus 128.0.0.0/1, or "" when it covers neither.
-func coveredFamily(prefixes map[netip.Prefix]bool) string {
-	for _, family := range []struct {
-		name  string
-		first netip.Addr
-		last  netip.Addr
-		is4   bool
-	}{
-		{"IPv4", netip.IPv4Unspecified(), netip.AddrFrom4([4]byte{255, 255, 255, 255}), true},
-		{"IPv6", netip.IPv6Unspecified(), netip.AddrFrom16([16]byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}), false},
-	} {
-		var ranges [][2]netip.Addr
-		for prefix := range prefixes {
-			if prefix.Addr().Is4() == family.is4 {
-				ranges = append(ranges, [2]netip.Addr{prefix.Masked().Addr(), lastAddr(prefix)})
-			}
-		}
-		sort.Slice(ranges, func(i, j int) bool { return ranges[i][0].Less(ranges[j][0]) })
-		next := family.first
-		covered := false
-		for _, r := range ranges {
-			if next.Less(r[0]) {
-				break
-			}
-			if !r[1].Less(next) {
-				if r[1] == family.last {
-					covered = true
-					break
-				}
-				next = r[1].Next()
-			}
-		}
-		if covered {
-			return family.name
-		}
-	}
-	return ""
-}
-
-// lastAddr is the highest address in a prefix.
-func lastAddr(prefix netip.Prefix) netip.Addr {
-	addr := prefix.Masked().Addr()
-	b := addr.AsSlice()
-	for bit := prefix.Bits(); bit < len(b)*8; bit++ {
-		b[bit/8] |= 0x80 >> (bit % 8)
-	}
-	last, _ := netip.AddrFromSlice(b)
-	return last
-}
-
-func parseClientNetwork(value string) (netip.Prefix, error) {
-	if strings.Contains(value, "/") {
-		prefix, err := netip.ParsePrefix(value)
-		if err != nil {
-			return netip.Prefix{}, errors.New("not a CIDR prefix or an IP address")
-		}
-		if prefix != prefix.Masked() {
-			return netip.Prefix{}, fmt.Errorf("has host bits set; the network is %s", prefix.Masked())
-		}
-		// An IPv4-mapped prefix is an IPv4 network in IPv6 spelling, and
-		// net.ParseCIDR reads ::ffff:0:0/96 as 0.0.0.0/0, so judge it as the
-		// IPv4 prefix it is.
-		if prefix.Addr().Is4In6() {
-			if prefix.Bits() < 96 {
-				return netip.Prefix{}, errors.New("mixes IPv4-mapped and IPv6 space; name the IPv4 network instead")
-			}
-			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
-		}
-		if prefix.Bits() == 0 {
-			return netip.Prefix{}, errors.New("allows every client; name the networks that should use this resolver")
-		}
-		return prefix, nil
-	}
-	addr, err := netip.ParseAddr(value)
-	if err != nil || addr.Zone() != "" {
-		return netip.Prefix{}, errors.New("not a CIDR prefix or an IP address")
-	}
-	addr = addr.Unmap()
-	return netip.PrefixFrom(addr, addr.BitLen()), nil
 }
 
 func validateRecordValue(rec model.DNSRecord) error {

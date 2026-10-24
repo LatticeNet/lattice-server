@@ -474,57 +474,46 @@ func TestNetGuardActionRetainsLegacyAutoApprovalPrefix(t *testing.T) {
 	}
 }
 
-// Design 32 D7 reverses the earlier compatibility contract: a legacy Network
-// Guard plan rebuilds lattice_guard from NFTInputs and would drop every
-// security group on an adopted node. The plan route refuses such a node, and a
-// legacy plan made before adoption is refused at approve, queues nothing and
-// leaves the binding alone.
-func TestLegacyNFTPlanMadeBeforeAdoptionCannotApply(t *testing.T) {
+func TestLegacyNFTApplyOnAdoptedNodeRemainsCompatible(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	cookies, csrf := loginSession(t, handler)
-	enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
-	inputs := doJSON(t, handler, http.MethodPost, "/api/network/nft/inputs",
-		`{"node_id":"node-a","interface_name":"ens3","public_tcp":[22]}`, cookies, csrf)
-	inputs.Body.Close()
-	if inputs.StatusCode != http.StatusOK {
-		t.Fatalf("save nft inputs: %d", inputs.StatusCode)
-	}
+	token := setupAdoptedNetGuardNode(t, handler, st, cookies, csrf)
+	before, _ := st.NodeGuardBinding("node-a")
+
+	// No accept_lockout_risk: setupAdoptedNetGuardNode stores public_tcp [22]
+	// on ens3 and the node reports both, so the legacy plan keeps a path to
+	// the shell and clears the lockout lint on its own merits.
 	seedNodeReality(t, st, "node-a", 22, "ens3")
 	plan := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, cookies, csrf)
 	defer plan.Body.Close()
 	if plan.StatusCode != http.StatusOK {
-		t.Fatalf("legacy nft plan before adoption: %d", plan.StatusCode)
+		t.Fatalf("legacy nft plan: %d", plan.StatusCode)
 	}
 	approval := decodeNFTPlan(t, plan)
 	if isNetGuardApproval(approval) || approval.Action != "apply-ruleset" {
 		t.Fatalf("legacy plan was misclassified: %+v", approval)
 	}
-
-	adopt := doJSON(t, handler, http.MethodPost, "/api/netguard/nodes/adopt", `{"node_id":"node-a"}`, cookies, csrf)
-	adopt.Body.Close()
-	if adopt.StatusCode != http.StatusOK {
-		t.Fatalf("adopt netguard node: %d", adopt.StatusCode)
-	}
-	before, _ := st.NodeGuardBinding("node-a")
-
-	again := doJSON(t, handler, http.MethodPost, "/api/network/nft/plan", `{"node_id":"node-a"}`, cookies, csrf)
-	again.Body.Close()
-	if again.StatusCode != http.StatusConflict {
-		t.Fatalf("legacy nft plan after adoption = %d, want 409", again.StatusCode)
-	}
 	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
 		`{"approval_id":"`+approval.ID+`","queue_apply":true,"plan_sha256":"`+approvalPlanSHA(approval)+`"}`,
 		cookies, csrf)
-	approve.Body.Close()
-	if approve.StatusCode != http.StatusConflict {
-		t.Fatalf("approving a legacy plan made before adoption = %d, want 409", approve.StatusCode)
+	defer approve.Body.Close()
+	if approve.StatusCode != http.StatusOK {
+		t.Fatalf("legacy nft approve: %d", approve.StatusCode)
 	}
-	if leased, err := st.LeaseTasks("node-a", 10); err != nil || len(leased) != 0 {
-		t.Fatalf("a refused legacy approval must queue nothing: tasks=%+v err=%v", leased, err)
+	leased, err := st.LeaseTasks("node-a", 10)
+	if err != nil || len(leased) != 1 {
+		t.Fatalf("legacy nft lease: tasks=%+v err=%v", leased, err)
+	}
+	if strings.Contains(leased[0].Script, "--guard-managed-sha") {
+		t.Fatalf("legacy nft task requires unreleased agent helper:\n%s", leased[0].Script)
+	}
+	posted := postNetGuardTaskResult(t, handler, token, leased[0], model.TaskResult{ExitCode: 0, Stdout: "lattice nft: applied\n"})
+	if posted.Code != http.StatusOK {
+		t.Fatalf("legacy nft result: %d %s", posted.Code, posted.Body.String())
 	}
 	after, _ := st.NodeGuardBinding("node-a")
-	if after.Version != before.Version || after.AppliedTableSHA != before.AppliedTableSHA {
-		t.Fatalf("a refused legacy approval mutated the netguard binding: before=%+v after=%+v", before, after)
+	if after.Version != before.Version || after.LastAppliedAt != before.LastAppliedAt || after.AppliedTableSHA != before.AppliedTableSHA {
+		t.Fatalf("legacy nft result mutated netguard binding: before=%+v after=%+v", before, after)
 	}
 }
 

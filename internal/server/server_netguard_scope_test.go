@@ -99,13 +99,18 @@ func TestNodeGroupPlanRefusesANodeThatWouldCloseDNSPorts(t *testing.T) {
 	adoptNodeWithWebGroup(t, handler, st, cookies, csrf)
 	depID := createDNSDeployment(t, handler, cookies, csrf)
 	markDNSApplied(t, st, depID)
-	if _, err := st.UpsertSecurityGroup(webSecurityGroup); err != nil {
+	// n1 already has sg-web of its own; the node group adds a group it lacks.
+	metrics := model.SecurityGroup{ID: "sg-metrics", Name: "metrics", Rules: []model.GuardRule{{
+		ID: "node-exporter", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: model.NetProtoTCP,
+		Ports: []model.GuardPortRange{{From: 9100, To: 9100}}, Remote: model.NetEndpoint{Kind: model.NetRefZone, ZoneID: model.GuardZonePublic},
+	}}}
+	if _, err := st.UpsertSecurityGroup(metrics); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UpsertGroup(model.Group{ID: "grp_web", Name: "web", Members: []string{"n1"}}); err != nil {
+	if err := st.UpsertGroup(model.Group{ID: "grp_mon", Name: "monitored", Members: []string{"n1"}}); err != nil {
 		t.Fatal(err)
 	}
-	bindNodeGroup(t, handler, cookies, csrf, "grp_web", 0, "sg-web")
+	bindNodeGroup(t, handler, cookies, csrf, "grp_mon", 0, "sg-metrics")
 	res := doJSON(t, handler, http.MethodPost, "/api/netguard/node-group-bindings/plan", `{"accept_lockout_risk":true}`, cookies, csrf)
 	var out nodeGroupPlanOut
 	if err := json.Unmarshal([]byte(readBody(t, res)), &out); err != nil {

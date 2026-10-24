@@ -197,7 +197,9 @@ func TestLeaseSupersedesASelfDNSRulesetOnceNetGuardTookTheNode(t *testing.T) {
 
 // A node that joins a node group whose security groups NetGuard applies is
 // NetGuard's to write even before it is adopted (design 32 D7 with S4), so a
-// legacy apply approved before the join is superseded too, naming the group.
+// legacy apply approved before the join is superseded too. The sentence does
+// not name the group: it outlives the request and is read by whoever may read
+// the approval, not only by those who may read node groups.
 func TestLeaseSupersedesALegacyApplyOnANodeCoveredThroughANodeGroup(t *testing.T) {
 	_, handler, st := newInventoryServer(t)
 	cookies, csrf := loginSession(t, handler)
@@ -221,8 +223,8 @@ func TestLeaseSupersedesALegacyApplyOnANodeCoveredThroughANodeGroup(t *testing.T
 		t.Fatalf("a legacy apply on a node covered through a node group was handed out: %+v", views)
 	}
 	stored, _ := st.Approval(legacy.ID)
-	if stored.StaleCode != store.ApprovalStaleGuardOwnerChanged || !strings.Contains(stored.Reason, `node group "web"`) {
-		t.Fatalf("superseded approval = %+v, want the reason naming the node group", stored)
+	if stored.StaleCode != store.ApprovalStaleGuardOwnerChanged || !strings.Contains(stored.Reason, "joined a node group whose security groups NetGuard applies") || strings.Contains(stored.Reason, "web") {
+		t.Fatalf("superseded approval = %+v, want the reason without the group's name", stored)
 	}
 	if binding, ok := st.NodeGuardBinding("node-a"); ok && binding.Managed {
 		t.Fatalf("a group binding adopted the node: %+v", binding)

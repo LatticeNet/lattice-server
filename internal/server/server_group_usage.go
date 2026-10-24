@@ -19,28 +19,64 @@ type groupUse struct {
 	ID    string `json:"id"`
 	Label string `json:"label"`
 	// Role says how the object names the group: "target" when the group is
-	// among what it applies to, "remote" when a rule points at the group.
+	// among what it applies to, "remote" when a policy rule points at the
+	// group, "source" when a check runs from it, and "source_and_target"
+	// when a check runs from the group and to it, as a group mesh does.
 	Role string `json:"role"`
 }
 
-const groupUseOutboundPolicy = "outbound_policy"
+const (
+	groupUseOutboundPolicy = "outbound_policy"
+	groupUseCheck          = "check"
+)
 
 // groupUseSource is one kind of object that can name a node group, with the
 // scope that reveals it. Checks (design 32 S2b), security-group bindings (S4)
 // and mesh membership rules (design 13 W1) add a source here when they start
 // storing group references; the console already renders all four kinds.
-// collect builds labels for viewer, or for the system when viewer is nil.
+// collect builds labels for viewer, or for the system when viewer is nil, and
+// counts the uses of its kind that viewer may not see one by one even with the
+// kind's scope.
 type groupUseSource struct {
 	kind    string
 	scope   string
-	collect func(s *Server, groupID string, viewer *principal) []groupUse
+	collect func(s *Server, groupID string, viewer *principal) (uses []groupUse, hidden int)
 }
 
 var groupUseSources = []groupUseSource{
+	{kind: groupUseCheck, scope: "monitor:read", collect: (*Server).checkDefinitionGroupUses},
 	{kind: groupUseOutboundPolicy, scope: "netpolicy:read", collect: (*Server).outboundPolicyGroupUses},
 }
 
-func (s *Server) outboundPolicyGroupUses(groupID string, viewer *principal) []groupUse {
+// checkDefinitionGroupUses lists the check definitions (design 32 D1) that
+// name the group among their sources or targets, by name. A definition the
+// viewer may not read (checkDefinitionVisible: a confined viewer never reads
+// one that names a group) is counted instead.
+func (s *Server) checkDefinitionGroupUses(groupID string, viewer *principal) ([]groupUse, int) {
+	out := make([]groupUse, 0)
+	hidden := 0
+	for _, def := range s.store.CheckDefinitions() {
+		source, target := store.CheckDefinitionNamesGroup(def, groupID)
+		if !source && !target {
+			continue
+		}
+		if viewer != nil && !checkDefinitionVisible(*viewer, def) {
+			hidden++
+			continue
+		}
+		role := "target"
+		switch {
+		case source && target:
+			role = "source_and_target"
+		case source:
+			role = "source"
+		}
+		out = append(out, groupUse{Kind: groupUseCheck, ID: def.ID, Label: def.Name, Role: role})
+	}
+	return out, hidden
+}
+
+func (s *Server) outboundPolicyGroupUses(groupID string, viewer *principal) ([]groupUse, int) {
 	names, nodeNames := groupNamesOf(s.store.Groups()), nodeNamesOf(s.store.Nodes())
 	out := make([]groupUse, 0)
 	for _, gp := range s.store.GroupPolicies() {
@@ -59,7 +95,7 @@ func (s *Server) outboundPolicyGroupUses(groupID string, viewer *principal) []gr
 		}
 		out = append(out, groupUse{Kind: groupUseOutboundPolicy, ID: gp.ID, Label: outboundPolicyLabel(gp.Name, target, hidden, names, nodeNames), Role: role})
 	}
-	return out
+	return out, 0
 }
 
 // groupUses lists every object that names the group, sorted by kind, then
@@ -70,12 +106,16 @@ func (s *Server) groupUses(groupID string, viewer *principal) (uses []groupUse, 
 	uses = make([]groupUse, 0)
 	hidden = make(map[string]int)
 	for _, source := range groupUseSources {
-		found := source.collect(s, groupID, viewer)
 		if viewer != nil && !rbac.Allows(viewer.Principal, source.scope, "") {
-			if len(found) > 0 {
-				hidden[source.kind] += len(found)
+			found, unseen := source.collect(s, groupID, nil)
+			if n := len(found) + unseen; n > 0 {
+				hidden[source.kind] += n
 			}
 			continue
+		}
+		found, unseen := source.collect(s, groupID, viewer)
+		if unseen > 0 {
+			hidden[source.kind] += unseen
 		}
 		uses = append(uses, found...)
 	}
@@ -135,7 +175,7 @@ func (s *Server) groupInUseMessage(p principal, groupID string, inUse *store.Gro
 	}
 	uses, hidden := s.groupUses(groupID, &p)
 	for _, use := range uses {
-		parts = append(parts, fmt.Sprintf("%s %q (%s)", groupUseNoun(use.Kind, 1), use.Label, use.Role))
+		parts = append(parts, fmt.Sprintf("%s %q (%s)", groupUseNoun(use.Kind, 1), use.Label, strings.ReplaceAll(use.Role, "_", " ")))
 	}
 	kinds := make([]string, 0, len(hidden))
 	for kind := range hidden {
@@ -156,12 +196,17 @@ func (s *Server) groupInUseMessage(p principal, groupID string, inUse *store.Gro
 }
 
 func groupUseNoun(kind string, n int) string {
-	noun := strings.ReplaceAll(kind, "_", " ")
-	if kind == groupUseOutboundPolicy {
-		noun = "outbound policy"
+	switch kind {
+	case groupUseOutboundPolicy:
 		if n != 1 {
-			noun = "outbound policies"
+			return "outbound policies"
 		}
+		return "outbound policy"
+	case groupUseCheck:
+		if n != 1 {
+			return "check definitions"
+		}
+		return "check definition"
 	}
-	return noun
+	return strings.ReplaceAll(kind, "_", " ")
 }

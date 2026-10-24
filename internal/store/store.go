@@ -5217,9 +5217,10 @@ func (s *Store) Groups() []model.Group {
 }
 
 // DeleteGroup removes a group. It refuses with a *GroupInUseError when the
-// group still has child groups (another group's ParentID points at it) or
-// when any outbound policy names it, as a target or as a rule's remote, so
-// deletion cannot orphan a subtree or leave a policy naming nothing. Phase 1
+// group still has child groups (another group's ParentID points at it), when
+// any outbound policy names it, as a target or as a rule's remote, or when
+// any check definition names it among its sources or targets, so deletion
+// cannot orphan a subtree or leave a policy or a check naming nothing. Phase 1
 // surfaces this as an explicit reparent-to-root flow before delete. A missing
 // id is a no-op (idempotent, matching the other Delete* methods).
 func (s *Store) DeleteGroup(id string) error {
@@ -5236,19 +5237,12 @@ func (s *Store) DeleteGroup(id string) error {
 	for _, gp := range s.state.GroupPolicies {
 		policies = append(policies, gp)
 	}
-	if err := groupInUse(id, all, policies); err != nil {
+	defs := make([]model.CheckDefinition, 0, len(s.state.CheckDefinitions))
+	for _, def := range s.state.CheckDefinitions {
+		defs = append(defs, def)
+	}
+	if err := groupInUse(id, all, policies, defs); err != nil {
 		return err
-	}
-	defIDs := make([]string, 0, len(s.state.CheckDefinitions))
-	for defID := range s.state.CheckDefinitions {
-		defIDs = append(defIDs, defID)
-	}
-	sort.Strings(defIDs)
-	for _, defID := range defIDs {
-		def := s.state.CheckDefinitions[defID]
-		if slices.Contains(def.Sources.Groups, id) || slices.Contains(def.Targets.Groups, id) {
-			return fmt.Errorf("group %q is used by check definition %q (%s); take it out of that check first", id, def.ID, def.Name)
-		}
 	}
 	delete(s.state.Groups, id)
 	return s.Save()

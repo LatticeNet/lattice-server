@@ -739,7 +739,8 @@ func TestCheckDefinitionNodeRemovalAndGroupDelete(t *testing.T) {
 	save := tcpMesh([]string{"node-sh"}, nil)
 	save.Targets = model.TargetSelector{Groups: []string{"grp_edge"}}
 	view := c.create(save)
-	if code, raw := c.do(http.MethodPost, "/api/groups/delete", map[string]string{"id": "grp_edge"}); code != http.StatusConflict || !strings.Contains(raw, view.ID) {
+	// The refusal names the definition the way Used by lists it, by name.
+	if code, raw := c.do(http.MethodPost, "/api/groups/delete", map[string]string{"id": "grp_edge"}); code != http.StatusConflict || !strings.Contains(raw, `check definition \"`+view.Name+`\"`) {
 		t.Fatalf("delete a group a definition names = %d %s", code, raw)
 	}
 	us := monitorTo(t, definitionMonitors(st, view.ID), "node-us", "")
@@ -1215,5 +1216,129 @@ func TestCheckDefinitionSavesAndSweepsConcurrently(t *testing.T) {
 		if mon.IntervalSec != 160 {
 			t.Fatalf("monitor after concurrent saves = %+v", mon)
 		}
+	}
+}
+
+// D3 Used by: a check definition that names a group is listed in the group's
+// Used by as a source or a target, and a refused group delete names it next to
+// the outbound policy that names the group. A deleter that cannot read checks
+// learns how many, not which, and a confined reader, which may not see a
+// definition that names a group, gets them counted.
+func TestGroupUsedByAndDeleteRefusalNameCheckDefinitions(t *testing.T) {
+	_, handler, st := checkFleet(t)
+	c := newCheckClient(t, handler)
+	if err := st.UpsertGroup(model.Group{ID: "grp_edge", Name: "edge", Slug: "edge", Color: "sky", Members: []string{"node-jp", "node-us"}}); err != nil {
+		t.Fatal(err)
+	}
+	toEdge := tcpMesh([]string{"node-sh"}, nil)
+	toEdge.Name = "to edge"
+	toEdge.Targets = model.TargetSelector{Groups: []string{"grp_edge"}}
+	fromEdge := tcpMesh(nil, []string{"node-hk"})
+	fromEdge.Name = "from edge"
+	fromEdge.Sources = model.TargetSelector{Groups: []string{"grp_edge"}}
+	mesh := tcpMesh(nil, nil)
+	mesh.Name = "edge mesh"
+	mesh.Sources = model.TargetSelector{Groups: []string{"grp_edge"}}
+	mesh.Targets = model.TargetSelector{Groups: []string{"grp_edge"}}
+	to, from, self := c.create(toEdge), c.create(fromEdge), c.create(mesh)
+	if code, raw := c.do(http.MethodPost, "/api/group-policies", map[string]any{"name": "edge egress", "scope": map[string]any{"groups": []string{"grp_edge"}}, "enabled": true}); code != http.StatusOK {
+		t.Fatalf("policy = %d %s", code, raw)
+	}
+
+	type use struct {
+		Kind, ID, Label, Role string
+	}
+	usedBy := func(code int, raw string) ([]use, int) {
+		t.Helper()
+		if code != http.StatusOK {
+			t.Fatalf("used-by = %d %s", code, raw)
+		}
+		var out struct {
+			UsedBy []use `json:"used_by"`
+			Hidden int   `json:"hidden"`
+		}
+		if err := json.Unmarshal([]byte(raw), &out); err != nil {
+			t.Fatal(err)
+		}
+		return out.UsedBy, out.Hidden
+	}
+	uses, hidden := usedBy(c.do(http.MethodGet, "/api/groups/used-by?id=grp_edge", nil))
+	checks := []use{}
+	for _, u := range uses {
+		if u.Kind == "check" {
+			checks = append(checks, u)
+		}
+	}
+	want := []use{{"check", self.ID, "edge mesh", "source_and_target"}, {"check", from.ID, "from edge", "source"}, {"check", to.ID, "to edge", "target"}}
+	if !reflect.DeepEqual(checks, want) || len(uses) != 4 || hidden != 0 {
+		t.Fatalf("used by = %+v (hidden %d), want the three checks %+v and the policy", uses, hidden, want)
+	}
+
+	code, raw := c.do(http.MethodPost, "/api/groups/delete", map[string]string{"id": "grp_edge"})
+	if code != http.StatusConflict || !strings.Contains(raw, "to edge") || !strings.Contains(raw, "from edge") ||
+		!strings.Contains(raw, "(source and target)") || !strings.Contains(raw, "edge egress") {
+		t.Fatalf("refused delete must name the checks and the policy: %d %s", code, raw)
+	}
+
+	deleter := createPAT(t, handler, c.cookies, c.csrf, []string{"group:read", "group:admin", "netpolicy:read"}, nil)
+	res := doBearerJSON(t, handler, http.MethodPost, "/api/groups/delete", `{"id":"grp_edge"}`, deleter)
+	raw = readBody(t, res)
+	if res.StatusCode != http.StatusConflict || strings.Contains(raw, "to edge") || strings.Contains(raw, "from edge") ||
+		!strings.Contains(raw, "edge egress") || !strings.Contains(raw, "3 check definitions you cannot read") {
+		t.Fatalf("a deleter without monitor:read learns the count, not the checks: %d %s", res.StatusCode, raw)
+	}
+
+	reader := createPAT(t, handler, c.cookies, c.csrf, []string{"group:read", "monitor:read", "netpolicy:read"}, []string{"node-sh"})
+	res = doBearerJSON(t, handler, http.MethodGet, "/api/groups/used-by?id=grp_edge", "", reader)
+	uses, hidden = usedBy(res.StatusCode, readBody(t, res))
+	for _, u := range uses {
+		if u.Kind == "check" {
+			t.Fatalf("a confined reader must not see a definition that names a group: %+v", uses)
+		}
+	}
+	if hidden != 3 {
+		t.Fatalf("a confined reader gets the three checks counted, got hidden %d (%+v)", hidden, uses)
+	}
+	if _, ok := st.Group("grp_edge"); !ok {
+		t.Fatal("the refused deletes must keep the group")
+	}
+}
+
+// D1: a definition can still name a group id that has no record, from a
+// state written before a group delete looked at checks or from a write below
+// the API. The sweep resolves the stale id to nothing and pauses that
+// target's monitor with its history; it does not error.
+func TestCheckDefinitionStaleGroupResolvesToNothingAndPauses(t *testing.T) {
+	srv, handler, st := checkFleet(t)
+	c := newCheckClient(t, handler)
+	if err := st.UpsertGroup(model.Group{ID: "grp_edge", Name: "edge", Slug: "edge", Color: "sky", Members: []string{"node-jp"}}); err != nil {
+		t.Fatal(err)
+	}
+	save := tcpMesh([]string{"node-sh"}, nil)
+	save.Targets = model.TargetSelector{Groups: []string{"grp_edge"}}
+	view := c.create(save)
+	jp := monitorTo(t, definitionMonitors(st, view.ID), "node-jp", "")
+	if !jp.Enabled {
+		t.Fatalf("the group member's monitor = %+v, want it running", jp)
+	}
+	reportRun(t, st, jp.ID, "node-sh", checkT0)
+
+	def, ok := st.CheckDefinition(view.ID)
+	if !ok {
+		t.Fatal("definition not stored")
+	}
+	def.Targets = model.TargetSelector{Groups: []string{"grp_gone"}}
+	if _, _, err := st.SaveCheckDefinition(def, def.Version, "test", nil, checkT0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.syncCheckDefinitions(checkT0.Add(time.Minute), "test"); err != nil {
+		t.Fatalf("a stale group id must not fail the sweep: %v", err)
+	}
+	left, ok := st.Monitor(jp.ID)
+	if !ok || left.Enabled {
+		t.Fatalf("the stale group's former member = %+v %v, want its monitor kept paused", left, ok)
+	}
+	if held := heldRuns(t, st, jp.ID, "node-sh"); held != 1 {
+		t.Fatalf("the paused monitor kept %d runs, want 1", held)
 	}
 }

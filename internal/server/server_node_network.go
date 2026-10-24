@@ -55,10 +55,10 @@ const (
 	nodeNetworkKnockTable  = "inet lattice_knock"
 
 	// Who writes or feeds a table.
-	ownerNetGuard       = "netguard"
-	ownerBeacon         = "beacon"
-	ownerSelfDNS        = "selfdns"
-	ownerLegacyFirewall = "legacy_firewall"
+	ownerNetGuard       = store.GuardWriterNetGuard
+	ownerBeacon         = store.GuardWriterBeacon
+	ownerSelfDNS        = store.GuardWriterSelfDNS
+	ownerLegacyFirewall = store.GuardWriterLegacyFirewall
 	ownerOutboundPolicy = "outbound_policy"
 	ownerManualPolicy   = "manual_policy"
 	ownerSSHGuard       = "sshguard"
@@ -96,8 +96,13 @@ type nodeNetworkSecurityGroup struct {
 	ID    string `json:"id"`
 	Name  string `json:"name,omitempty"`
 	Rules int    `json:"rules"`
-	// Via names the node group a derived binding comes through (S4).
+	// Via names the node group a derived binding comes through (S4); the
+	// group's name is sent to a caller holding group:read.
 	Via *nodeNetworkRef `json:"via,omitempty"`
+	// State is inactive, with the reason, for a derived group on a node
+	// NetGuard does not manage: the binding never adopts a node.
+	State  string `json:"state,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // nodeNetworkPort is a port another feature opens in lattice_guard.
@@ -135,8 +140,8 @@ type nodeNetworkInbound struct {
 	BindingVersion int64                      `json:"binding_version,omitempty"`
 	Zones          []nodeNetworkRef           `json:"zones"`
 	SecurityGroups []nodeNetworkSecurityGroup `json:"security_groups"`
-	// DerivedSecurityGroups is the place for security groups bound to a
-	// node group the node belongs to. Empty until S4 stores such bindings.
+	// DerivedSecurityGroups are the security groups the node's node groups
+	// bind, in compile order after SecurityGroups.
 	DerivedSecurityGroups []nodeNetworkSecurityGroup `json:"derived_security_groups"`
 	ExtraPorts            []nodeNetworkPort          `json:"extra_ports"`
 	LegacyIngress         *nodeNetworkLegacyIngress  `json:"legacy_ingress,omitempty"`
@@ -397,6 +402,20 @@ func (s *Server) nodeNetworkInbound(p principal, node model.Node, binding model.
 			in.SecurityGroups = append(in.SecurityGroups, sg)
 		}
 		in.DriftState = netGuardDriftState(binding, reality)
+	}
+	showGroupName := rbac.Allows(p.Principal, "group:read", "")
+	for _, d := range s.store.NodeDerivedGuardGroups(node.ID) {
+		sg := nodeNetworkSecurityGroup{ID: d.SecurityGroupID, Via: &nodeNetworkRef{ID: d.NodeGroupID}}
+		if group, ok := s.store.SecurityGroup(d.SecurityGroupID); ok {
+			sg.Name, sg.Rules = group.Name, len(group.Rules)
+		}
+		if showGroupName {
+			sg.Via.Name = d.NodeGroupName
+		}
+		if !hasBinding || !binding.Managed {
+			sg.State, sg.Reason = "inactive", nodeGroupBindingInactive
+		}
+		in.DerivedSecurityGroups = append(in.DerivedSecurityGroups, sg)
 	}
 
 	for _, dep := range s.store.DNSDeployments() {
@@ -678,25 +697,14 @@ func nodeNetworkGroupsFor(p principal, nodeID string, groupList []model.Group, r
 // beacon companion: NetGuard's own plans, the legacy route's, a self-host
 // DNS plan that carries a ruleset, and a beacon plan under NetGuard.
 func guardWriteOf(a model.Approval) (kind, ruleset, deploymentID string, ok bool) {
-	switch {
-	case isNetGuardApproval(a):
-		return ownerNetGuard, a.Plan, "", true
-	case a.Plugin == "nft":
-		return ownerLegacyFirewall, a.Plan, "", true
-	case a.Plugin == "selfdns":
-		artifacts, err := selfdns.ParseApprovalPlan(a.Plan)
-		if err != nil || artifacts.NFTRuleset == "" {
-			return "", "", "", false
-		}
-		return ownerSelfDNS, artifacts.NFTRuleset, selfDNSDeploymentOf(a.Action), true
-	case isBeaconApproval(a):
-		plan, err := beaconPlanOf(a)
-		if err != nil || plan.NetGuard == nil {
-			return "", "", "", false
-		}
-		return ownerBeacon, plan.NetGuard.Ruleset, "", true
+	w, ok := store.GuardWriteOf(a)
+	if !ok || w.Ruleset == "" {
+		return "", "", "", false
 	}
-	return "", "", "", false
+	if w.Kind == store.GuardWriterSelfDNS {
+		deploymentID = selfDNSDeploymentOf(a.Action)
+	}
+	return w.Kind, w.Ruleset, deploymentID, true
 }
 
 // selfDNSDeploymentOf reads the deployment id selfDNSApprovalAction encoded.

@@ -50,6 +50,12 @@ const (
 	// reported is exactly the node most likely to be running an agent old
 	// enough to have been enrolled with the eth0 guess.
 	FindingInterfaceUnverified = "interface_unverified"
+	// FindingDNSListenerClosed fires when the plan closes a listener of a
+	// self-host DNS deployment applied on the node (KI-29): CoreDNS would
+	// keep running and answer nobody. The server raises it, since only it
+	// knows the deployments, and refuses the plan on it whatever the
+	// operator accepts: it is not a lockout risk to weigh.
+	FindingDNSListenerClosed = "dns_listener_closed"
 
 	SeverityBlock = "block"
 	SeverityWarn  = "warn"

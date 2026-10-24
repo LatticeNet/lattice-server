@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -222,6 +223,12 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 		s.planSelfDNSUnderNetGuard(w, r, p, dep, node, cfg)
 		return
 	}
+	// The legacy path below writes a ruleset, which a node NetGuard covers
+	// through a node group refuses until NetGuard adopts it.
+	if err := s.groupCoverageRefusal(dep.NodeID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 	planInput := network.NFTPlan{}
 	inputSource := "default"
 	if stored, ok := s.store.NFTInputs(dep.NodeID); ok {
@@ -382,9 +389,23 @@ func (s *Server) netGuardDNSPortsClosed(nodeID, nodeName string, header selfdns.
 	if err != nil {
 		return nil, errors.New("the node's NetGuard intent does not compile, so the DNS ports cannot be checked; fix it in NetGuard first")
 	}
+	open, closed, where := dnsListenerSockets(compiled, input.Zones, header)
+	if len(closed) > 0 {
+		return nil, fmt.Errorf("open %s %s in a security group on %s first: NetGuard manages this node's firewall, and a DNS plan here does not change it",
+			strings.Join(closed, " and "), where, nodeName)
+	}
+	return open, nil
+}
+
+// dnsListenerSockets judges a compiled NetGuard table against one DNS
+// listener: the sockets it admits to the deployment's audience, the ones it
+// closes, and the audience in words. It is the one test both directions use,
+// the DNS plan checking NetGuard (netGuardDNSPortsClosed) and NetGuard
+// checking the deployments (dnsListenerFindings), so they cannot disagree.
+func dnsListenerSockets(compiled network.NFTPlan, zones map[string]model.GuardZone, header selfdns.PlanHeader) (open, closed []string, where string) {
 	audience, where := netguard.Audience{}, "to the public"
 	if header.Exposure == model.DNSExposureMesh {
-		audience = netguard.Audience{Mesh: true, MeshInterfaces: input.Zones[model.GuardZoneWireGuard].Interfaces}
+		audience = netguard.Audience{Mesh: true, MeshInterfaces: zones[model.GuardZoneWireGuard].Interfaces}
 		where = "from the WireGuard range"
 	}
 	var protocols []string
@@ -394,7 +415,6 @@ func (s *Server) netGuardDNSPortsClosed(nodeID, nodeName string, header selfdns.
 	if header.TCP {
 		protocols = append(protocols, network.NFTProtoTCP)
 	}
-	var open, closed []string
 	for _, proto := range protocols {
 		socket := fmt.Sprintf("%s/%d", proto, header.Port)
 		if netguard.Admits(compiled, proto, header.Port, audience) {
@@ -403,11 +423,56 @@ func (s *Server) netGuardDNSPortsClosed(nodeID, nodeName string, header selfdns.
 			closed = append(closed, socket)
 		}
 	}
-	if len(closed) > 0 {
-		return nil, fmt.Errorf("open %s %s in a security group on %s first: NetGuard manages this node's firewall, and a DNS plan here does not change it",
-			strings.Join(closed, " and "), where, nodeName)
+	return open, closed, where
+}
+
+// dnsListenerFindings is the lint NetGuard runs for the DNS deployments on a
+// node (KI-29): every applied, enabled, self-hosted deployment there must
+// keep its listeners open in the table compiled, or the plan would close
+// them under a running CoreDNS. The findings name the deployment and the two
+// ways out. A deployment counts once it has applied; its listener is the one
+// its record names, which is what the DNS plan checks NetGuard against too.
+func (s *Server) dnsListenerFindings(nodeID string, compiled network.NFTPlan, zones map[string]model.GuardZone) []netguard.Finding {
+	nodeName := s.nodeName(nodeID)
+	if nodeName == "" {
+		nodeName = nodeID
 	}
-	return open, nil
+	deployments := s.store.DNSDeployments()
+	sort.Slice(deployments, func(i, j int) bool {
+		if deployments[i].Name != deployments[j].Name {
+			return deployments[i].Name < deployments[j].Name
+		}
+		return deployments[i].ID < deployments[j].ID
+	})
+	var findings []netguard.Finding
+	for _, dep := range deployments {
+		if dep.NodeID != nodeID || dep.Engine == model.DNSEngineExternal || dep.Disabled || dep.LastAppliedAt.IsZero() {
+			continue
+		}
+		header := selfdns.PlanHeader{Exposure: dep.Exposure, UDP: dep.EnableUDP, TCP: dep.EnableTCP, Port: dep.ListenPort}
+		if _, closed, where := dnsListenerSockets(compiled, zones, header); len(closed) > 0 {
+			findings = append(findings, netguard.Finding{
+				Code:     netguard.FindingDNSListenerClosed,
+				Severity: netguard.SeverityBlock,
+				Message: fmt.Sprintf("this plan closes %s %s on %s, where self-host DNS deployment %q listens: open them in a security group on this node, or disable the deployment first",
+					strings.Join(closed, " and "), where, nodeName, dep.Name),
+			})
+		}
+	}
+	return findings
+}
+
+// dnsListenerRefusal is the error a plan or approval refused on
+// dnsListenerFindings answers with, nil when there are none.
+func dnsListenerRefusal(findings []netguard.Finding) error {
+	if len(findings) == 0 {
+		return nil
+	}
+	messages := make([]string, 0, len(findings))
+	for _, f := range findings {
+		messages = append(messages, f.Message)
+	}
+	return errors.New(strings.Join(messages, "; "))
 }
 
 // requireSelfDNSFirewallOwner holds a DNS approval to the node's firewall
@@ -433,6 +498,10 @@ func (s *Server) requireSelfDNSFirewallOwner(approval model.Approval) error {
 	switch {
 	case managed && artifacts.NFTRuleset != "":
 		return errors.New("node is managed by NetGuard, which is the only writer of its lattice_guard table, and this DNS plan would replace it; plan the deployment again")
+	case !managed && artifacts.NFTRuleset != "":
+		if err := s.groupCoverageRefusal(approval.NodeID); err != nil {
+			return err
+		}
 	case !managed && artifacts.NFTRuleset == "":
 		return errors.New("this DNS plan was made while NetGuard managed the node, which it no longer does, so nothing would open its ports; plan the deployment again")
 	case managed:
@@ -459,14 +528,8 @@ func (s *Server) requireSelfDNSFirewallOwner(approval model.Approval) error {
 // nft approval that is not NetGuard's own), or a self-host DNS plan that
 // carries a ruleset.
 func approvalWritesLegacyGuard(approval model.Approval) bool {
-	switch approval.Plugin {
-	case "nft":
-		return !isNetGuardApproval(approval)
-	case "selfdns":
-		artifacts, err := selfdns.ParseApprovalPlan(approval.Plan)
-		return err != nil || artifacts.NFTRuleset != ""
-	}
-	return false
+	w, ok := store.GuardWriteOf(approval)
+	return ok && !w.NetGuardSide()
 }
 
 func (s *Server) handleDNSPublish(w http.ResponseWriter, r *http.Request, p principal) {

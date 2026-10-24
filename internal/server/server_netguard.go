@@ -36,6 +36,11 @@ type securityGroupView struct {
 	model.SecurityGroup
 	Source string `json:"source"`
 	NodeID string `json:"node_id,omitempty"` // set for node-private legacy groups
+	// ViaNodeGroup names the node group a derived group comes through; its
+	// name is sent to a caller holding group:read.
+	ViaNodeGroup *nodeNetworkRef `json:"via_node_group,omitempty"`
+	// Inactive marks a derived group on a node NetGuard does not manage.
+	Inactive bool `json:"inactive,omitempty"`
 }
 
 type nodeGuardView struct {
@@ -44,7 +49,29 @@ type nodeGuardView struct {
 	Source   string                 `json:"source"`
 	Binding  model.NodeGuardBinding `json:"binding"`
 	Groups   []securityGroupView    `json:"groups"`
-	Zones    []model.GuardZone      `json:"zones"`
+	// DerivedGroups are the groups the node's node groups bind, in compile
+	// order after Groups (design 32 D3).
+	DerivedGroups []securityGroupView `json:"derived_groups"`
+	Zones         []model.GuardZone   `json:"zones"`
+}
+
+// derivedGroupViews renders a node's derived groups for p: active ones as
+// compiled, inactive ones marked with why.
+func (s *Server) derivedGroupViews(p principal, derived []store.DerivedGuardGroup, active bool) []securityGroupView {
+	showName := rbac.Allows(p.Principal, "group:read", "")
+	out := make([]securityGroupView, 0, len(derived))
+	for _, d := range derived {
+		group, ok := s.store.SecurityGroup(d.SecurityGroupID)
+		if !ok {
+			group = model.SecurityGroup{ID: d.SecurityGroupID}
+		}
+		via := &nodeNetworkRef{ID: d.NodeGroupID}
+		if showName {
+			via.Name = d.NodeGroupName
+		}
+		out = append(out, securityGroupView{SecurityGroup: group, Source: netGuardSourceStored, ViaNodeGroup: via, Inactive: !active})
+	}
+	return out
 }
 
 type netGuardReplanInput struct {
@@ -171,7 +198,7 @@ func (s *Server) handleNetGuardNodes(w http.ResponseWriter, r *http.Request, p p
 			continue
 		}
 		covered[binding.NodeID] = true
-		views = append(views, s.storedNodeGuardView(binding))
+		views = append(views, s.storedNodeGuardView(p, binding))
 	}
 	for _, inputs := range s.store.AllNFTInputs() {
 		if covered[inputs.NodeID] {
@@ -191,7 +218,8 @@ func (s *Server) handleNetGuardNodes(w http.ResponseWriter, r *http.Request, p p
 				Source:        netGuardSourceLegacy,
 				NodeID:        inputs.NodeID,
 			}},
-			Zones: converted.Zones,
+			DerivedGroups: s.derivedGroupViews(p, s.store.NodeDerivedGuardGroups(inputs.NodeID), false),
+			Zones:         converted.Zones,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"nodes": views})
@@ -235,8 +263,13 @@ func (s *Server) handleNetGuardReview(w http.ResponseWriter, r *http.Request, p 
 			return
 		}
 	}
+	view := netGuardViewFromCompileInput(input, snapshot.Node.Name)
+	if own := len(input.Binding.GroupIDs); len(view.Groups) > own {
+		view.Groups = view.Groups[:own]
+	}
+	view.DerivedGroups = s.derivedGroupViews(p, snapshot.Derived, snapshot.HasBinding && snapshot.Binding.Managed)
 	review := netGuardReview{
-		Node:        netGuardViewFromCompileInput(input, snapshot.Node.Name),
+		Node:        view,
 		Reality:     reality,
 		Suggestions: suggestions,
 		DriftState:  netGuardDriftState(input.Binding, reality.Reality),
@@ -303,6 +336,8 @@ func netGuardViewFromCompileInput(input netguard.CompileInput, nodeName string) 
 		Source:   netGuardSourceStored,
 		Groups:   groups,
 		Zones:    zones,
+		// Filled by the caller, which holds the snapshot that names them.
+		DerivedGroups: []securityGroupView{},
 	}
 }
 
@@ -323,6 +358,7 @@ func (s *Server) netGuardPreview(input netguard.CompileInput, reality *model.Gua
 		PublicURLConfigured: s.publicURL != "",
 		Reality:             reality,
 	})
+	findings = append(findings, s.dnsListenerFindings(input.Binding.NodeID, compiled, input.Zones)...)
 	if findings == nil {
 		findings = make([]netguard.Finding, 0)
 	}
@@ -339,7 +375,7 @@ func netGuardDriftState(binding model.NodeGuardBinding, reality *model.GuardNode
 	return netGuardDriftDetected
 }
 
-func (s *Server) storedNodeGuardView(binding model.NodeGuardBinding) nodeGuardView {
+func (s *Server) storedNodeGuardView(p principal, binding model.NodeGuardBinding) nodeGuardView {
 	groups := make([]securityGroupView, 0, len(binding.GroupIDs))
 	for _, groupID := range binding.GroupIDs {
 		if group, ok := s.store.SecurityGroup(groupID); ok {
@@ -353,12 +389,13 @@ func (s *Server) storedNodeGuardView(binding model.NodeGuardBinding) nodeGuardVi
 		}
 	}
 	return nodeGuardView{
-		NodeID:   binding.NodeID,
-		NodeName: s.nodeName(binding.NodeID),
-		Source:   netGuardSourceStored,
-		Binding:  binding,
-		Groups:   groups,
-		Zones:    zones,
+		NodeID:        binding.NodeID,
+		NodeName:      s.nodeName(binding.NodeID),
+		Source:        netGuardSourceStored,
+		Binding:       binding,
+		Groups:        groups,
+		DerivedGroups: s.derivedGroupViews(p, s.store.NodeDerivedGuardGroups(binding.NodeID), binding.Managed),
+		Zones:         zones,
 	}
 }
 
@@ -467,12 +504,22 @@ func (s *Server) compileInputSnapshotFor(p principal, nodeID string) (netguard.C
 		return node, ok
 	}, p, "netguard:read", "compiling this node's guard", nodeID)
 	return netguard.CompileInput{
-		Binding: snapshot.Binding,
-		Groups:  snapshot.Groups,
-		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
-		Resolve: resolver.Resolve,
-		Beacon:  s.beaconCompanionFor(nodeID),
+		Binding:      snapshot.Binding,
+		Groups:       snapshot.Groups,
+		Zones:        resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
+		Resolve:      resolver.Resolve,
+		GroupMembers: snapshotGroupMembers(snapshot),
+		Beacon:       s.beaconCompanionFor(nodeID),
 	}, snapshot, resolver, nil
+}
+
+// snapshotGroupMembers answers a compile's group remotes from the members
+// the snapshot resolved under the same lock as everything else it holds.
+func snapshotGroupMembers(snapshot store.NetGuardCompileSnapshot) func(string) ([]string, bool) {
+	return func(groupID string) ([]string, bool) {
+		members, ok := snapshot.RemoteGroups[groupID]
+		return members, ok
+	}
 }
 
 // nodeGuardManaged reports whether NetGuard has adopted the node, the test
@@ -499,9 +546,16 @@ func (s *Server) beaconCompanionFor(nodeID string) *netguard.BeaconCompanion {
 // approve-time freshness recompute whose only output is a hash compared in
 // memory. See currentGroupDerivedPolicyPlanSHA for the same reasoning.
 func (s *Server) compileInputForSystem(nodeID string) (netguard.CompileInput, error) {
+	input, _, err := s.compileInputSnapshotForSystem(nodeID)
+	return input, err
+}
+
+// compileInputSnapshotForSystem is compileInputForSystem with the snapshot
+// it compiled from.
+func (s *Server) compileInputSnapshotForSystem(nodeID string) (netguard.CompileInput, store.NetGuardCompileSnapshot, error) {
 	snapshot, err := s.store.NetGuardCompileSnapshot(nodeID)
 	if err != nil {
-		return netguard.CompileInput{}, err
+		return netguard.CompileInput{}, store.NetGuardCompileSnapshot{}, err
 	}
 	nodes := snapshot.Nodes
 	resolver := s.systemNodeResolverOver(func(id string) (model.Node, bool) {
@@ -509,12 +563,13 @@ func (s *Server) compileInputForSystem(nodeID string) (netguard.CompileInput, er
 		return node, ok
 	}, "freshness hash only; never returned to the caller")
 	return netguard.CompileInput{
-		Binding: snapshot.Binding,
-		Groups:  snapshot.Groups,
-		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
-		Resolve: resolver.Resolve,
-		Beacon:  s.beaconCompanionFor(nodeID),
-	}, nil
+		Binding:      snapshot.Binding,
+		Groups:       snapshot.Groups,
+		Zones:        resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
+		Resolve:      resolver.Resolve,
+		GroupMembers: snapshotGroupMembers(snapshot),
+		Beacon:       s.beaconCompanionFor(nodeID),
+	}, snapshot, nil
 }
 
 func (s *Server) handleUpsertSecurityGroup(w http.ResponseWriter, r *http.Request, p principal) {
@@ -592,6 +647,12 @@ func (s *Server) validateGuardRules(p principal, rules []model.GuardRule) error 
 		Groups:  []model.SecurityGroup{{ID: "validate", Rules: rules}},
 		Zones:   zones,
 		Resolve: resolver.Resolve,
+		// The shape is what is validated here, so a group remote needs only
+		// to name a node group that exists; its members are a plan's concern.
+		GroupMembers: func(groupID string) ([]string, bool) {
+			_, ok := s.store.Group(groupID)
+			return nil, ok
+		},
 	})
 	// Checked before err: the compiler names the node it could not resolve.
 	if refused := resolver.Refused(); refused != nil {
@@ -626,6 +687,10 @@ func (s *Server) handleDeleteSecurityGroup(w http.ResponseWriter, r *http.Reques
 				return
 			}
 		}
+	}
+	if bound := s.store.NodeGroupsBindingSecurityGroup(req.ID); len(bound) > 0 {
+		writeError(w, http.StatusConflict, fmt.Errorf("security group %q is still bound to node group %s", req.ID, strings.Join(bound, ", ")))
+		return
 	}
 	if err := s.store.DeleteSecurityGroup(req.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -746,9 +811,27 @@ func (s *Server) handleNetGuardBindings(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 	}
+	// A node group remote admits every member the group gains later, with no
+	// write to carry a reach check, so an override that names one, or an
+	// edit of a binding that has one, needs an unrestricted principal (the
+	// rule design 32 D5 set for an outbound policy's group remote).
+	if principalHasNodeRestriction(p) {
+		existing, _ := s.store.NodeGuardBinding(req.NodeID)
+		if guardRulesNameGroup(req.Overrides) || guardRulesNameGroup(existing.Overrides) {
+			s.refuseConfinedGroupRemote(w, p)
+			return
+		}
+	}
 	if err := s.validateGuardRules(p, req.Overrides); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	// Turning managed on is an adoption by another name.
+	if existing, ok := s.store.NodeGuardBinding(req.NodeID); req.Managed && (!ok || !existing.Managed) {
+		if err := s.guardWriterInFlightRefusal(req.NodeID, true, "NetGuard cannot manage this node now"); err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 	}
 	req = s.serverAuthoritativeGuardBinding(req)
 	saved, err := s.store.UpsertNodeGuardBinding(req)
@@ -764,7 +847,7 @@ func (s *Server) handleNetGuardBindings(w http.ResponseWriter, r *http.Request, 
 		ID: id.New("audit"), NodeID: req.NodeID, Action: "netguard.binding.upsert", Scope: "netguard:admin",
 		Metadata: map[string]string{"node_id": req.NodeID},
 	})
-	writeJSON(w, http.StatusOK, s.storedNodeGuardView(saved))
+	writeJSON(w, http.StatusOK, s.storedNodeGuardView(p, saved))
 }
 
 // handleDeleteNodeGuardBinding is the undo for an observe-only binding
@@ -819,6 +902,24 @@ func (s *Server) handleDeleteNodeGuardBinding(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, deleted)
 }
 
+func guardRulesNameGroup(rules []model.GuardRule) bool {
+	for _, rule := range rules {
+		if rule.Remote.Kind == model.NetRefGroup {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) refuseConfinedGroupRemote(w http.ResponseWriter, p principal) {
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID: id.New("audit"), Action: "authorize.scope", Scope: "netguard:admin", Decision: "deny",
+		Reason: "a node group remote in a binding override requires an unrestricted server allowlist",
+	})
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied,
+		"a binding override whose remote is a node group needs a token that is not confined to some nodes, since the group can gain members later"))
+}
+
 func (s *Server) serverAuthoritativeGuardBinding(req model.NodeGuardBinding) model.NodeGuardBinding {
 	existing, ok := s.store.NodeGuardBinding(req.NodeID)
 	if !ok {
@@ -826,6 +927,7 @@ func (s *Server) serverAuthoritativeGuardBinding(req model.NodeGuardBinding) mod
 		req.LastAppliedAt = time.Time{}
 		req.LastError = ""
 		req.AppliedTableSHA = ""
+		req.AppliedDerived = nil
 		return req
 	}
 	intentChanged := !guardBindingIntentEqual(existing, req)
@@ -833,6 +935,7 @@ func (s *Server) serverAuthoritativeGuardBinding(req model.NodeGuardBinding) mod
 	req.LastAppliedAt = existing.LastAppliedAt
 	req.LastError = existing.LastError
 	req.AppliedTableSHA = existing.AppliedTableSHA
+	req.AppliedDerived = existing.AppliedDerived
 	if intentChanged {
 		req.LastPlanSHA = ""
 		req.LastError = "binding changed since the last plan; create a new plan before applying"
@@ -880,6 +983,10 @@ func (s *Server) handleNetGuardAdopt(w http.ResponseWriter, r *http.Request, p p
 	existing, hasBinding := s.store.NodeGuardBinding(req.NodeID)
 	if hasBinding && existing.Managed {
 		writeError(w, http.StatusConflict, errors.New("node is already adopted"))
+		return
+	}
+	if err := s.guardWriterInFlightRefusal(req.NodeID, true, "NetGuard cannot adopt this node now"); err != nil {
+		writeError(w, http.StatusConflict, err)
 		return
 	}
 	inputs, ok := s.store.NFTInputs(req.NodeID)
@@ -932,7 +1039,7 @@ func (s *Server) handleNetGuardAdopt(w http.ResponseWriter, r *http.Request, p p
 		ID: id.New("audit"), NodeID: req.NodeID, Action: "netguard.node.adopt", Scope: "netguard:admin",
 		Metadata: map[string]string{"node_id": req.NodeID, "group_id": saved.ID},
 	})
-	writeJSON(w, http.StatusOK, s.storedNodeGuardView(storedBinding))
+	writeJSON(w, http.StatusOK, s.storedNodeGuardView(p, storedBinding))
 }
 
 // handleNetGuardPlan compiles a node's guard model, lints it, and records a
@@ -973,6 +1080,12 @@ func (s *Server) handleNetGuardPlan(w http.ResponseWriter, r *http.Request, p pr
 	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	// A plan that closes a running CoreDNS's ports is refused outright, with
+	// or without accept_lockout_risk (KI-29).
+	if err := dnsListenerRefusal(s.dnsListenerFindings(req.NodeID, compiled, input.Zones)); err != nil {
+		writeError(w, http.StatusConflict, err)
 		return
 	}
 	// The lockout lint is the only thing standing between a default-drop plan
@@ -1053,7 +1166,22 @@ func (s *Server) requireCurrentNetGuardApproval(approval model.Approval) error {
 	if !strings.EqualFold(currentSHA, planSHA) {
 		return errors.New("netguard binding dependencies changed since this plan was created; re-plan before approving")
 	}
-	return nil
+	// A DNS deployment may have applied since the plan was made.
+	return s.netGuardDNSListenerRefusal(approval.NodeID)
+}
+
+// netGuardDNSListenerRefusal runs dnsListenerFindings on the node's current
+// compile, for a decision that judges the plan again.
+func (s *Server) netGuardDNSListenerRefusal(nodeID string) error {
+	input, err := s.compileInputForSystem(nodeID)
+	if err != nil {
+		return err
+	}
+	compiled, err := netguard.Compile(input)
+	if err != nil {
+		return err
+	}
+	return dnsListenerRefusal(s.dnsListenerFindings(nodeID, compiled, input.Zones))
 }
 
 func isNetGuardApproval(approval model.Approval) bool {
@@ -1061,19 +1189,27 @@ func isNetGuardApproval(approval model.Approval) bool {
 }
 
 func (s *Server) currentNetGuardPlanSHA(nodeID string) (string, error) {
-	input, err := s.compileInputForSystem(nodeID)
+	sha, _, err := s.currentNetGuardPlan(nodeID)
+	return sha, err
+}
+
+// currentNetGuardPlan is currentNetGuardPlanSHA with the derived security
+// groups the compile included, which an apply that proves this plan records
+// as the node's AppliedDerived.
+func (s *Server) currentNetGuardPlan(nodeID string) (string, []model.DerivedSecurityGroup, error) {
+	input, snapshot, err := s.compileInputSnapshotForSystem(nodeID)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	compiled, err := netguard.Compile(input)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	ruleset, err := network.GenerateNFTPlan(compiled)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
-	return approvalPlanSHA(model.Approval{Plan: ruleset}), nil
+	return approvalPlanSHA(model.Approval{Plan: ruleset}), derivedSecurityGroupsOf(snapshot.Derived), nil
 }
 
 func (s *Server) handleNetGuardTaskResult(r *http.Request, approval model.Approval, task model.Task, result model.TaskResult) error {
@@ -1095,15 +1231,16 @@ func (s *Server) handleNetGuardTaskResult(r *http.Request, approval model.Approv
 		}
 
 		reason := ""
+		var derived []model.DerivedSecurityGroup
 		if binding.LastPlanSHA == "" || !strings.EqualFold(binding.LastPlanSHA, planSHA) {
 			if strings.Contains(binding.LastError, "dependency changed") {
 				reason = "task result belongs to a stale netguard plan after a binding dependency changed; re-plan before applying"
 			} else {
 				reason = "task result belongs to a stale netguard plan; re-plan before applying the current binding"
 			}
-		} else if currentSHA, err := s.currentNetGuardPlanSHA(currentApproval.NodeID); err != nil {
+		} else if currentSHA, currentDerived, err := s.currentNetGuardPlan(currentApproval.NodeID); err != nil {
 			reason = "task result belongs to stale netguard intent that no longer compiles: " + err.Error()
-		} else if !strings.EqualFold(currentSHA, planSHA) {
+		} else if derived = currentDerived; !strings.EqualFold(currentSHA, planSHA) {
 			reason = "task result belongs to a stale netguard plan after a binding dependency changed; re-plan before applying"
 		} else if result.Error != "" || result.ExitCode != 0 {
 			reason = taskFailureSummary(result)
@@ -1124,6 +1261,7 @@ func (s *Server) handleNetGuardTaskResult(r *http.Request, approval model.Approv
 			binding.LastAppliedAt = result.FinishedAt
 			binding.LastError = ""
 			binding.AppliedTableSHA = managedSHA
+			binding.AppliedDerived = derived
 			currentApproval.Status = model.ApprovalApplied
 			currentApproval.Reason = ""
 			metadata["managed_sha"] = managedSHA

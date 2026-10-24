@@ -46,6 +46,11 @@ type CompileInput struct {
 	// Zones by id, including the builtin zones resolved for this node.
 	Zones   map[string]model.GuardZone
 	Resolve NodeResolver
+	// GroupMembers returns the resolved members of a node group a rule names
+	// as its remote, false when the group does not exist. Each member is
+	// then resolved through Resolve, so a scoped resolver refuses a member
+	// the caller cannot read. Nil refuses every group remote.
+	GroupMembers func(groupID string) ([]string, bool)
 	// Beacon is the measurement beacon's companion rule set (design 29 D3),
 	// nil when the node's applied beacon plan carries none. It is approved
 	// through a node.beacon plan, never authored here, and every compile of
@@ -219,6 +224,11 @@ func lowerRule(plan *network.NFTPlan, rule model.GuardRule, in CompileInput, fas
 	if err != nil {
 		return err
 	}
+	// A node group with no addressable member admits, or drops, nobody; a
+	// rule with no source would match every source instead.
+	if rule.Remote.Kind == model.NetRefGroup && len(sources) == 0 {
+		return nil
+	}
 	plan.InputRules = append(plan.InputRules, network.NFTInputRule{
 		Interface:   iface,
 		SourceCIDRs: sources,
@@ -314,7 +324,34 @@ func ruleSource(rule model.GuardRule, in CompileInput) ([]string, string, error)
 	case model.NetRefDomain:
 		return nil, "", errors.New("domain remotes are egress-only")
 	case model.NetRefGroup:
-		return nil, "", errors.New("group remotes must be expanded to node refs before compile")
+		// Expanded here, at compile time, so a plan always carries the
+		// members of the moment (design 32 D3). Each member is pinned to its
+		// own addresses, as a node remote is. A member that no longer
+		// exists, or has no address yet, contributes nothing: there is no
+		// address it could be matched by.
+		if in.GroupMembers == nil {
+			return nil, "", errors.New("group remotes need the node group's members")
+		}
+		members, ok := in.GroupMembers(rule.Remote.GroupID)
+		if !ok {
+			return nil, "", fmt.Errorf("remote node group %q not found", rule.Remote.GroupID)
+		}
+		seen := map[string]bool{}
+		var sources []string
+		for _, memberID := range members {
+			node, ok := in.Resolve(memberID)
+			if !ok {
+				continue
+			}
+			for _, source := range nodeSources(node) {
+				if !seen[source] {
+					seen[source] = true
+					sources = append(sources, source)
+				}
+			}
+		}
+		sort.Strings(sources)
+		return sources, "", nil
 	default:
 		return nil, "", fmt.Errorf("invalid remote kind %q", rule.Remote.Kind)
 	}

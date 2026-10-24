@@ -1623,6 +1623,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/netguard/bindings/delete", s.withAuth("netguard:admin", s.handleDeleteNodeGuardBinding))
 	mux.HandleFunc("/api/netguard/nodes/adopt", s.withAuth("netguard:admin", s.handleNetGuardAdopt))
 	mux.HandleFunc("/api/netguard/plan", s.withAuth("netguard:admin", s.handleNetGuardPlan))
+	mux.HandleFunc("/api/netguard/node-group-bindings", s.withAuth("netguard:read", s.handleNetGuardNodeGroupBindings))
+	mux.HandleFunc("/api/netguard/node-group-bindings/delete", s.withAuth("netguard:admin", s.handleDeleteNetGuardNodeGroupBinding))
+	mux.HandleFunc("/api/netguard/node-group-bindings/plan", s.withAuth("netguard:admin", s.handleNetGuardNodeGroupPlan))
 	mux.HandleFunc("/api/sshguard/plan", s.withAuth("sshguard:admin", s.handleSSHGuardPlan))
 	mux.HandleFunc("/api/sshguard/confirm", s.withAuth("sshguard:admin", s.handleSSHGuardConfirm))
 	// knock is the non-secret half: does the control plane know this node's
@@ -4128,6 +4131,10 @@ func (s *Server) handleRerunTask(w http.ResponseWriter, r *http.Request, p princ
 			for _, nodeID := range targets {
 				if s.nodeGuardManaged(nodeID) {
 					writeError(w, http.StatusConflict, fmt.Errorf("node %s is managed by NetGuard, which is the only writer of its lattice_guard table; this task would replace it, so it cannot be rerun there", nodeID))
+					return
+				}
+				if err := s.groupCoverageRefusal(nodeID); err != nil {
+					writeError(w, http.StatusConflict, fmt.Errorf("node %s: %w; this task would replace its table, so it cannot be rerun there", nodeID, err))
 					return
 				}
 			}
@@ -7392,6 +7399,10 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusConflict, errors.New("node is managed by NetGuard: plan its firewall with /api/netguard/plan; this legacy route would rebuild lattice_guard without the node's security groups"))
 		return
 	}
+	if err := s.groupCoverageRefusal(req.NodeID); err != nil {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
 	planInput := req.NFTPlan
 	source := "request"
 	if !nftPlanRequestHasInputs(planInput) {
@@ -7725,7 +7736,7 @@ func requestBool(r *http.Request, key string) bool {
 }
 
 // approvalPlanReach reports the nodes beyond approval.NodeID whose data the
-// stored plan bytes carry, and the scope required to read them.
+// stored plan bytes carry, grouped by the scope required to read them.
 //
 // This exists because closing the plan endpoints was only half the job. A plan
 // endpoint now refuses to compile a mesh or a ruleset for a principal that
@@ -7742,13 +7753,14 @@ func requestBool(r *http.Request, key string) bool {
 // policy was edited after planning, where the stored bytes may still name a
 // node the current rules no longer do. Recording the set at plan time is the
 // real fix and needs an SDK field.
-func (s *Server) approvalPlanReach(approval model.Approval) (string, []string) {
+func (s *Server) approvalPlanReach(approval model.Approval) []planReach {
 	switch {
 	case isBeaconApproval(approval):
-		// The plan names every source with its addresses.
+		// The plan names every source with its addresses, and under NetGuard
+		// carries the node's whole compiled table.
 		plan, err := beaconPlanOf(approval)
 		if err != nil {
-			return "", nil
+			return nil
 		}
 		sources := make([]string, 0, len(plan.Sources))
 		for _, src := range plan.Sources {
@@ -7756,7 +7768,11 @@ func (s *Server) approvalPlanReach(approval model.Approval) (string, []string) {
 				sources = append(sources, src.NodeID)
 			}
 		}
-		return "monitor:read", sources
+		reach := []planReach{{scope: "monitor:read", nodes: sources}}
+		if plan.NetGuard != nil {
+			reach = append(reach, planReach{scope: "netguard:read", nodes: s.store.NetGuardRuleRemoteNodes(approval.NodeID)})
+		}
+		return reach
 	case approval.Plugin == "wireguard" && approval.Action == "apply-config":
 		// The plan is a mesh config: every member's public key, mesh IP and
 		// endpoint is in the bytes.
@@ -7767,28 +7783,59 @@ func (s *Server) approvalPlanReach(approval model.Approval) (string, []string) {
 			}
 			members = append(members, n.ID)
 		}
-		return "wireguard:read", members
+		return []planReach{{scope: "wireguard:read", nodes: members}}
 	case approval.Plugin == "nftpolicy":
 		// The plan is a compiled ruleset: every remote node named by a rule has
 		// its WireGuard IP and public addresses in the bytes.
-		policy, ok := s.store.NetPolicy(approval.NodeID)
-		if !ok {
-			return "", nil
+		return []planReach{{scope: "netpolicy:read", nodes: s.netPolicyRemoteNodes(approval.NodeID, "")}}
+	case isNetGuardApproval(approval):
+		// A NetGuard ruleset pins every node remote, and every member of a
+		// node group remote, to its addresses (compileInputSnapshotFor
+		// refuses the plan to a caller who cannot read them).
+		return []planReach{{scope: "netguard:read", nodes: s.store.NetGuardRuleRemoteNodes(approval.NodeID)}}
+	case approvalWritesLegacyGuard(approval):
+		// The legacy firewall route and a self-host DNS ruleset fold the
+		// node's outbound document's ingress rules into the table, remote
+		// addresses included (composeNFTIngressPolicy).
+		return []planReach{{scope: "netpolicy:read", nodes: s.netPolicyRemoteNodes(approval.NodeID, model.NetDirIngress)}}
+	case isLineChainApproval(approval):
+		// The plan names the target node's line: host, port, SNI and key
+		// fingerprints.
+		var plan lineChainPlan
+		if err := json.Unmarshal([]byte(approval.Plan), &plan); err != nil || plan.TargetNodeID == "" || plan.TargetNodeID == approval.NodeID {
+			return nil
 		}
-		remotes := make([]string, 0, len(policy.Rules))
-		for _, rule := range policy.Rules {
-			if rule.Remote.Kind != model.NetRefNode {
-				continue
-			}
-			remoteID := strings.TrimSpace(rule.Remote.NodeID)
-			if remoteID == "" || remoteID == approval.NodeID {
-				continue
-			}
-			remotes = append(remotes, remoteID)
-		}
-		return "netpolicy:read", remotes
+		return []planReach{{scope: "network:plan", nodes: []string{plan.TargetNodeID}}}
 	}
-	return "", nil
+	return nil
+}
+
+// planReach is one scope an approval's plan reaches other nodes under, and
+// those nodes.
+type planReach struct {
+	scope string
+	nodes []string
+}
+
+// netPolicyRemoteNodes is every node other than nodeID that a rule of its
+// outbound document names, in the given direction or any when empty.
+func (s *Server) netPolicyRemoteNodes(nodeID, direction string) []string {
+	policy, ok := s.store.NetPolicy(nodeID)
+	if !ok {
+		return nil
+	}
+	remotes := make([]string, 0, len(policy.Rules))
+	for _, rule := range policy.Rules {
+		if rule.Remote.Kind != model.NetRefNode || (direction != "" && !strings.EqualFold(rule.Direction, direction)) {
+			continue
+		}
+		remoteID := strings.TrimSpace(rule.Remote.NodeID)
+		if remoteID == "" || remoteID == nodeID {
+			continue
+		}
+		remotes = append(remotes, remoteID)
+	}
+	return remotes
 }
 
 func (s *Server) approvalVisibleToPrincipal(p principal, approval model.Approval) bool {
@@ -7827,11 +7874,12 @@ func (s *Server) approvalNodeReachAllows(p principal, approval model.Approval) b
 	// Filtered, not refused, and deliberately: this is a list. A caller who
 	// cannot read one approval sees a shorter list, which is a correct answer.
 	// The refuse-instead-of-filter rule applies to artefacts, not listings.
-	scope, reach := s.approvalPlanReach(approval)
-	if scope == "" {
-		return true
+	for _, reach := range s.approvalPlanReach(approval) {
+		if deniedNodeCount(p.Principal, reach.scope, reach.nodes) > 0 {
+			return false
+		}
 	}
-	return deniedNodeCount(p.Principal, scope, reach) == 0
+	return true
 }
 
 func (s *Server) approvalPrimaryScopeAllows(p principal, approval model.Approval) bool {
@@ -8964,12 +9012,25 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	// auto-approve rule decides, would replace the adopted firewall with the
 	// legacy baseline; this path serves both, so it refuses here as well as
 	// at the plan route.
-	if approval.Plugin == "nft" && approvalWritesLegacyGuard(approval) && s.nodeGuardManaged(approval.NodeID) {
-		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "node is managed by NetGuard, which is the only writer of its lattice_guard table; plan its firewall with /api/netguard/plan")}
+	if approval.Plugin == "nft" && approvalWritesLegacyGuard(approval) {
+		if s.nodeGuardManaged(approval.NodeID) {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "node is managed by NetGuard, which is the only writer of its lattice_guard table; plan its firewall with /api/netguard/plan")}
+		}
+		if err := s.groupCoverageRefusal(approval.NodeID); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
 	}
 	if approval.Plugin == "selfdns" {
 		if err := s.requireSelfDNSFirewallOwner(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+	}
+	// One apply of each side at a time on a node (KI-29): an apply replaces
+	// the whole lattice_guard table, so a decision here must not queue one
+	// behind an unfinished apply of the other side.
+	if w, ok := store.GuardWriteOf(approval); ok {
+		if err := s.guardWriterInFlightRefusal(approval.NodeID, w.NetGuardSide(), "this plan cannot be approved now"); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorBadRequest, err.Error())}
 		}
 	}
 	if approval.Plugin == proxyCorePlugin {
@@ -9557,8 +9618,8 @@ func (s *Server) deniedApprovalNodeCount(p principal, approval model.Approval) i
 			denied++
 		}
 	}
-	if scope, reach := s.approvalPlanReach(approval); scope != "" {
-		denied += deniedNodeCount(p.Principal, scope, reach)
+	for _, reach := range s.approvalPlanReach(approval) {
+		denied += deniedNodeCount(p.Principal, reach.scope, reach.nodes)
 	}
 	if denied == 0 {
 		return 1
@@ -9879,6 +9940,7 @@ func (s *Server) handleAgentTasks(w http.ResponseWriter, r *http.Request) {
 		// warning is explicit in server logs.
 		s.logger.Printf("generic task leases committed with degraded durability and delivered one-shot: %v", err)
 	}
+	s.auditGuardSupersessions()
 	views := make([]agentTaskView, 0, len(deliveries))
 	for _, delivery := range deliveries {
 		views = append(views, toAgentTaskView(delivery.Task, delivery.DurableResult, delivery.DurableProtocol))

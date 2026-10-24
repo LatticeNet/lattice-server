@@ -221,50 +221,50 @@ func monitorNumericLabel(label string) bool {
 // dial time).
 func normalizeHTTPMonitor(mon *model.Monitor, checkHost bool) error {
 	if mon.TargetNode != "" {
-		return errMonitorTargetNodeKinds
+		return fieldError("target_node", errMonitorTargetNodeKinds)
 	}
 	if mon.Packets != 0 {
-		return errMonitorPacketsKinds
+		return fieldError("packets", errMonitorPacketsKinds)
 	}
 	u, err := url.Parse(strings.TrimSpace(mon.Target))
 	if err != nil || !u.IsAbs() || u.Host == "" {
-		return errors.New("an http check's target is an absolute http or https URL")
+		return fieldErrorf("target", "an http check's target is an absolute http or https URL")
 	}
 	scheme := strings.ToLower(u.Scheme)
 	if scheme != "http" && scheme != "https" {
-		return errors.New("an http check's target is an absolute http or https URL")
+		return fieldErrorf("target", "an http check's target is an absolute http or https URL")
 	}
 	if u.User != nil {
-		return errors.New("an http check's URL cannot carry a user name or password; send it as a secret header")
+		return fieldErrorf("target", "an http check's URL cannot carry a user name or password; send it as a secret header")
 	}
 	if port := u.Port(); port != "" {
 		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
-			return fmt.Errorf("an http check's URL has port %q; it must be 1 to 65535", port)
+			return fieldErrorf("target", "an http check's URL has port %q; it must be 1 to 65535", port)
 		}
 	}
 	if checkHost {
 		if err := checkMonitorHost(u.Hostname()); err != nil {
-			return err
+			return fieldError("target", err)
 		}
 	}
 	mon.Target = strings.TrimSpace(mon.Target)
 	set, err := model.ParseMonitorStatusSet(mon.ExpectStatus)
 	if err != nil {
-		return err
+		return fieldError("expect_status", err)
 	}
 	mon.ExpectStatus = set.String()
 	if len(mon.Headers) > model.MonitorHeadersMax {
-		return fmt.Errorf("an http check carries at most %d headers", model.MonitorHeadersMax)
+		return fieldErrorf("headers", "an http check carries at most %d headers", model.MonitorHeadersMax)
 	}
 	seen := map[string]bool{}
 	headers := make([]model.MonitorHeader, 0, len(mon.Headers))
-	for _, h := range mon.Headers {
+	for i, h := range mon.Headers {
 		name := model.CanonicalMonitorHeaderName(h.Name)
 		if err := model.ValidateMonitorHeader(name, h.Value); err != nil {
-			return err
+			return fieldError(fieldIndex("headers", i), err)
 		}
 		if seen[name] {
-			return fmt.Errorf("header %s is named twice", name)
+			return fieldErrorf(fieldIndex("headers", i), "header %s is named twice", name)
 		}
 		seen[name] = true
 		headers = append(headers, model.MonitorHeader{Name: name, Value: h.Value, Secret: h.Secret})
@@ -276,7 +276,7 @@ func normalizeHTTPMonitor(mon *model.Monitor, checkHost bool) error {
 	mon.SecretsOrigin = ""
 	if model.MonitorHasSecrets(*mon) {
 		if scheme != "https" {
-			return errors.New("a check with secret headers must use https, so the secrets travel encrypted to a verified host")
+			return fieldErrorf("target", "a check with secret headers must use https, so the secrets travel encrypted to a verified host")
 		}
 		origin, err := model.MonitorOrigin(mon.Target)
 		if err != nil {
@@ -313,24 +313,25 @@ func applyMonitorHeaderEdits(stored []model.MonitorHeader, edits []model.Monitor
 		return -1
 	}
 	named := map[string]bool{}
-	for _, e := range edits {
+	for k, e := range edits {
+		field := fieldIndex("headers", k)
 		name := model.CanonicalMonitorHeaderName(e.Name)
 		if name == "" {
-			return nil, errors.New("a header edit names no header")
+			return nil, fieldErrorf(field, "a header edit names no header")
 		}
 		if named[name] {
-			return nil, fmt.Errorf("header %s is named twice in one edit", name)
+			return nil, fieldErrorf(field, "header %s is named twice in one edit", name)
 		}
 		named[name] = true
 		i := index(name)
 		switch e.Op {
 		case model.MonitorHeaderKeep:
 			if i < 0 {
-				return nil, fmt.Errorf("header %s is not on the check; read it again before editing", name)
+				return nil, fieldErrorf(field, "header %s is not on the check; read it again before editing", name)
 			}
 		case model.MonitorHeaderSet:
 			if e.Value == "" {
-				return nil, fmt.Errorf("header %s needs a value to be set", name)
+				return nil, fieldErrorf(field, "header %s needs a value to be set", name)
 			}
 			h := model.MonitorHeader{Name: name, Value: e.Value, Secret: e.Secret}
 			if i < 0 {
@@ -343,7 +344,7 @@ func applyMonitorHeaderEdits(stored []model.MonitorHeader, edits []model.Monitor
 				out = slices.Delete(out, i, i+1)
 			}
 		default:
-			return nil, fmt.Errorf("header %s: op must be %q, %q or %q", name, model.MonitorHeaderKeep, model.MonitorHeaderSet, model.MonitorHeaderDelete)
+			return nil, fieldErrorf(field, "header %s: op must be %q, %q or %q", name, model.MonitorHeaderKeep, model.MonitorHeaderSet, model.MonitorHeaderDelete)
 		}
 	}
 	return out, nil

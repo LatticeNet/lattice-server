@@ -76,8 +76,17 @@ func checkBadRequest(format string, args ...any) *checkDefinitionError {
 	return &checkDefinitionError{status: http.StatusBadRequest, err: fmt.Errorf(format, args...)}
 }
 
-func checkForbidden(msg string) *checkDefinitionError {
-	return &checkDefinitionError{status: http.StatusForbidden, err: apiError(model.APIErrorCapabilityDenied, msg)}
+// checkFieldRefusal is a 400 about the request field at path (design 32 R6).
+func checkFieldRefusal(path string, err error) *checkDefinitionError {
+	return &checkDefinitionError{status: http.StatusBadRequest, err: fieldError(path, err)}
+}
+
+func checkFieldf(path, format string, args ...any) *checkDefinitionError {
+	return checkFieldRefusal(path, fmt.Errorf(format, args...))
+}
+
+func checkForbidden(path, msg string) *checkDefinitionError {
+	return &checkDefinitionError{status: http.StatusForbidden, err: fieldError(path, apiError(model.APIErrorCapabilityDenied, msg))}
 }
 
 // checkSelectorBroad reports whether a selector names a group or the whole
@@ -109,8 +118,9 @@ func normalizeCheckSelector(field string, in model.TargetSelector, prior *model.
 	}
 	clean := func(name string, raw []string, limit int, exists map[string]bool, list func(model.TargetSelector) []string) ([]string, error) {
 		out := cleanNodeList(raw)
+		path := field + "." + name
 		if len(out) > limit {
-			return nil, fmt.Errorf("%s.%s holds %d entries, at most %d", field, name, len(out), limit)
+			return nil, fieldErrorf(path, "%s holds %d entries, at most %d", path, len(out), limit)
 		}
 		for _, id := range out {
 			if !exists[id] && !priorHas(list, id) {
@@ -118,7 +128,7 @@ func normalizeCheckSelector(field string, in model.TargetSelector, prior *model.
 				if name == "groups" {
 					kind = "group"
 				}
-				return nil, fmt.Errorf("%s.%s names %q, which is not a %s", field, name, id, kind)
+				return nil, fieldErrorf(rawIndexPath(path, raw, id), "%s names %q, which is not a %s", path, id, kind)
 			}
 		}
 		if len(out) == 0 {
@@ -218,16 +228,16 @@ func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinition
 	}
 	out.Name = strings.TrimSpace(spec.Name)
 	if out.Name == "" {
-		return out, checkBadRequest("name is required")
+		return out, checkFieldf("name", "name is required")
 	}
 	if len(out.Name) > model.CheckDefinitionNameMax {
-		return out, checkBadRequest("name is at most %d bytes", model.CheckDefinitionNameMax)
+		return out, checkFieldf("name", "name is at most %d bytes", model.CheckDefinitionNameMax)
 	}
 	out.Type = strings.TrimSpace(spec.Type)
 	switch out.Type {
 	case model.MonitorTypeTCP, model.MonitorTypeICMP, model.MonitorTypeBeacon, model.MonitorTypeHTTP, model.MonitorTypeTLS:
 	default:
-		return out, checkBadRequest("type must be tcp, icmp, beacon, http or tls")
+		return out, checkFieldf("type", "type must be tcp, icmp, beacon, http or tls")
 	}
 	if failure := checkDefinitionScope(p, out.Type, spec.Sources, spec.Targets); failure != nil {
 		return out, failure
@@ -244,14 +254,14 @@ func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinition
 	out.Alert = strings.TrimSpace(spec.Alert)
 	degraded, err := validMonitorAlertFor(out.Type, out.Alert, spec.Degraded)
 	if err != nil {
-		return out, checkBadRequest("%v", err)
+		return out, checkFieldRefusal("alert", err)
 	}
 	out.Degraded = degraded
 	if out.Alert == "" {
 		out.Alert = model.MonitorAlertDown
 	}
 	if err := validMonitorAlertAfter(spec.AlertAfter); err != nil {
-		return out, checkBadRequest("%v", err)
+		return out, checkFieldRefusal("alert_after", err)
 	}
 	out.AlertAfter = spec.AlertAfter
 	out.Enabled = spec.Enabled
@@ -265,21 +275,27 @@ func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinition
 // nodes: sources it administers, targets and exclusions it can read.
 func checkDefinitionScope(p principal, kind string, sources, targets model.TargetSelector) *checkDefinitionError {
 	restricted := principalHasNodeRestriction(p)
-	if restricted && (checkSelectorBroad(sources) || checkSelectorBroad(targets)) {
-		return checkForbidden("a group or whole-fleet selector needs a token with no node allowlist; name the nodes instead")
+	if restricted && checkSelectorBroad(sources) {
+		return checkForbidden("sources", "a group or whole-fleet selector needs a token with no node allowlist; name the nodes instead")
+	}
+	if restricted && checkSelectorBroad(targets) {
+		return checkForbidden("targets", "a group or whole-fleet selector needs a token with no node allowlist; name the nodes instead")
 	}
 	if restricted && kind == model.MonitorTypeTLS {
-		return checkForbidden("restricted token cannot create a server-evaluated monitor")
+		return checkForbidden("type", "restricted token cannot create a server-evaluated monitor")
 	}
 	for _, nodeID := range cleanNodeList(sources.Nodes) {
 		if !rbac.Allows(p.Principal, "monitor:admin", nodeID) {
-			return checkForbidden("forbidden: sources names a node this token may not administer")
+			return checkForbidden(rawIndexPath("sources.nodes", sources.Nodes, nodeID), "forbidden: sources names a node this token may not administer")
 		}
 	}
-	for _, list := range [][]string{targets.Nodes, sources.Exclude, targets.Exclude} {
-		for _, nodeID := range cleanNodeList(list) {
+	for _, list := range []struct {
+		path string
+		ids  []string
+	}{{"targets.nodes", targets.Nodes}, {"sources.exclude", sources.Exclude}, {"targets.exclude", targets.Exclude}} {
+		for _, nodeID := range cleanNodeList(list.ids) {
 			if !latencyNodeVisible(p, nodeID) {
-				return checkForbidden("forbidden: the check names a node this token may not read")
+				return checkForbidden(rawIndexPath(list.path, list.ids, nodeID), "forbidden: the check names a node this token may not read")
 			}
 		}
 	}
@@ -303,19 +319,19 @@ func (s *Server) normalizeCheckTargets(out *model.CheckDefinition, spec model.Ch
 	}
 	var err error
 	if out.Sources, err = normalizeCheckSelector("sources", spec.Sources, priorSources, nodes, groupIDs); err != nil {
-		return checkBadRequest("%v", err)
+		return checkFieldRefusal("sources", err)
 	}
 	if out.Targets, err = normalizeCheckSelector("targets", spec.Targets, priorTargets, nodes, groupIDs); err != nil {
-		return checkBadRequest("%v", err)
+		return checkFieldRefusal("targets", err)
 	}
 	seen := map[string]bool{}
-	for _, raw := range spec.Addresses {
+	for i, raw := range spec.Addresses {
 		if strings.TrimSpace(raw) == "" {
 			continue
 		}
 		addr, err := normalizeCheckAddress(out.Type, raw)
 		if err != nil {
-			return checkBadRequest("%v", err)
+			return checkFieldRefusal(fieldIndex("addresses", i), err)
 		}
 		if !seen[addr] {
 			seen[addr] = true
@@ -324,20 +340,20 @@ func (s *Server) normalizeCheckTargets(out *model.CheckDefinition, spec model.Ch
 	}
 	sort.Strings(out.Addresses)
 	if len(out.Addresses) > model.CheckDefinitionAddressesMax {
-		return checkBadRequest("addresses holds %d entries, at most %d", len(out.Addresses), model.CheckDefinitionAddressesMax)
+		return checkFieldf("addresses", "addresses holds %d entries, at most %d", len(out.Addresses), model.CheckDefinitionAddressesMax)
 	}
 	tls := out.Type == model.MonitorTypeTLS
 	switch {
 	case tls && (!checkSelectorEmpty(out.Sources) || len(out.Sources.Exclude) > 0):
-		return checkBadRequest("a tls check runs on the control plane: it takes no sources")
+		return checkFieldf("sources", "a tls check runs on the control plane: it takes no sources")
 	case !tls && checkSelectorEmpty(out.Sources):
-		return checkBadRequest("sources selects no node: name nodes, groups or the whole fleet")
+		return checkFieldf("sources", "sources selects no node: name nodes, groups or the whole fleet")
 	case !checkKindTakesNodes(out.Type) && (!checkSelectorEmpty(out.Targets) || len(out.Targets.Exclude) > 0):
-		return checkBadRequest("a %s check takes addresses, not target nodes", out.Type)
+		return checkFieldf("targets", "a %s check takes addresses, not target nodes", out.Type)
 	case !checkKindTakesAddresses(out.Type) && len(out.Addresses) > 0:
-		return checkBadRequest("a beacon check names target nodes; it never takes an address")
+		return checkFieldf("addresses", "a beacon check names target nodes; it never takes an address")
 	case checkSelectorEmpty(out.Targets) && len(out.Addresses) == 0:
-		return checkBadRequest("the check has no target: name target nodes or addresses")
+		return checkFieldf("targets", "the check has no target: name target nodes or addresses")
 	}
 	return nil
 }
@@ -360,7 +376,7 @@ func normalizeCheckTiming(out *model.CheckDefinition, spec model.CheckDefinition
 		}
 	}
 	if err := validMonitorTiming(out.IntervalSec, out.TimeoutSec); err != nil {
-		return checkBadRequest("%v", err)
+		return checkFieldRefusal("interval_sec", err)
 	}
 	if model.MonitorKindSendsPackets(out.Type) {
 		out.Packets = spec.Packets
@@ -368,13 +384,13 @@ func normalizeCheckTiming(out *model.CheckDefinition, spec model.CheckDefinition
 			out.Packets = model.MonitorPacketsDefault
 		}
 		if out.Packets < 1 || out.Packets > model.MonitorPacketsMax {
-			return checkBadRequest("packets must be 1 to %d", model.MonitorPacketsMax)
+			return checkFieldf("packets", "packets must be 1 to %d", model.MonitorPacketsMax)
 		}
 		if err := validMonitorRun(model.Monitor{Type: out.Type, IntervalSec: out.IntervalSec, TimeoutSec: out.TimeoutSec, Packets: out.Packets}); err != nil {
-			return checkBadRequest("%v", err)
+			return checkFieldRefusal("interval_sec", err)
 		}
 	} else if spec.Packets != 0 {
-		return checkBadRequest("%v", errMonitorPacketsKinds)
+		return checkFieldRefusal("packets", errMonitorPacketsKinds)
 	}
 	if tls {
 		out.ThresholdDays = spec.ThresholdDays
@@ -382,10 +398,10 @@ func normalizeCheckTiming(out *model.CheckDefinition, spec model.CheckDefinition
 			out.ThresholdDays = tlsMonitorDefaultThresholdDays
 		}
 		if out.ThresholdDays < 1 || out.ThresholdDays > tlsMonitorMaxThresholdDays {
-			return checkBadRequest("threshold_days must be between 1 and %d", tlsMonitorMaxThresholdDays)
+			return checkFieldf("threshold_days", "threshold_days must be between 1 and %d", tlsMonitorMaxThresholdDays)
 		}
 	} else if spec.ThresholdDays != 0 {
-		return checkBadRequest("threshold_days applies to tls checks only")
+		return checkFieldf("threshold_days", "threshold_days applies to tls checks only")
 	}
 	return nil
 }
@@ -396,8 +412,11 @@ func normalizeCheckTiming(out *model.CheckDefinition, spec model.CheckDefinition
 // bound to the origins they were saved for.
 func normalizeCheckHTTP(out *model.CheckDefinition, req model.CheckDefinitionSave, prior *model.CheckDefinition) *checkDefinitionError {
 	if out.Type != model.MonitorTypeHTTP {
-		if strings.TrimSpace(req.ExpectStatus) != "" || len(req.Headers) > 0 {
-			return checkBadRequest("expect_status and headers apply to http checks only")
+		if strings.TrimSpace(req.ExpectStatus) != "" {
+			return checkFieldf("expect_status", "expect_status and headers apply to http checks only")
+		}
+		if len(req.Headers) > 0 {
+			return checkFieldf("headers", "expect_status and headers apply to http checks only")
 		}
 		return nil
 	}
@@ -407,30 +426,39 @@ func normalizeCheckHTTP(out *model.CheckDefinition, req model.CheckDefinitionSav
 	}
 	headers, err := applyMonitorHeaderEdits(stored, req.Headers)
 	if err != nil {
-		return checkBadRequest("%v", err)
+		return checkFieldRefusal("headers", err)
 	}
 	probe := model.Monitor{Type: out.Type, Target: "https://example.invalid/", ExpectStatus: req.ExpectStatus, Headers: headers}
 	if len(out.Addresses) > 0 {
 		probe.Target = out.Addresses[0]
 	}
 	if err := normalizeHTTPMonitor(&probe, false); err != nil {
-		return checkBadRequest("%v", err)
+		// The probe's headers are the stored ones with the edits applied,
+		// so their positions are not the request's: name the list.
+		path := apiErrorField(err)
+		switch {
+		case path == "target":
+			path = "addresses"
+		case strings.HasPrefix(path, "headers"):
+			path = "headers"
+		}
+		return &checkDefinitionError{status: http.StatusBadRequest, err: refieldError(path, err)}
 	}
 	out.ExpectStatus, out.Headers = probe.ExpectStatus, probe.Headers
 	if !model.MonitorHasSecrets(probe) {
 		return nil
 	}
 	if checkSelectorBroad(out.Sources) {
-		return checkBadRequest("a check with secret headers names its sources as nodes, never a group or the whole fleet: a node that joined would receive the secrets")
+		return checkFieldf("sources", "a check with secret headers names its sources as nodes, never a group or the whole fleet: a node that joined would receive the secrets")
 	}
 	origins := map[string]bool{}
-	for _, addr := range out.Addresses {
+	for i, addr := range out.Addresses {
 		origin, err := model.MonitorOrigin(addr)
 		if err != nil {
-			return checkBadRequest("%v", err)
+			return checkFieldRefusal(fieldIndex("addresses", i), err)
 		}
 		if !strings.HasPrefix(origin, "https://") {
-			return checkBadRequest("a check with secret headers must use https for every address, so the secrets travel encrypted to a verified host")
+			return checkFieldf(fieldIndex("addresses", i), "a check with secret headers must use https for every address, so the secrets travel encrypted to a verified host")
 		}
 		origins[origin] = true
 	}
@@ -439,7 +467,7 @@ func normalizeCheckHTTP(out *model.CheckDefinition, req model.CheckDefinitionSav
 	}
 	sort.Strings(out.SecretsOrigins)
 	if err := checkSecretsRebound(prior, out.SecretsOrigins, req.Headers); err != nil {
-		return checkBadRequest("%v", err)
+		return checkFieldRefusal("headers", err)
 	}
 	return nil
 }

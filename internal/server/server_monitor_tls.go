@@ -42,7 +42,7 @@ const (
 // node assignment: the server, not an agent, dials the target.
 func normalizeTLSMonitor(req model.Monitor) (model.Monitor, error) {
 	if req.AssignAll || len(req.NodeIDs) > 0 {
-		return model.Monitor{}, errors.New("tls monitors are evaluated by the server: leave assign_all false and node_ids empty")
+		return model.Monitor{}, fieldErrorf("node_ids", "tls monitors are evaluated by the server: leave assign_all false and node_ids empty")
 	}
 	host, port, err := splitTLSTarget(req.Target)
 	if err != nil {
@@ -53,7 +53,7 @@ func normalizeTLSMonitor(req model.Monitor) (model.Monitor, error) {
 		req.ThresholdDays = tlsMonitorDefaultThresholdDays
 	}
 	if req.ThresholdDays < 1 || req.ThresholdDays > tlsMonitorMaxThresholdDays {
-		return model.Monitor{}, fmt.Errorf("threshold_days must be between 1 and %d", tlsMonitorMaxThresholdDays)
+		return model.Monitor{}, fieldErrorf("threshold_days", "threshold_days must be between 1 and %d", tlsMonitorMaxThresholdDays)
 	}
 	if req.IntervalSec <= 0 {
 		req.IntervalSec = int(tlsMonitorDefaultInterval / time.Second)

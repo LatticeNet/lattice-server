@@ -393,7 +393,7 @@ func (s *Server) saveCheckDefinition(w http.ResponseWriter, p principal, req mod
 	stored, changes, err := s.store.SaveCheckDefinition(def, expected, p.ActorID, c.sets(plans), now)
 	switch {
 	case errors.Is(err, store.ErrCheckDefinitionVersion):
-		writeError(w, http.StatusConflict, err)
+		writeError(w, http.StatusConflict, versionConflict(err))
 		return
 	case err != nil && stored.ID == "":
 		writeError(w, http.StatusInternalServerError, err)
@@ -510,7 +510,10 @@ func (s *Server) handleCheckDefinitionDelete(w http.ResponseWriter, r *http.Requ
 	case errors.Is(err, store.ErrCheckDefinitionNotFound):
 		writeError(w, http.StatusNotFound, apiError(model.APIErrorNotFound, "check definition not found"))
 		return
-	case errors.Is(err, store.ErrCheckDefinitionVersion), errors.Is(err, store.ErrCheckDefinitionMonitors):
+	case errors.Is(err, store.ErrCheckDefinitionVersion):
+		writeError(w, http.StatusConflict, versionConflict(err))
+		return
+	case errors.Is(err, store.ErrCheckDefinitionMonitors):
 		writeError(w, http.StatusConflict, err)
 		return
 	case err != nil && deleted == nil:

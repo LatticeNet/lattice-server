@@ -209,7 +209,9 @@ func TestCheckDefinitionExpandsSourcesTimesTargets(t *testing.T) {
 		t.Fatalf("created = %+v", view.CheckDefinition)
 	}
 	mons := definitionMonitors(st, view.ID)
-	if len(mons) != 3 || view.Summary.Monitors != 3 || view.Summary.Paths != 6 {
+	// Six pairs, four of them paths: TCP has nothing to dial on the third
+	// target, and a skipped pair is not a path (design 32 R2).
+	if len(mons) != 3 || view.Summary.Monitors != 3 || view.Summary.Paths != 4 {
 		t.Fatalf("monitors = %d, summary = %+v", len(mons), view.Summary)
 	}
 	for _, mon := range mons {

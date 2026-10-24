@@ -663,23 +663,26 @@ func (s *Server) publishDNSDeploymentWithAudit(parent context.Context, dep model
 			},
 		})
 	}
-	profile, err := s.dnsPublishProfile(dep)
-	if err != nil {
-		_ = s.markDNSPublishResult(dep, "", "", err)
+	// fail records an early refusal on the deployment, as the apply below
+	// records its outcome, and logs the record when it cannot be stored.
+	fail := func(v4, v6 string, err error) error {
+		if perr := s.markDNSPublishResult(dep, v4, v6, err); perr != nil {
+			s.logger.Printf("dns publish: persist deployment %s: %v", dep.ID, perr)
+		}
 		recordPublishAudit(false)
 		return err
+	}
+	profile, err := s.dnsPublishProfile(dep)
+	if err != nil {
+		return fail("", "", err)
 	}
 	publishV4, publishV6, err := publishableDNSIPs(profile, v4, v6)
 	if err != nil {
-		_ = s.markDNSPublishResult(dep, "", "", err)
-		recordPublishAudit(false)
-		return err
+		return fail("", "", err)
 	}
 	prov, err := s.ddnsProvider(profile)
 	if err != nil {
-		_ = s.markDNSPublishResult(dep, publishV4, publishV6, err)
-		recordPublishAudit(false)
-		return err
+		return fail(publishV4, publishV6, err)
 	}
 	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()

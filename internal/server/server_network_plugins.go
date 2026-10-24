@@ -144,6 +144,8 @@ func (s *Server) registerNetworkPluginRPC() {
 		// why the drift panel has never existed despite the backend for it
 		// being finished.
 		"review", "reality",
+		// Security groups bound to node groups (design 32 S4).
+		"node_group_bindings", "upsert_node_group_binding", "delete_node_group_binding", "plan_node_groups",
 	}, s.netGuardFirewallRPC); err != nil {
 		s.logger.Printf("netguard: register %s failed: %v", netGuardFirewallService, err)
 	}
@@ -198,6 +200,14 @@ func (s *Server) netGuardFirewallRPC(ctx context.Context, method string, request
 		return invokePluginOperation(ctx, http.MethodPost, request, s.handleNetGuardAdopt)
 	case "plan":
 		return invokePluginOperation(ctx, http.MethodPost, request, s.handleNetGuardPlan)
+	case "node_group_bindings":
+		return invokePluginOperation(ctx, http.MethodGet, nil, s.handleNetGuardNodeGroupBindings)
+	case "upsert_node_group_binding":
+		return invokePluginOperation(ctx, http.MethodPost, request, s.handleNetGuardNodeGroupBindings)
+	case "delete_node_group_binding":
+		return invokePluginOperation(ctx, http.MethodPost, request, s.handleDeleteNetGuardNodeGroupBinding)
+	case "plan_node_groups":
+		return invokePluginOperation(ctx, http.MethodPost, request, s.handleNetGuardNodeGroupPlan)
 	case "review":
 		// Both read paths take their parameters from the query string, so the
 		// request body is turned into one here rather than duplicating their

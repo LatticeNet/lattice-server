@@ -18,7 +18,9 @@ import (
 	"github.com/LatticeNet/lattice-sdk/model"
 	"github.com/LatticeNet/lattice-server/internal/audit"
 	"github.com/LatticeNet/lattice-server/internal/auth"
+	"github.com/LatticeNet/lattice-server/internal/groups"
 	"github.com/LatticeNet/lattice-server/internal/secret"
+	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/telemetry"
 )
 
@@ -201,6 +203,9 @@ type State struct {
 	// run, with when each ran. A name present here never runs again, so an
 	// operator's later edits to the data it touched stay as they left them.
 	Migrations map[string]time.Time `json:"migrations,omitempty"`
+	// NodeGroupGuardBindings binds security groups to node groups, keyed by
+	// node group id (design 32 S4).
+	NodeGroupGuardBindings map[string]model.NodeGroupGuardBinding `json:"node_group_guard_bindings,omitempty"`
 }
 
 // TaskResultReceipt is the compact, durable idempotency record retained for a
@@ -371,6 +376,9 @@ type Store struct {
 	shareGen  uint64
 	// vpnLinkGen counts identity writes for the same index.
 	vpnLinkGen uint64
+	// guardSuperseded holds the applies the lease superseded until the
+	// server audits them (guard_writers.go). Guarded by mu.
+	guardSuperseded []GuardSupersession
 }
 
 // NetGuardCompileSnapshot is one immutable, revision-consistent view of every
@@ -387,6 +395,15 @@ type NetGuardCompileSnapshot struct {
 	NFTInputs   model.NFTInputs
 	HasNFTInput bool
 	Nodes       map[string]model.Node
+	// Derived is every security group the node receives through a node
+	// group's binding, in compile order (design 32 D3). Their rules follow
+	// the node's own in Groups only while the binding is managed: a group
+	// binding never adopts a node.
+	Derived []DerivedGuardGroup
+	// RemoteGroups holds the resolved members, sorted by node id, of every
+	// node group that a rule in Binding.Overrides or Groups names as its
+	// remote.
+	RemoteGroups map[string][]string
 }
 
 var ErrNetGuardCompileNodeNotFound = errors.New("netguard compile node not found")
@@ -425,6 +442,19 @@ func (s *Store) NetGuardCompileSnapshot(nodeID string) (NetGuardCompileSnapshot,
 		}
 		snapshot.Groups = append(snapshot.Groups, cloneSecurityGroup(group))
 	}
+	// The one place derived groups join a compile, so the operator path,
+	// the system path, the beacon closure and the preview all see them.
+	snapshot.Derived = s.derivedGuardGroupsLocked(node, binding.GroupIDs)
+	if hasBinding && binding.Managed {
+		for _, derived := range snapshot.Derived {
+			group, ok := s.state.SecurityGroups[derived.SecurityGroupID]
+			if !ok {
+				return NetGuardCompileSnapshot{}, fmt.Errorf("security group %q bound to node group %q not found", derived.SecurityGroupID, derived.NodeGroupName)
+			}
+			snapshot.Groups = append(snapshot.Groups, cloneSecurityGroup(group))
+		}
+	}
+	snapshot.RemoteGroups = s.remoteGroupMembersLocked(binding.Overrides, snapshot.Groups)
 	for _, zone := range s.state.GuardZones {
 		snapshot.GuardZones = append(snapshot.GuardZones, cloneGuardZone(zone))
 	}
@@ -976,6 +1006,7 @@ func emptyState() State {
 		SecurityGroups:          map[string]model.SecurityGroup{},
 		GuardZones:              map[string]model.GuardZone{},
 		GuardBindings:           map[string]model.NodeGuardBinding{},
+		NodeGroupGuardBindings:  map[string]model.NodeGroupGuardBinding{},
 		GuardRealitySnapshots:   map[string]GuardRealitySnapshot{},
 		SingBoxLiveness:         map[string]SingBoxLiveness{},
 		NodeOfflineAlerts:       map[string]time.Time{},
@@ -1139,6 +1170,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.GuardBindings == nil {
 		st.GuardBindings = map[string]model.NodeGuardBinding{}
+	}
+	if st.NodeGroupGuardBindings == nil {
+		st.NodeGroupGuardBindings = map[string]model.NodeGroupGuardBinding{}
 	}
 	if st.GuardRealitySnapshots == nil {
 		st.GuardRealitySnapshots = map[string]GuardRealitySnapshot{}
@@ -1700,6 +1734,9 @@ func (s *Store) UpsertNode(n model.Node) error {
 	if existed && (previous.PublicIP != n.PublicIP || previous.WireGuardIP != n.WireGuardIP) {
 		s.invalidateGuardBindingsForNodeLocked(n.ID)
 	}
+	if existed {
+		s.invalidateGuardBindingsForMembershipLocked(previous, n)
+	}
 	if !n.LastSeen.IsZero() {
 		if s.metricsPersistedAt == nil {
 			s.metricsPersistedAt = map[string]time.Time{}
@@ -1793,6 +1830,7 @@ func (s *Store) UpdateNodeGeo(nodeID string, geo *model.NodeGeo) (model.Node, bo
 	if !ok {
 		return model.Node{}, false, nil
 	}
+	previous := n
 	if geo != nil {
 		copyGeo := *geo
 		n.Geo = &copyGeo
@@ -1800,6 +1838,7 @@ func (s *Store) UpdateNodeGeo(nodeID string, geo *model.NodeGeo) (model.Node, bo
 		n.Geo = nil
 	}
 	s.state.Nodes[nodeID] = n
+	s.invalidateGuardBindingsForMembershipLocked(previous, n)
 	return cloneNode(n), true, s.Save()
 }
 
@@ -1998,6 +2037,7 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string
 	if !ok {
 		return model.Node{}, false, nil
 	}
+	previous := cloneNode(n)
 	n.Name = name
 	n.Role = role
 	n.Comment = comment
@@ -2020,6 +2060,7 @@ func (s *Store) UpdateNodeMeta(nodeID, name, role, comment string, tags []string
 		n.Inventory = *inventory
 	}
 	s.state.Nodes[nodeID] = n
+	s.invalidateGuardBindingsForMembershipLocked(previous, n)
 	if err := s.Save(); err != nil {
 		return model.Node{}, true, err
 	}
@@ -2255,7 +2296,7 @@ func (s *Store) LeaseTaskDeliveriesWithDurableProtocols(nodeID string, limit int
 type LineChainFirstLeaseValidator func(LineChainCompileStateSnapshot, model.Approval, LineChainAttempt, model.Task) error
 
 func (s *Store) LeaseTaskDeliveriesWithLineChainValidator(nodeID string, limit int, netGuardAllowed, lineChainAllowed bool, validate LineChainFirstLeaseValidator) ([]TaskDelivery, error) {
-	return s.leaseTaskDeliveries(nodeID, limit, "nft", "apply-ruleset:netguard-v1", netGuardAllowed, lineChainAllowed, validate)
+	return s.leaseTaskDeliveries(nodeID, limit, "nft", NetGuardApplyAction, netGuardAllowed, lineChainAllowed, validate)
 }
 
 func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action string, allowed, lineChainAllowed bool, validate ...LineChainFirstLeaseValidator) ([]TaskDelivery, error) {
@@ -2313,6 +2354,34 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		}
 		staged.LineChainGraphRevision++
 		lineChainStaled[t.ID], stateChanged = true, true
+	}
+	// A guard-writing apply whose writer no longer owns lattice_guard is
+	// rejected with the sentence saying why and its task cancelled, in this
+	// same commit; the server audits it after the lease.
+	var superseded []GuardSupersession
+	supersedeGuardWriter := func(t model.Task, reason string) {
+		approval, w, rerun, _ := guardWriteOfTaskLocked(staged, t)
+		// A rerun is cancelled alone: its approval was decided long ago and
+		// says what its first run did. A first run's approval is rejected
+		// with the reason, and a self-host DNS deployment it was applying is
+		// marked failed, as a failed apply marks it.
+		if !rerun {
+			approval.Status, approval.Stale, approval.StaleCode = model.ApprovalRejected, true, ApprovalStaleGuardOwnerChanged
+			approval.Reason, approval.UpdatedAt = truncateRunes(reason, 240), now
+			staged.Approvals[approval.ID] = approval
+			if depID, ok := selfdns.DeploymentIDOf(approval.Action); ok && approval.Plugin == "selfdns" {
+				if dep, ok := staged.DNSDeployments[depID]; ok && dep.Status == model.DNSStatusApplying {
+					staged.DNSDeployments = maps.Clone(staged.DNSDeployments)
+					dep.Status, dep.LastError, dep.UpdatedAt = model.DNSStatusFailed, approval.Reason, now
+					staged.DNSDeployments[depID] = dep
+				}
+			}
+		}
+		t.Status, t.FinishedAt = model.TaskCancelled, now
+		staged.Tasks[t.ID] = t
+		superseded = append(superseded, GuardSupersession{NodeID: nodeID, ApprovalID: approval.ID, TaskID: t.ID,
+			Kind: w.Kind, Reason: reason, ActorID: t.ActorID, TokenID: t.TokenID, At: now})
+		stateChanged = true
 	}
 	ids := make([]string, 0, len(staged.Tasks))
 	for id := range staged.Tasks {
@@ -2413,6 +2482,12 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 			protocol, current := gated(t)
 			isGated := protocol != ""
 			if !current || isGated != wantGated || !taskCanLeaseTarget(t, nodeID, s.state.Results, staged.TaskTargetStates, now, s.taskQueueDeadline) {
+				continue
+			}
+			if reason, hold := s.guardOwnerAtLeaseLocked(staged, t, nodeID, now); reason != "" {
+				supersedeGuardWriter(t, reason)
+				continue
+			} else if hold {
 				continue
 			}
 			// Past the gate with a lease already recorded means that lease died
@@ -2530,6 +2605,7 @@ func (s *Store) leaseTaskDeliveries(nodeID string, limit int, plugin, action str
 		return nil, err
 	}
 	s.state = staged
+	s.guardSuperseded = append(s.guardSuperseded, superseded...)
 	if err != nil {
 		if onlyGenericTaskDeliveries(out) {
 			// Generic tasks intentionally retain the historical one-shot protocol:
@@ -4008,6 +4084,7 @@ func cloneNodeGuardBinding(binding model.NodeGuardBinding) model.NodeGuardBindin
 	binding.GroupIDs = append([]string(nil), binding.GroupIDs...)
 	binding.Overrides = cloneGuardRules(binding.Overrides)
 	binding.ZoneIDs = append([]string(nil), binding.ZoneIDs...)
+	binding.AppliedDerived = append([]model.DerivedSecurityGroup(nil), binding.AppliedDerived...)
 	return binding
 }
 
@@ -4983,12 +5060,51 @@ func (s *Store) SecurityGroups() []model.SecurityGroup {
 	return out
 }
 
-// DeleteSecurityGroup removes a stored security group.
+// SecurityGroupInUseError is DeleteSecurityGroup's refusal: node bindings or
+// node-group bindings still attach the group, and deleting it would leave
+// their compiles failing. The ids are sorted.
+type SecurityGroupInUseError struct {
+	ID           string
+	NodeIDs      []string
+	NodeGroupIDs []string
+}
+
+func (e *SecurityGroupInUseError) Error() string {
+	var parts []string
+	if len(e.NodeIDs) > 0 {
+		parts = append(parts, "node "+strings.Join(e.NodeIDs, ", "))
+	}
+	if len(e.NodeGroupIDs) > 0 {
+		parts = append(parts, "node group "+strings.Join(e.NodeGroupIDs, ", "))
+	}
+	return fmt.Sprintf("security group %q is still attached to %s", e.ID, strings.Join(parts, " and "))
+}
+
+// DeleteSecurityGroup removes a stored security group. It refuses with a
+// *SecurityGroupInUseError, under the lock that deletes, while a binding
+// still attaches it, so a binding written between a caller's check and the
+// delete cannot be left naming a group that is gone.
 func (s *Store) DeleteSecurityGroup(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.state.SecurityGroups[id]; !ok {
 		return nil
+	}
+	inUse := &SecurityGroupInUseError{ID: id}
+	for nodeID, binding := range s.state.GuardBindings {
+		if contains(binding.GroupIDs, id) {
+			inUse.NodeIDs = append(inUse.NodeIDs, nodeID)
+		}
+	}
+	for groupID, b := range s.state.NodeGroupGuardBindings {
+		if contains(b.SecurityGroupIDs, id) {
+			inUse.NodeGroupIDs = append(inUse.NodeGroupIDs, groupID)
+		}
+	}
+	if len(inUse.NodeIDs) > 0 || len(inUse.NodeGroupIDs) > 0 {
+		sort.Strings(inUse.NodeIDs)
+		sort.Strings(inUse.NodeGroupIDs)
+		return inUse
 	}
 	delete(s.state.SecurityGroups, id)
 	s.invalidateGuardBindingsForGroupLocked(id)
@@ -5066,35 +5182,52 @@ func (s *Store) invalidateGuardBindingsForGroupLocked(groupID string) {
 	for nodeID, binding := range s.state.GuardBindings {
 		if contains(binding.GroupIDs, groupID) {
 			s.invalidateGuardBindingLocked(nodeID)
+			continue
+		}
+		if node, ok := s.state.Nodes[nodeID]; ok && binding.Managed {
+			for _, derived := range s.derivedGuardGroupsLocked(node, binding.GroupIDs) {
+				if derived.SecurityGroupID == groupID {
+					s.invalidateGuardBindingLocked(nodeID)
+					break
+				}
+			}
 		}
 	}
 }
 
 func (s *Store) invalidateGuardBindingsForZoneLocked(zoneID string) {
 	for nodeID, binding := range s.state.GuardBindings {
-		if contains(binding.ZoneIDs, zoneID) || guardRulesReferenceZone(binding.Overrides, zoneID) {
-			s.invalidateGuardBindingLocked(nodeID)
+		if binding.LastPlanSHA == "" {
 			continue
 		}
-		for _, groupID := range binding.GroupIDs {
-			group, ok := s.state.SecurityGroups[groupID]
-			if ok && guardRulesReferenceZone(group.Rules, zoneID) {
-				s.invalidateGuardBindingLocked(nodeID)
-				break
-			}
+		if contains(binding.ZoneIDs, zoneID) || guardRulesReferenceZone(s.bindingRulesLocked(nodeID, binding), zoneID) {
+			s.invalidateGuardBindingLocked(nodeID)
 		}
 	}
 }
 
+// invalidateGuardBindingsForNodeLocked runs when a node's addresses change:
+// every compile that names it, directly or as a member of a group remote,
+// renders those addresses.
 func (s *Store) invalidateGuardBindingsForNodeLocked(referencedNodeID string) {
+	referenced, known := s.state.Nodes[referencedNodeID]
 	for nodeID, binding := range s.state.GuardBindings {
-		if guardRulesReferenceNode(binding.Overrides, referencedNodeID) {
+		if binding.LastPlanSHA == "" {
+			continue
+		}
+		rules := s.bindingRulesLocked(nodeID, binding)
+		if guardRulesReferenceNode(rules, referencedNodeID) {
 			s.invalidateGuardBindingLocked(nodeID)
 			continue
 		}
-		for _, groupID := range binding.GroupIDs {
-			group, ok := s.state.SecurityGroups[groupID]
-			if ok && guardRulesReferenceNode(group.Rules, referencedNodeID) {
+		if !known {
+			continue
+		}
+		for _, rule := range rules {
+			if rule.Remote.Kind != model.NetRefGroup {
+				continue
+			}
+			if g, ok := s.state.Groups[rule.Remote.GroupID]; ok && groups.Contains(g, referenced) {
 				s.invalidateGuardBindingLocked(nodeID)
 				break
 			}
@@ -5209,7 +5342,11 @@ func (s *Store) UpsertGroup(g model.Group) error {
 	if g.CreatedAt.IsZero() {
 		g.CreatedAt = g.UpdatedAt
 	}
+	// Membership may move: clear the anchors the old members' compiles hold,
+	// then the new members'.
+	s.invalidateGuardBindingsForGroupEditLocked(g.ID)
 	s.state.Groups[g.ID] = cloneGroup(g)
+	s.invalidateGuardBindingsForGroupEditLocked(g.ID)
 	return s.Save()
 }
 
@@ -5259,10 +5396,13 @@ func (s *Store) DeleteGroup(id string) error {
 	for _, def := range s.state.CheckDefinitions {
 		defs = append(defs, def)
 	}
-	if err := groupInUse(id, all, policies, defs); err != nil {
+	if err := groupInUse(id, all, policies, defs, s.guardUsesOfGroupLocked(id)); err != nil {
 		return err
 	}
+	s.invalidateGuardBindingsForGroupEditLocked(id)
 	delete(s.state.Groups, id)
+	// An empty binding is not a use; it goes with its group.
+	delete(s.state.NodeGroupGuardBindings, id)
 	return s.Save()
 }
 

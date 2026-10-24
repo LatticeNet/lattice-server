@@ -220,6 +220,11 @@ func (s *Server) buildBeaconPlan(node model.Node, action string, settings model.
 		if err != nil {
 			return plan, "", err
 		}
+		// The companion re-renders the whole table, so it must not close a
+		// running CoreDNS's ports any more than a NetGuard plan may (KI-29).
+		if err := dnsListenerRefusal(s.dnsListenerFindings(node.ID, compiled, input.Zones)); err != nil {
+			return plan, "", &beaconPlanError{status: http.StatusConflict, err: err}
+		}
 		ruleset, err := network.GenerateNFTPlan(compiled)
 		if err != nil {
 			return plan, "", err

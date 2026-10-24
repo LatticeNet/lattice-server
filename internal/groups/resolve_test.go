@@ -188,3 +188,29 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// Contains is ResolveMembers for one node: it must agree with it for every
+// group and node, explicit members and selector matches alike.
+func TestContainsAgreesWithResolveMembers(t *testing.T) {
+	nodes := fixtureNodes()
+	groupList := []model.Group{
+		{ID: "static", Members: []string{"node_b", "node_zz"}},
+		{ID: "web", Selector: sel(model.GroupSelector{MatchRoles: []string{"web"}})},
+		{ID: "both", Members: []string{"node_d"}, Selector: sel(model.GroupSelector{MatchTagsAny: []string{"prod"}})},
+		{ID: "empty-selector", Selector: sel(model.GroupSelector{})},
+	}
+	for _, g := range groupList {
+		members := map[string]bool{}
+		for _, id := range ResolveMembers(g, nodes) {
+			members[id] = true
+		}
+		for _, n := range nodes {
+			if got := Contains(g, n); got != members[n.ID] {
+				t.Fatalf("Contains(%s, %s) = %v, ResolveMembers says %v", g.ID, n.ID, got, members[n.ID])
+			}
+		}
+	}
+	if Contains(model.Group{Members: []string{""}}, model.Node{}) {
+		t.Fatal("a node without an id is never a member")
+	}
+}

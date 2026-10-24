@@ -52,6 +52,20 @@ func ResolveMembers(g model.Group, allNodes []model.Node) []string {
 	return out
 }
 
+// Contains reports whether n is a resolved member of g, by the same rule
+// as ResolveMembers, without resolving the rest of the fleet.
+func Contains(g model.Group, n model.Node) bool {
+	if n.ID == "" {
+		return false
+	}
+	for _, id := range g.Members {
+		if id == n.ID {
+			return true
+		}
+	}
+	return g.Selector != nil && selectorMatches(g.Selector, n)
+}
+
 // ResolveAll resolves every group against the same node set, returning a map of
 // group ID to its resolved (deduped, sorted) node IDs.
 func ResolveAll(groups []model.Group, nodes []model.Node) map[string][]string {

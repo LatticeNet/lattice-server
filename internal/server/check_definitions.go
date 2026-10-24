@@ -138,6 +138,23 @@ func normalizeCheckSelector(field string, in model.TargetSelector, prior *model.
 		return out, err
 	}
 	out.All = in.All
+	// One canonical form that resolves to the same nodes (groups.ResolveTargets):
+	// the whole fleet needs nothing named, an exclusion wins over a named
+	// node, and an exclusion with no group or whole fleet to subtract from
+	// says nothing. The console edits this form, so it never changes what a
+	// selector sent through the API measures.
+	if out.All {
+		out.Nodes, out.Groups = nil, nil
+	}
+	if len(out.Exclude) > 0 {
+		out.Nodes = slices.DeleteFunc(out.Nodes, func(id string) bool { return slices.Contains(out.Exclude, id) })
+		if len(out.Nodes) == 0 {
+			out.Nodes = nil
+		}
+		if !out.All && len(out.Groups) == 0 {
+			out.Exclude = nil
+		}
+	}
 	return out, nil
 }
 

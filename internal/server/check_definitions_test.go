@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
@@ -908,6 +909,51 @@ func TestFleetMeshListedAndUntouched(t *testing.T) {
 }
 
 // A save validates the method's shape.
+// A selector is stored in one canonical form that resolves to the same
+// nodes as what was sent (design 32 D5): the whole fleet needs no named
+// nodes or groups, an excluded node is never also named (an exclusion wins),
+// and an exclusion with no group or whole fleet to subtract from says
+// nothing. So the console, which edits that form, never changes what a
+// definition made through the API measures.
+func TestCheckDefinitionSelectorIsStoredCanonical(t *testing.T) {
+	_, handler, st := checkFleet(t)
+	if err := st.UpsertGroup(model.Group{ID: "grp_far", Name: "far", Slug: "far", Color: "sky", Members: []string{"node-jp", "node-us"}}); err != nil {
+		t.Fatal(err)
+	}
+	c := newCheckClient(t, handler)
+	cases := []struct {
+		name     string
+		sent     model.TargetSelector
+		stored   model.TargetSelector
+		resolves []string
+	}{
+		{"whole fleet drops named nodes and groups", model.TargetSelector{All: true, Nodes: []string{"node-jp"}, Groups: []string{"grp_far"}, Exclude: []string{"node-hk"}}, model.TargetSelector{All: true, Exclude: []string{"node-hk"}}, []string{"node-bj", "node-jp", "node-us"}},
+		{"an excluded node leaves the named list", model.TargetSelector{Nodes: []string{"node-jp", "node-us"}, Exclude: []string{"node-jp"}}, model.TargetSelector{Nodes: []string{"node-us"}}, []string{"node-us"}},
+		{"exclusions stay beside a group", model.TargetSelector{Groups: []string{"grp_far"}, Nodes: []string{"node-us", "node-hk"}, Exclude: []string{"node-us"}}, model.TargetSelector{Nodes: []string{"node-hk"}, Groups: []string{"grp_far"}, Exclude: []string{"node-us"}}, []string{"node-hk", "node-jp"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			view := c.create(model.CheckDefinitionSave{CheckDefinitionSpec: model.CheckDefinitionSpec{
+				Name: tc.name, Type: model.MonitorTypeICMP, IntervalSec: 60, TimeoutSec: 5, Packets: 1, Enabled: true,
+				Sources: model.TargetSelector{Nodes: []string{"node-sh"}}, Targets: tc.sent,
+			}})
+			if !reflect.DeepEqual(view.Targets, tc.stored) {
+				t.Fatalf("stored %+v, want %+v", view.Targets, tc.stored)
+			}
+			var got []string
+			for _, mon := range definitionMonitors(st, view.ID) {
+				if mon.Enabled {
+					got = append(got, mon.TargetNode)
+				}
+			}
+			slices.Sort(got)
+			if !slices.Equal(got, tc.resolves) {
+				t.Fatalf("measures %v, want %v (the canonical form must resolve as the sent one did)", got, tc.resolves)
+			}
+		})
+	}
+}
+
 func TestCheckDefinitionValidation(t *testing.T) {
 	_, handler, _ := checkFleet(t)
 	c := newCheckClient(t, handler)

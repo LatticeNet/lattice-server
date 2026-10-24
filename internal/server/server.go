@@ -2425,7 +2425,7 @@ func (s *Server) startSessionAudited(w http.ResponseWriter, r *http.Request, use
 	if err := s.store.PutSession(session); err != nil {
 		return auth.Session{}, err
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
 		Name:     "lattice_session",
 		Value:    session.ID,
 		Path:     "/",
@@ -2789,7 +2789,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, p principa
 		}
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "logout", Decision: "allow"})
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
 		Name:     "lattice_session",
 		Value:    "",
 		Path:     "/",

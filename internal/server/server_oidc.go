@@ -96,7 +96,7 @@ func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setOIDCBindingCookie(w, binding)
-	http.Redirect(w, r, authURL, http.StatusFound)
+	http.Redirect(w, r, authURL, http.StatusFound) // #nosec G710 -- authURL is the configured provider's endpoint; the request only picks an enabled one
 }
 
 // oidcBindingCookie carries the per-flow browser-binding token. SameSite=Lax so
@@ -105,7 +105,7 @@ func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 const oidcBindingCookie = "lattice_oidc_bind"
 
 func (s *Server) setOIDCBindingCookie(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
 		Name:     oidcBindingCookie,
 		Value:    token,
 		Path:     "/api/auth/oidc",
@@ -117,7 +117,7 @@ func (s *Server) setOIDCBindingCookie(w http.ResponseWriter, token string) {
 }
 
 func (s *Server) clearOIDCBindingCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
 		Name:     oidcBindingCookie,
 		Value:    "",
 		Path:     "/api/auth/oidc",
@@ -166,7 +166,7 @@ func (s *Server) ssoChallengeFromCookie(r *http.Request) (auth.TOTPChallenge, bo
 }
 
 func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, value string) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
 		Name:     totpChallengeCookie,
 		Value:    value,
 		Path:     "/api/login/totp",
@@ -178,7 +178,7 @@ func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, value string) {
 }
 
 func (s *Server) clearTOTPChallengeCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
 		Name:     totpChallengeCookie,
 		Value:    "",
 		Path:     "/api/login/totp",

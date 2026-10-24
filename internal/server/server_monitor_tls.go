@@ -213,17 +213,17 @@ func (s *Server) readTLSLeafNotAfter(ctx context.Context, target string) (time.T
 		tlsConn := tls.Client(conn, &tls.Config{
 			ServerName: host,
 			// See the doc comment: expiry is read, trust is not asserted.
-			InsecureSkipVerify: true, //nolint:gosec // expiry probe, see doc comment
+			InsecureSkipVerify: true, // #nosec G402 -- an expiry probe asserts no trust, see the doc comment
 			MinVersion:         tls.VersionTLS12,
 		})
 		err = tlsConn.HandshakeContext(ctx)
 		if err != nil {
-			tlsConn.Close()
+			_ = tlsConn.Close()
 			lastErr = err
 			continue
 		}
 		chain := tlsConn.ConnectionState().PeerCertificates
-		tlsConn.Close()
+		_ = tlsConn.Close()
 		if len(chain) == 0 {
 			lastErr = errors.New("handshake presented no certificate")
 			continue

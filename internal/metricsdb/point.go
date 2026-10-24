@@ -299,7 +299,7 @@ func appendPayload(b []byte, p Point) []byte {
 			if n == 0 {
 				continue
 			}
-			b = binary.AppendUvarint(b, uint64(bin-prev-1))
+			b = binary.AppendUvarint(b, uint64(bin-prev-1)) // #nosec G115 -- bins ascend from prev = -1, so the gap is never negative
 			b = binary.AppendUvarint(b, uint64(n))
 			prev = bin
 		}

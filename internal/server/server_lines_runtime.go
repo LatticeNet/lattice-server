@@ -92,7 +92,7 @@ func singBoxUserPayloadForLine(u VpnUser, line Line, flowOverride string) (strin
 	default:
 		return "", fmt.Errorf("unsupported line protocol %q", line.Type)
 	}
-	b, err := json.Marshal(payload)
+	b, err := json.Marshal(payload) // #nosec G117 -- the node needs the credential to apply it; sent on the node channel
 	if err != nil {
 		return "", err
 	}

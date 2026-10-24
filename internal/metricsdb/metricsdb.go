@@ -299,7 +299,7 @@ func Open(path string, opts Options) (db *DB, err error) {
 		refused:     map[refusedKey]*RefusedSeries{},
 	}
 	if err := db.init(); err != nil {
-		bdb.Close()
+		_ = bdb.Close()
 		return nil, err
 	}
 	return db, nil
@@ -416,11 +416,11 @@ func (db *DB) init() error {
 		}
 		for i, t := range db.tiers {
 			if v := meta.Get([]byte(rolledPrefix + t.Name)); len(v) == 8 {
-				db.rolled[i] = int64(binary.BigEndian.Uint64(v))
+				db.rolled[i] = int64(binary.BigEndian.Uint64(v)) // #nosec G115 -- the meta value is unix seconds this package wrote, never negative
 			}
 		}
 		if v := meta.Get(metaHorizon); len(v) == 8 {
-			db.horizon = int64(binary.BigEndian.Uint64(v))
+			db.horizon = int64(binary.BigEndian.Uint64(v)) // #nosec G115 -- the meta value is unix seconds this package wrote, never negative
 		}
 		return nil
 	})
@@ -560,7 +560,7 @@ func (db *DB) Write(at time.Time, samples []Sample) (WriteResult, error) {
 		res.Late = len(samples)
 		res.Duration = time.Since(start)
 		db.mu.Lock()
-		db.lateSamples += uint64(res.Late)
+		db.lateSamples += uint64(res.Late) // #nosec G115 -- a sample count, never negative
 		db.lastWrite = res
 		db.mu.Unlock()
 		return res, nil
@@ -653,7 +653,7 @@ func (db *DB) Write(at time.Time, samples []Sample) (WriteResult, error) {
 		}
 		res.Trimmed = trimmed
 		if nextHorizon != db.horizon {
-			if err := tx.Bucket(bucketMeta).Put(metaHorizon, binary.BigEndian.AppendUint64(nil, uint64(nextHorizon))); err != nil {
+			if err := tx.Bucket(bucketMeta).Put(metaHorizon, binary.BigEndian.AppendUint64(nil, uint64(nextHorizon))); err != nil { // #nosec G115 -- the horizon is unix seconds on the server clock, never negative
 				return err
 			}
 		}
@@ -682,7 +682,7 @@ func (db *DB) Write(at time.Time, samples []Sample) (WriteResult, error) {
 	copy(db.rolled, rolledAfter)
 	db.horizon = nextHorizon
 	res.NewlyRefused = db.noteRefusedLocked(refusedNow, res.At)
-	db.refusedSamples += uint64(res.Refused)
+	db.refusedSamples += uint64(res.Refused) // #nosec G115 -- a sample count, never negative
 	db.lastWrite = res
 	db.lastWrite.NewlyRefused = nil
 	db.mu.Unlock()
@@ -878,7 +878,7 @@ func (db *DB) rollTx(tx *bolt.Tx, owners []uint32, written, horizon int64) ([]in
 		}
 		rolled[i] = last
 		if last != prev {
-			if err := meta.Put([]byte(rolledPrefix+t.Name), binary.BigEndian.AppendUint64(nil, uint64(last))); err != nil {
+			if err := meta.Put([]byte(rolledPrefix+t.Name), binary.BigEndian.AppendUint64(nil, uint64(last))); err != nil { // #nosec G115 -- a rolled bucket start, unix seconds, never negative
 				return nil, 0, err
 			}
 		}
@@ -917,7 +917,7 @@ func newestRowTx(tx *bolt.Tx, t Tier, owners []uint32) (int64, bool) {
 		if len(k) != 12 || binary.BigEndian.Uint32(k[:4]) != owner {
 			continue
 		}
-		if at := int64(binary.BigEndian.Uint64(k[4:])); !found || at > newest {
+		if at := int64(binary.BigEndian.Uint64(k[4:])); !found || at > newest { // #nosec G115 -- ownerKey writes the time half from a non-negative int64
 			newest, found = at, true
 		}
 	}
@@ -947,7 +947,7 @@ func oldestRowTx(tx *bolt.Tx, t Tier, owners []uint32) (int64, bool) {
 		if len(k) != 12 || string(k[:4]) != string(prefix) {
 			continue
 		}
-		at := int64(binary.BigEndian.Uint64(k[4:]))
+		at := int64(binary.BigEndian.Uint64(k[4:])) // #nosec G115 -- ownerKey writes the time half from a non-negative int64
 		if !found || at < oldest {
 			oldest, found = at, true
 		}

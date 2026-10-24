@@ -665,19 +665,19 @@ func (s *Server) publishDNSDeploymentWithAudit(parent context.Context, dep model
 	}
 	profile, err := s.dnsPublishProfile(dep)
 	if err != nil {
-		s.markDNSPublishResult(dep, "", "", err)
+		_ = s.markDNSPublishResult(dep, "", "", err)
 		recordPublishAudit(false)
 		return err
 	}
 	publishV4, publishV6, err := publishableDNSIPs(profile, v4, v6)
 	if err != nil {
-		s.markDNSPublishResult(dep, "", "", err)
+		_ = s.markDNSPublishResult(dep, "", "", err)
 		recordPublishAudit(false)
 		return err
 	}
 	prov, err := s.ddnsProvider(profile)
 	if err != nil {
-		s.markDNSPublishResult(dep, publishV4, publishV6, err)
+		_ = s.markDNSPublishResult(dep, publishV4, publishV6, err)
 		recordPublishAudit(false)
 		return err
 	}

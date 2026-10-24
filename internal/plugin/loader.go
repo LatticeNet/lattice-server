@@ -167,7 +167,7 @@ func firstUnmetDependency(pl Loaded, byID map[string]Loaded) string {
 }
 
 func (l Loader) loadBundle(bundle string) (Loaded, error) {
-	manifestBytes, err := os.ReadFile(filepath.Join(bundle, manifestFileName))
+	manifestBytes, err := os.ReadFile(filepath.Join(bundle, manifestFileName)) // #nosec G304 -- bundle is a directory entry of the operator's plugin dir
 	if err != nil {
 		return Loaded{}, fmt.Errorf("read manifest: %w", err)
 	}
@@ -215,7 +215,7 @@ func (l Loader) loadBundle(bundle string) (Loaded, error) {
 
 func (l Loader) readArtifact(artifactPath string, bounded bool) ([]byte, error) {
 	if !bounded {
-		return os.ReadFile(artifactPath)
+		return os.ReadFile(artifactPath) // #nosec G304 -- artifactPath is a fixed name inside an operator plugin bundle
 	}
 	limit := normalizedBundleLimits(l.Limits).MaxCompressedBytes
 	return readBoundedRegularFile(artifactPath, limit)
@@ -225,7 +225,7 @@ func readBoundedRegularFile(filePath string, limit int64) ([]byte, error) {
 	if limit <= 0 {
 		return nil, errors.New("file size limit must be positive")
 	}
-	file, err := os.Open(filePath)
+	file, err := os.Open(filePath) // #nosec G304 -- callers pass a fixed name inside an operator plugin bundle
 	if err != nil {
 		return nil, err
 	}

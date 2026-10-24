@@ -92,7 +92,7 @@ func main() {
 	fmt.Printf("signing payload bytes  : %d\n", len(payload))
 
 	if *write {
-		must(os.WriteFile(*manifestPath, out, 0o644), "write manifest")
+		must(os.WriteFile(*manifestPath, out, 0o644), "write manifest") // #nosec G306 -- a signed manifest is public by design
 		fmt.Printf("wrote %s\n", *manifestPath)
 	} else {
 		fmt.Println("--- canonical manifest (not written; pass -write) ---")

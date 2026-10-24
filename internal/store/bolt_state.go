@@ -521,19 +521,19 @@ func OpenBoltState(path string, cph secret.Cipher) (*BoltStateStore, error) {
 	bs := &BoltStateStore{db: db, cipher: cph}
 	if preexisting {
 		if _, err := bs.exportState(false, false); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, err
 		}
 		// Audit is checked here and only here: it is the one domain the export
 		// deliberately skips, and open is the one moment when checking it is
 		// both meaningful and paid once.
 		if err := bs.ValidateAuditLog(); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, err
 		}
 	}
 	if err := bs.ensureBuckets(); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	if preexisting {
@@ -543,7 +543,7 @@ func OpenBoltState(path string, cph secret.Cipher) (*BoltStateStore, error) {
 		// above already read every record, decoding and discarding one at a
 		// time, so the records are checked without a peak.
 		if _, err := bs.exportState(true, false); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, err
 		}
 	}
@@ -1145,7 +1145,7 @@ func (bs *BoltStateStore) replaceWithCompactEncryptedState(st State) error {
 	}
 	tmpPath := tmp.Name()
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return err
 	}
 	defer os.Remove(tmpPath)

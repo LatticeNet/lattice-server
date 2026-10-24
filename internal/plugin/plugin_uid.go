@@ -120,11 +120,11 @@ func currentProcessIdentity() (processIdentity, error) {
 		return processIdentity{}, fmt.Errorf("read the server's supplementary groups: %w", err)
 	}
 	id := processIdentity{
-		UIDs: []uint32{uint32(os.Getuid()), uint32(os.Geteuid())},
-		GIDs: []uint32{uint32(os.Getgid()), uint32(os.Getegid())},
+		UIDs: []uint32{uint32(os.Getuid()), uint32(os.Geteuid())}, // #nosec G115 -- POSIX uids and gids are 32-bit kernel ids
+		GIDs: []uint32{uint32(os.Getgid()), uint32(os.Getegid())}, // #nosec G115 -- POSIX uids and gids are 32-bit kernel ids
 	}
 	for _, g := range groups {
-		id.Groups = append(id.Groups, uint32(g))
+		id.Groups = append(id.Groups, uint32(g)) // #nosec G115 -- POSIX uids and gids are 32-bit kernel ids
 	}
 	return id, nil
 }

@@ -61,7 +61,7 @@ func (s *Server) renderShareShared(ctx context.Context, share model.Subscription
 		}
 		flight = &shareRenderFlight{done: make(chan struct{})}
 		s.shareRenderFlights[key] = flight
-		go func() {
+		go func() { // #nosec G118 -- a shared flight outlives any one waiter's request; it has its own timeout
 			renderCtx, cancel := context.WithTimeout(context.Background(), shareRenderTimeout)
 			defer cancel()
 			outcome := s.renderShareOnce(renderCtx, share, plan, key)

@@ -50,7 +50,7 @@ const (
 	// shareExtraFleetCredentials marks a share created with the explicit
 	// flag. It rides in the share's Extra map until the SDK has a field, as
 	// update_interval_hours does.
-	shareExtraFleetCredentials = "publishes_fleet_credentials"
+	shareExtraFleetCredentials = "publishes_fleet_credentials" // #nosec G101 -- a share Extra key, not a credential
 	// apiErrorFleetFeedFlagRequired refuses a share of a fleet feed created
 	// without the flag.
 	apiErrorFleetFeedFlagRequired = "fleet_feed_flag_required"

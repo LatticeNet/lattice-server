@@ -54,12 +54,12 @@ func migrate(db *sql.DB) error {
 		}
 		for _, stmt := range m.statements {
 			if _, err := tx.Exec(stmt); err != nil {
-				tx.Rollback()
+				_ = tx.Rollback()
 				return fmt.Errorf("tracestore: migrate v%d: %w", m.version, err)
 			}
 		}
 		if _, err := tx.Exec("INSERT INTO schema_version (version, applied_at) VALUES (?, ?)", m.version, time.Now().UTC().UnixNano()); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			return fmt.Errorf("tracestore: migrate v%d: %w", m.version, err)
 		}
 		if err := tx.Commit(); err != nil {

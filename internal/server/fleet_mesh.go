@@ -227,9 +227,24 @@ func planFleetMeshMigration(cfg model.LatencyProbeConfig, nodes []model.Node, pa
 	return out
 }
 
+// isFleetMeshID reports whether id is a definition the path set became
+// (chk_fleet_mesh, or chk_fleet_mesh_<method> for a pinned method).
+func isFleetMeshID(id string) bool {
+	return id == model.CheckFleetMeshID || strings.HasPrefix(id, model.CheckFleetMeshID+"_")
+}
+
 // migratePathSet migrates the path set into check definitions unless it is
 // migrated already, then syncs the definitions so the adopted monitors take
 // their definition's form at once. It reports whether it migrated.
+//
+// It runs once at start, before the listeners and the sweeps, so it takes
+// latencySync without monitorSaves, which the lock order puts first: no
+// save can be running yet.
+//
+// After a rollback the older release drops the marker, and the next start
+// migrates again from the path set it ran: that path set wins over the
+// Fleet mesh definitions left from before, whose ids and versions the audit
+// record names as replaced.
 func (s *Server) migratePathSet(now time.Time) (bool, error) {
 	s.latencySync.Lock()
 	cfg, stored := s.store.LatencyProbeConfig()
@@ -250,7 +265,7 @@ func (s *Server) migratePathSet(now time.Time) (bool, error) {
 	}
 	prior := map[string]model.CheckDefinition{}
 	for _, def := range s.store.CheckDefinitions() {
-		if def.ID == model.CheckFleetMeshID || strings.HasPrefix(def.ID, model.CheckFleetMeshID+"_") {
+		if isFleetMeshID(def.ID) {
 			prior[def.ID] = def
 		}
 	}
@@ -258,7 +273,12 @@ func (s *Server) migratePathSet(now time.Time) (bool, error) {
 	err := s.store.MigratePathSet(m.config, m.defs, m.adopt, now)
 	s.latencySync.Unlock()
 	if err != nil {
-		return false, fmt.Errorf("migrate the path set: %w", err)
+		if after, _ := s.store.LatencyProbeConfig(); after.Migrated == nil {
+			return false, fmt.Errorf("migrate the path set: %w", err)
+		}
+		// The write committed and only its directory sync went unconfirmed:
+		// the migration holds, so the rest of it runs.
+		s.logger.Printf("latency probes: path set migrated, durability unconfirmed: %v", err)
 	}
 	s.monitorPaths.dropPlan()
 	adopted := make([]string, 0, len(m.adopt))
@@ -266,6 +286,11 @@ func (s *Server) migratePathSet(now time.Time) (bool, error) {
 		adopted = append(adopted, monitorID)
 	}
 	sort.Strings(adopted)
+	replaced := make([]string, 0, len(prior))
+	for defID, def := range prior {
+		replaced = append(replaced, defID+"@v"+strconv.FormatInt(def.Version, 10))
+	}
+	sort.Strings(replaced)
 	s.recordAudit(model.AuditEvent{
 		ID:       id.New("audit"),
 		At:       now.UTC(),
@@ -280,6 +305,7 @@ func (s *Server) migratePathSet(now time.Time) (bool, error) {
 			"config_kind":    map[bool]string{true: "stored", false: "defaults"}[stored],
 			"left_out":       latencyIDList(m.leftOut),
 			"excluded_pairs": strconv.Itoa(len(cfg.DisabledPairs)),
+			"replaced":       latencyIDList(replaced),
 			"note":           "the region rule became the whole fleet minus left_out: a node that joins later is measured unless excluded",
 		},
 	})

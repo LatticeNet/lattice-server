@@ -806,14 +806,6 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	// migrated are the definitions the path set became: their node cells
-	// keep the deprecated Managed mark for one release (design 32 R1).
-	migrated := map[string]bool{}
-	for _, def := range s.store.CheckDefinitions() {
-		if len(def.Adopted) > 0 {
-			migrated[def.ID] = true
-		}
-	}
 	firstAuthored := len(out)
 	for _, id := range ids {
 		mon := monitors[id]
@@ -858,7 +850,9 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 					Source: source, TargetNode: targetNode, Target: target,
 					MonitorID: mon.ID, Method: mon.Type,
 					CheckDefinitionID: definitionID,
-					Managed:           migrated[definitionID] && mon.TargetNode != "",
+					// The path set's definitions keep the deprecated mark on
+					// their node cells for one release (design 32 R1).
+					Managed: isFleetMeshID(definitionID) && mon.TargetNode != "",
 				},
 				monitor:      &m,
 				interval:     time.Duration(mon.IntervalSec) * time.Second,

@@ -385,6 +385,11 @@ func TestFreshInstallSeedsFleetMesh(t *testing.T) {
 	if !stored || cfg.Migrated == nil {
 		t.Fatalf("the defaults are stored as migrated: %+v %v", cfg, stored)
 	}
+	// Its node cells keep the deprecated Managed mark the path set's had,
+	// though it adopted nothing.
+	if cells := pairCells(t, srv, "cd-hs-sh", "node-jp", model.CheckFleetMeshID); len(cells) != 1 || !cells[0].Managed {
+		t.Fatalf("a seeded Fleet mesh cell = %+v, want one marked managed", cells)
+	}
 	c := newCheckClient(t, handler)
 	view := c.get(model.CheckFleetMeshID)
 	var ids []string

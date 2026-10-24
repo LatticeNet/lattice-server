@@ -1,13 +1,16 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -135,10 +138,12 @@ func TestDNSApproveOnManagedNodeRefusesStaleNetGuardIntent(t *testing.T) {
 	}
 }
 
-// Every NetGuard compile of a node carries the DNS listeners its deployments
-// put in force, so a NetGuard plan made after the resolver is running keeps
-// its ports open. A deployment that was never approved contributes nothing.
-func TestNetGuardPlanKeepsDNSPortsOfDeploymentsInForce(t *testing.T) {
+// Every NetGuard compile of a node carries the DNS listeners its approved
+// plans opened, so a NetGuard plan made after the resolver is approved keeps
+// its ports. The set comes from the approved plan, not the stored record: a
+// deployment never approved opens nothing, and editing a running deployment
+// moves no port until its new plan is approved.
+func TestNetGuardPlanKeepsDNSPortsOfApprovedPlans(t *testing.T) {
 	_, handler, st := newDNSServer(t)
 	cookies, csrf := loginSession(t, handler)
 	adoptNodeWithWebGroup(t, handler, st, cookies, csrf)
@@ -162,30 +167,91 @@ func TestNetGuardPlanKeepsDNSPortsOfDeploymentsInForce(t *testing.T) {
 	}
 
 	if plan := netguardPlan(); strings.Contains(plan, "dport { 53 }") {
-		t.Fatalf("a pending deployment must not open its port:\n%s", plan)
+		t.Fatalf("a deployment never approved must not open its port:\n%s", plan)
 	}
-	dep, ok := st.DNSDeployment(depID)
-	if !ok {
-		t.Fatal("missing deployment")
-	}
-	dep.Status = model.DNSStatusRunning
-	if err := st.UpsertDNSDeployment(dep); err != nil {
-		t.Fatal(err)
+
+	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+depID+`"}`, cookies, csrf)
+	dnsApproval := decodeDNSPlan(t, planRes)
+	planRes.Body.Close()
+	approve := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": dnsApproval.ID, "queue_apply": true, "plan_sha256": planSHA256(dnsApproval.Plan)})), cookies, csrf)
+	approve.Body.Close()
+	if approve.StatusCode != http.StatusOK {
+		t.Fatalf("approve dns plan: %d", approve.StatusCode)
 	}
 	plan := netguardPlan()
 	for _, want := range []string{`ip saddr @wg_peers4 udp dport { 53 }`, `ip saddr @wg_peers4 tcp dport { 53 }`, `comment "web https"`} {
 		if !strings.Contains(plan, want) {
-			t.Fatalf("netguard plan must keep the running resolver's ports (%q):\n%s", want, plan)
+			t.Fatalf("netguard plan must keep the approved resolver's ports (%q):\n%s", want, plan)
 		}
 	}
 
-	dep.Disabled = true
-	dep.Status = model.DNSStatusDisabled
-	if err := st.UpsertDNSDeployment(dep); err != nil {
+	// An edit to the stored deployment, with no plan approved for it, opens
+	// and closes nothing.
+	edit := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", `{
+		"id":"`+depID+`","name":"private dns","node_id":"n1","listen_port":5353,
+		"zones":[{"suffix":".","mode":"forward","upstreams":["1.1.1.1"]}]
+	}`, cookies, csrf)
+	edit.Body.Close()
+	if edit.StatusCode != http.StatusOK {
+		t.Fatalf("edit deployment: %d", edit.StatusCode)
+	}
+	plan = netguardPlan()
+	if strings.Contains(plan, "5353") || !strings.Contains(plan, `ip saddr @wg_peers4 udp dport { 53 }`) {
+		t.Fatalf("an unapproved edit must not move the resolver's ports:\n%s", plan)
+	}
+
+	// A failed re-apply leaves the resolver on the plan that last applied,
+	// so its ports stay; an apply that never succeeded opens nothing.
+	failed, _ := st.Approval(dnsApproval.ID)
+	failed.Status = model.ApprovalRejected
+	if err := st.UpsertApproval(failed); err != nil {
 		t.Fatal(err)
 	}
 	if plan := netguardPlan(); strings.Contains(plan, "dport { 53 }") {
-		t.Fatalf("a disabled deployment must not keep its port open:\n%s", plan)
+		t.Fatalf("a plan that never applied must not hold ports open:\n%s", plan)
+	}
+	failed.Status = model.ApprovalApplied
+	if err := st.UpsertApproval(failed); err != nil {
+		t.Fatal(err)
+	}
+	if plan := netguardPlan(); !strings.Contains(plan, `ip saddr @wg_peers4 udp dport { 53 }`) {
+		t.Fatalf("an applied plan must keep its ports:\n%s", plan)
+	}
+}
+
+// A DNS plan composed through NetGuard applies the node's whole NetGuard
+// intent, so planning and deciding it take netguard:admin, as a NetGuard plan
+// does; and a node un-adopted between plan and approve refuses the plan.
+func TestDNSPlanOnManagedNodeNeedsNetGuardAdminAndAdoption(t *testing.T) {
+	srv, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	adoptNodeWithWebGroup(t, handler, st, cookies, csrf)
+	depID := createDNSDeployment(t, handler, cookies, csrf)
+	planRes := doJSON(t, handler, http.MethodPost, "/api/dns/plan", `{"id":"`+depID+`"}`, cookies, csrf)
+	approval := decodeDNSPlan(t, planRes)
+	planRes.Body.Close()
+	if !strings.Contains(approval.Plan, "source: netguard") || !strings.Contains(approval.Plan, "listen: mesh udp 53") {
+		t.Fatalf("plan must record its firewall source and listeners:\n%s", approval.Plan)
+	}
+
+	dnsOnly := principal{Principal: rbac.Principal{ActorID: "dns-operator", Scopes: []string{"dns:admin", "network:plan", "network:apply", "netguard:read"}}}
+	_, err := srv.approveApprovalCore(context.Background(), dnsOnly, approval, true, planSHA256(approval.Plan))
+	var decision *approvalDecisionError
+	if !errors.As(err, &decision) || decision.status != http.StatusForbidden {
+		t.Fatalf("deciding a NetGuard-composed DNS plan without netguard:admin = %v, want 403", err)
+	}
+
+	binding, _ := st.NodeGuardBinding("n1")
+	binding.Managed = false
+	if _, err := st.UpsertNodeGuardBinding(binding); err != nil {
+		t.Fatal(err)
+	}
+	res := doJSON(t, handler, http.MethodPost, "/api/network/approvals/approve",
+		string(mustJSON(t, map[string]any{"approval_id": approval.ID, "queue_apply": true, "plan_sha256": planSHA256(approval.Plan)})), cookies, csrf)
+	res.Body.Close()
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("approving a NetGuard-composed plan after the node was un-adopted = %d, want 409", res.StatusCode)
 	}
 }
 

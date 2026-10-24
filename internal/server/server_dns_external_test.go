@@ -252,3 +252,25 @@ func TestExternalDNSDeploymentIsNotRepublishedOnNodeIPChange(t *testing.T) {
 		t.Fatalf("record should carry no publish state, not even a failed attempt: %+v", stored)
 	}
 }
+
+// Nothing renders an observed engine, so a client acl on one would be stored
+// text that reads like a restriction and restricts nothing.
+func TestExternalDNSDeploymentDropsClientNetworks(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	body := strings.Replace(externalDNSBody, `"exposure":"public",`, `"exposure":"public","allowed_client_networks":["not a network"],`, 1)
+	res := doJSON(t, handler, http.MethodPost, "/api/dns/deployments", body, cookies, csrf)
+	var created struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("create external deployment: %d", res.StatusCode)
+	}
+	if dep, ok := st.DNSDeployment(created.ID); !ok || len(dep.AllowedClientNetworks) != 0 {
+		t.Fatalf("external deployment kept client networks: ok=%v %+v", ok, dep.AllowedClientNetworks)
+	}
+}

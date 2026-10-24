@@ -16,6 +16,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/netguard"
 	"github.com/LatticeNet/lattice-server/internal/network"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/selfdns"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -488,47 +489,74 @@ func (s *Server) beaconCompanionFor(nodeID string) *netguard.BeaconCompanion {
 	return &netguard.BeaconCompanion{Bind: t.Companion.Bind, Port: t.Companion.Port, Allow: append([]string(nil), t.Companion.Allow...)}
 }
 
-// dnsListenersFor is the self-host DNS listener set in force on the node:
-// the listeners of every CoreDNS deployment on it that is not disabled and
-// has been approved (applying) or applied (running). Every NetGuard compile
-// of the node carries it, so a NetGuard plan keeps a running resolver's ports
-// open, and a deployment that was never approved opens nothing.
+// dnsListenersFor is the self-host DNS listener set in force on the node,
+// read from what was approved rather than from the stored deployment: for
+// each CoreDNS deployment the newest selfdns approval on this node that is
+// approved (its apply is in flight) or applied names the listeners its plan
+// opened. An edit to a running deployment changes nothing here until its new
+// plan is approved, and a failed re-apply (rejected) falls back to the plan
+// that last applied, whose resolver the apply script left running. Every
+// NetGuard compile of the node carries the set, so a NetGuard plan keeps a
+// running resolver's ports open, and a deployment never approved opens
+// nothing.
 //
-// planned, when set, is the deployment a DNS plan is being rendered for: it
-// contributes its current listeners whatever its status, replacing its stored
-// copy, so the plan opens the ports the plan itself starts. The approve that
-// follows moves it to applying, and from then on every compile agrees.
+// planned, when set, is the deployment a DNS plan is being rendered for on
+// its node: it contributes its current listeners in place of its approved
+// ones, so the plan opens the ports the plan itself starts. The approve that
+// follows makes that plan the newest approved one, and from then on every
+// compile agrees.
 func (s *Server) dnsListenersFor(nodeID string, planned *model.DNSDeployment) []netguard.DNSListener {
-	var out []netguard.DNSListener
-	for _, dep := range s.store.DNSDeploymentsForNode(nodeID) {
-		if planned != nil && dep.ID == planned.ID {
+	override := planned != nil && planned.NodeID == nodeID
+	newest := map[string]model.Approval{}
+	for _, approval := range s.store.Approvals() {
+		if approval.Plugin != "selfdns" || approval.NodeID != nodeID {
 			continue
 		}
-		if dep.Status != model.DNSStatusApplying && dep.Status != model.DNSStatusRunning {
+		if approval.Status != model.ApprovalApproved && approval.Status != model.ApprovalApplied {
 			continue
 		}
-		out = append(out, dnsDeploymentListeners(dep)...)
+		depID, err := selfDNSApprovalDeploymentID(approval.Action)
+		if err != nil || (override && depID == planned.ID) {
+			continue
+		}
+		if current, ok := newest[depID]; ok && !approval.CreatedAt.After(current.CreatedAt) {
+			continue
+		}
+		newest[depID] = approval
 	}
-	if planned != nil && planned.NodeID == nodeID {
-		out = append(out, dnsDeploymentListeners(*planned)...)
+	depIDs := make([]string, 0, len(newest))
+	for depID := range newest {
+		depIDs = append(depIDs, depID)
 	}
-	return out
+	sort.Strings(depIDs)
+	var listeners []selfdns.Listener
+	for _, depID := range depIDs {
+		// A deleted deployment leaves its resolver on the node, as deleting
+		// any record here leaves config behind, but nothing can plan it any
+		// more, so it stops holding ports open.
+		if dep, ok := s.store.DNSDeployment(depID); !ok || dep.Engine != model.DNSEngineCoreDNS {
+			continue
+		}
+		approval := newest[depID]
+		firewall, err := selfdns.ParsePlanFirewall(approval.Plan)
+		if err != nil {
+			s.logger.Printf("netguard: dns approval %s on node %s has no readable listener set, so it opens no ports: %v", approval.ID, nodeID, err)
+			continue
+		}
+		listeners = append(listeners, firewall.Listeners...)
+	}
+	if override {
+		listeners = append(listeners, selfdns.Listeners(*planned)...)
+	}
+	return netGuardDNSListeners(listeners)
 }
 
-// dnsDeploymentListeners maps a deployment onto the sockets NetGuard admits
-// for it. External engines are observations Lattice never renders, and a
-// disabled deployment opens nothing.
-func dnsDeploymentListeners(dep model.DNSDeployment) []netguard.DNSListener {
-	if dep.Engine != model.DNSEngineCoreDNS || dep.Disabled {
-		return nil
-	}
-	mesh := dep.Exposure == model.DNSExposureMesh
-	var out []netguard.DNSListener
-	if dep.EnableUDP {
-		out = append(out, netguard.DNSListener{Mesh: mesh, Protocol: model.NetProtoUDP, Port: dep.ListenPort})
-	}
-	if dep.EnableTCP {
-		out = append(out, netguard.DNSListener{Mesh: mesh, Protocol: model.NetProtoTCP, Port: dep.ListenPort})
+// netGuardDNSListeners maps the sockets a DNS plan opens onto the NetGuard
+// compile input.
+func netGuardDNSListeners(in []selfdns.Listener) []netguard.DNSListener {
+	out := make([]netguard.DNSListener, 0, len(in))
+	for _, l := range in {
+		out = append(out, netguard.DNSListener{Mesh: l.Exposure == model.DNSExposureMesh, Protocol: l.Protocol, Port: l.Port})
 	}
 	return out
 }

@@ -228,9 +228,10 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 		// from the legacy NFTInputs baseline here would drop every security
 		// group bound to the node, so the plan renders through the NetGuard
 		// compile with this deployment's listeners added, the way a beacon
-		// plan carries its companion. The ruleset shows the binding's rules,
-		// so reading it takes netguard:read as well.
-		if !s.requireNodeScope(w, p, "netguard:read", dep.NodeID) {
+		// plan carries its companion. The plan applies the node's whole
+		// current NetGuard intent, so authoring it takes netguard:admin, as a
+		// NetGuard plan and a beacon plan with NetGuard rules do.
+		if !s.requireNodeScope(w, p, "netguard:admin", dep.NodeID) {
 			return
 		}
 		input, resolver, err := s.compileInputFor(p, dep.NodeID)
@@ -248,7 +249,7 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 			return
 		}
 		composed = compiled
-		inputSource = "netguard"
+		inputSource = selfdns.FirewallSourceNetGuard
 		firewallSummary = append([]string{netGuardFirewallSummary(input.Groups)}, dnsListenerSummary(dep)...)
 	} else {
 		planInput := network.NFTPlan{}
@@ -301,7 +302,11 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	planText, err := selfdns.RenderApprovalPlanWithOptions(dep, node.Name, cfg, nftRuleset, firewallSummary, selfdns.ApprovalPlanOptions{CoreDNSBinary: s.coreDNSBinary})
+	firewallSource := selfdns.FirewallSourceLegacy
+	if inputSource == selfdns.FirewallSourceNetGuard {
+		firewallSource = selfdns.FirewallSourceNetGuard
+	}
+	planText, err := selfdns.RenderApprovalPlanWithOptions(dep, node.Name, cfg, nftRuleset, firewallSummary, selfdns.ApprovalPlanOptions{CoreDNSBinary: s.coreDNSBinary, FirewallSource: firewallSource})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -413,13 +418,13 @@ func netGuardFirewallSummary(groups []model.SecurityGroup) string {
 // dnsListenerSummary is the operator-facing line per listener a DNS plan adds
 // to a NetGuard compile, worded as selfdns.ComposeFirewallPlan words them.
 func dnsListenerSummary(dep model.DNSDeployment) []string {
-	listeners := dnsDeploymentListeners(dep)
+	listeners := selfdns.Listeners(dep)
 	if len(listeners) == 0 {
 		return []string{"no DNS listener ports added"}
 	}
 	out := make([]string, 0, len(listeners))
 	for _, l := range listeners {
-		if l.Mesh {
+		if l.Exposure == model.DNSExposureMesh {
 			out = append(out, fmt.Sprintf("mesh %s/%d via WireGuard CIDR", strings.ToUpper(l.Protocol), l.Port))
 		} else {
 			out = append(out, fmt.Sprintf("public %s/%d", strings.ToUpper(l.Protocol), l.Port))
@@ -477,14 +482,26 @@ func (s *Server) requireSelfDNSDeploymentForApproval(approval model.Approval) er
 // candidate is not what NetGuard would compile for the node now. On an
 // adopted node the DNS plan carries a NetGuard compile, and applying it after
 // a binding, security group, zone or another listener changed would roll the
-// node's firewall back to the intent the plan saw. The same check refuses a
-// plan composed from the legacy baseline before the node was adopted, which
-// would drop every bound group. A node NetGuard does not manage keeps the
-// legacy behaviour.
+// node's firewall back to the intent the plan saw. A plan composed from the
+// legacy baseline before the node was adopted would drop every bound group,
+// and a NetGuard-composed plan on a node no longer adopted would install
+// rules nobody owns, so both are refused too. A node NetGuard does not manage
+// keeps the legacy behaviour for a legacy plan.
 func (s *Server) requireCurrentSelfDNSFirewall(approval model.Approval) error {
+	firewall, err := selfdns.ParsePlanFirewall(approval.Plan)
+	if err != nil {
+		return fmt.Errorf("selfdns plan is no longer applyable: %w", err)
+	}
 	binding, ok := s.store.NodeGuardBinding(approval.NodeID)
-	if !ok || !binding.Managed {
+	managed := ok && binding.Managed
+	if !managed {
+		if firewall.Source == selfdns.FirewallSourceNetGuard {
+			return errors.New("this DNS plan was composed through NetGuard and the node is no longer adopted; re-plan before approving")
+		}
 		return nil
+	}
+	if firewall.Source != selfdns.FirewallSourceNetGuard {
+		return errors.New("the node was adopted by NetGuard after this DNS plan was made; re-plan so the plan keeps its security groups")
 	}
 	deploymentID, err := selfDNSApprovalDeploymentID(approval.Action)
 	if err != nil {
@@ -515,6 +532,13 @@ func (s *Server) requireCurrentSelfDNSFirewall(approval model.Approval) error {
 		return errors.New("the node's NetGuard intent changed since this DNS plan was made; re-plan before approving")
 	}
 	return nil
+}
+
+// selfDNSPlanUsesNetGuard reports whether a DNS approval's firewall was
+// composed through NetGuard, which holds deciding it to netguard:admin.
+func selfDNSPlanUsesNetGuard(approval model.Approval) bool {
+	firewall, err := selfdns.ParsePlanFirewall(approval.Plan)
+	return err == nil && firewall.Source == selfdns.FirewallSourceNetGuard
 }
 
 func (s *Server) markSelfDNSApplying(approval model.Approval) error {

@@ -8928,6 +8928,12 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		}
 	}
 	if approval.Plugin == "selfdns" {
+		// A DNS plan composed through NetGuard applies the node's whole
+		// NetGuard intent, so deciding it takes netguard:admin, as deciding a
+		// NetGuard plan or a beacon plan with NetGuard rules does.
+		if selfDNSPlanUsesNetGuard(approval) && !rbac.Allows(p.Principal, "netguard:admin", approval.NodeID) {
+			return approval, &approvalDecisionError{status: http.StatusForbidden, err: apiError(model.APIErrorCapabilityDenied, "deciding a DNS plan composed through NetGuard needs netguard:admin on the node")}
+		}
 		if err := s.requireCurrentSelfDNSFirewall(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}

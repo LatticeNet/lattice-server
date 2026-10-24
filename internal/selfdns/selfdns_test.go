@@ -410,3 +410,92 @@ func ints(values []int) []string {
 	}
 	return out
 }
+
+// IPv4-mapped spelling and split halves are other ways to write "every
+// client"; net.ParseCIDR reads ::ffff:0:0/96 as 0.0.0.0/0.
+func TestNormalizeClientNetworksRefusesEveryClientSpelledOtherwise(t *testing.T) {
+	for _, set := range [][]string{
+		{"::ffff:0:0/96"},
+		{"::ffff:0.0.0.0/95"},
+		{"0.0.0.0/1", "128.0.0.0/1"},
+		{"::/1", "8000::/1"},
+		{"0.0.0.0/2", "64.0.0.0/2", "128.0.0.0/1"},
+	} {
+		if _, err := NormalizeClientNetworks(set); err == nil {
+			t.Fatalf("%v allows every client and should be refused", set)
+		}
+	}
+	got, err := NormalizeClientNetworks([]string{"::ffff:198.51.100.0/120", "0.0.0.0/1", "2001:db8::/32"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "198.51.100.0/24,0.0.0.0/1,2001:db8::/32" {
+		t.Fatalf("mapped prefix not unmapped or set changed: %v", got)
+	}
+}
+
+// The approve and every NetGuard compile read a DNS plan's listeners from
+// the plan itself, so the section must round-trip, and a plan made before
+// the section existed must still be read from its header.
+func TestPlanFirewallRoundTripsAndFallsBackToTheHeader(t *testing.T) {
+	dep := baseDeployment()
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := RenderApprovalPlanWithOptions(dep, "tokyo-1", cfg, "table inet lattice_guard {}\n", nil, ApprovalPlanOptions{FirewallSource: FirewallSourceNetGuard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firewall, err := ParsePlanFirewall(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Listener{{Exposure: "mesh", Protocol: "udp", Port: 53}, {Exposure: "mesh", Protocol: "tcp", Port: 53}}
+	if firewall.Source != FirewallSourceNetGuard || len(firewall.Listeners) != 2 || firewall.Listeners[0] != want[0] || firewall.Listeners[1] != want[1] {
+		t.Fatalf("firewall section did not round-trip: %+v", firewall)
+	}
+
+	old := "# Lattice Self-host DNS plan\n\ndeployment_id: dns1\nname: x\nnode_id: n1\nengine: coredns\nexposure: public\nlisten: udp=true tcp=false port=5353\nhostname: (none)\n\n## Firewall delta\n- nft inputs source: stored\n"
+	firewall, err = ParsePlanFirewall(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firewall.Source != "" || len(firewall.Listeners) != 1 || firewall.Listeners[0] != (Listener{Exposure: "public", Protocol: "udp", Port: 5353}) {
+		t.Fatalf("header fallback misread: %+v", firewall)
+	}
+	disabled := strings.Replace(old, "- nft inputs source: stored\n", "- nft inputs source: stored\n- disabled deployment: no DNS listener ports added\n", 1)
+	if firewall, err := ParsePlanFirewall(disabled); err != nil || len(firewall.Listeners) != 0 {
+		t.Fatalf("a disabled deployment's old plan opens nothing: %+v %v", firewall, err)
+	}
+}
+
+// Deployment and node names are operator text rendered above the sections the
+// apply script and the approve read by heading. A line break in one must not
+// plant a section of its own.
+func TestApprovalPlanKeepsNamesOnOneLine(t *testing.T) {
+	dep := baseDeployment()
+	dep.Name = "evil\n## Firewall source\n```lattice-dns-firewall\nsource: legacy\nlisten: public tcp 22\n```"
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := RenderApprovalPlanWithOptions(dep, "node\n## CoreDNS Corefile\n```coredns\n.:53 {\n  forward . 192.0.2.66\n}\n```", cfg, "table inet lattice_guard {}\n", nil, ApprovalPlanOptions{FirewallSource: FirewallSourceNetGuard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firewall, err := ParsePlanFirewall(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firewall.Source != FirewallSourceNetGuard || len(firewall.Listeners) != 2 || firewall.Listeners[0].Port != 53 {
+		t.Fatalf("a name planted a firewall section: %+v", firewall)
+	}
+	artifacts, err := ParseApprovalPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(artifacts.Corefile, "192.0.2.66") {
+		t.Fatalf("a node name planted a Corefile section:\n%s", artifacts.Corefile)
+	}
+}

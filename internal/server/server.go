@@ -2425,7 +2425,7 @@ func (s *Server) startSessionAudited(w http.ResponseWriter, r *http.Request, use
 	if err := s.store.PutSession(session); err != nil {
 		return auth.Session{}, err
 	}
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS; behind a TLS proxy it follows -secure-cookies
 		Name:     "lattice_session",
 		Value:    session.ID,
 		Path:     "/",
@@ -2789,7 +2789,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, p principa
 		}
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "logout", Decision: "allow"})
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS; behind a TLS proxy it follows -secure-cookies
 		Name:     "lattice_session",
 		Value:    "",
 		Path:     "/",
@@ -10546,8 +10546,9 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		// scripts and styles and break every plugin UI. The isolation those
 		// frames need already comes from the sandbox.
 		//
-		// HSTS is only meaningful (and only safe) over HTTPS, which we proxy
-		// for via secure cookies being enabled.
+		// HSTS is only meaningful (and only safe) over HTTPS, which the
+		// operator asserts with -secure-cookies. Direct TLS alone does not turn
+		// it on: a year of HSTS would lock browsers out of a self-signed console.
 		if s.secureCookies {
 			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}

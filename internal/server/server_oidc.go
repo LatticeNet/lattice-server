@@ -112,7 +112,7 @@ func (s *Server) cookieSecure(r *http.Request) bool {
 }
 
 func (s *Server) setOIDCBindingCookie(w http.ResponseWriter, r *http.Request, token string) {
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS; behind a TLS proxy it follows -secure-cookies
 		Name:     oidcBindingCookie,
 		Value:    token,
 		Path:     "/api/auth/oidc",
@@ -124,7 +124,7 @@ func (s *Server) setOIDCBindingCookie(w http.ResponseWriter, r *http.Request, to
 }
 
 func (s *Server) clearOIDCBindingCookie(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS; behind a TLS proxy it follows -secure-cookies
 		Name:     oidcBindingCookie,
 		Value:    "",
 		Path:     "/api/auth/oidc",
@@ -173,7 +173,7 @@ func (s *Server) ssoChallengeFromCookie(r *http.Request) (auth.TOTPChallenge, bo
 }
 
 func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, r *http.Request, value string) {
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS; behind a TLS proxy it follows -secure-cookies
 		Name:     totpChallengeCookie,
 		Value:    value,
 		Path:     "/api/login/totp",
@@ -185,7 +185,7 @@ func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) clearTOTPChallengeCookie(w http.ResponseWriter, r *http.Request) {
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS; behind a TLS proxy it follows -secure-cookies
 		Name:     totpChallengeCookie,
 		Value:    "",
 		Path:     "/api/login/totp",

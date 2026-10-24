@@ -13,6 +13,7 @@ import (
 
 	"github.com/LatticeNet/lattice-sdk/beacon"
 	"github.com/LatticeNet/lattice-sdk/model"
+	"github.com/LatticeNet/lattice-server/internal/groups"
 	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
@@ -338,9 +339,10 @@ func rotateBeaconEpoch(t *store.BeaconTarget, now time.Time) {
 }
 
 // beaconCurrentSources are the sources that use target's beacon now: the
-// path set's candidates for it and every source of an enabled operator
-// beacon check naming it, less nodes that are gone, disabled, or whose agent
-// does not run the beacon client.
+// path set's candidates for it, the sources of every enabled auto check
+// definition whose target set holds it, and every source of an enabled
+// operator beacon check naming it, less nodes that are gone, disabled, or
+// whose agent does not run the beacon client.
 func (s *Server) beaconCurrentSources(target string, planned latencyPlan, monitors []model.Monitor, nodes map[string]model.Node) map[string]bool {
 	out := map[string]bool{}
 	add := func(sourceID string) {
@@ -351,6 +353,9 @@ func (s *Server) beaconCurrentSources(target string, planned latencyPlan, monito
 		out[sourceID] = true
 	}
 	for _, sourceID := range planned.beaconCandidates[target] {
+		add(sourceID)
+	}
+	for _, sourceID := range s.checkBeaconCandidates(target, nodes) {
 		add(sourceID)
 	}
 	targets := monitorTargets{nodes: nodes}
@@ -701,4 +706,38 @@ func randomBeaconPort() (int, error) {
 			return beacon.PortRandomMin + v%span, nil
 		}
 	}
+}
+
+// checkBeaconCandidates are the sources of every enabled auto check
+// definition that measures target, less its excluded pairs: an auto pair
+// takes the beacon only once the target's applied plan approves its source,
+// so a node.beacon plan for the target approves them, as it did the path
+// set's auto sources (design 29 D12, design 32 R1).
+func (s *Server) checkBeaconCandidates(target string, nodes map[string]model.Node) []string {
+	var defs []model.CheckDefinition
+	for _, def := range s.store.CheckDefinitions() {
+		if def.Enabled && def.Type == model.CheckMethodAuto {
+			defs = append(defs, def)
+		}
+	}
+	if len(defs) == 0 {
+		return nil
+	}
+	list := make([]model.Node, 0, len(nodes))
+	for _, n := range nodes {
+		list = append(list, n)
+	}
+	groupList := s.store.Groups()
+	var out []string
+	for _, def := range defs {
+		if !slices.Contains(groups.ResolveTargets(def.Targets, list, groupList), target) {
+			continue
+		}
+		for _, sourceID := range groups.ResolveTargets(def.Sources, list, groupList) {
+			if sourceID != target && !slices.Contains(def.ExcludedPairs, model.LatencyPair{Source: sourceID, Target: target}) {
+				out = append(out, sourceID)
+			}
+		}
+	}
+	return out
 }

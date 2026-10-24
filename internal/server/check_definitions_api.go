@@ -144,24 +144,27 @@ func (s *Server) narrowDefinitionMonitorViews(p principal, monitors []model.Moni
 func (s *Server) checkDefinitionView(p principal, def model.CheckDefinition, plan checkDefinitionPlan, monitors []model.Monitor, runs map[string]int, withMonitors bool) model.CheckDefinitionView {
 	view := model.CheckDefinitionView{CheckDefinition: def}
 	view.Headers = redactMonitorHeaders(def.Headers)
-	inSet := map[string]bool{}
+	// measuring are the monitors that measure now; a monitor of a target
+	// still in the set that is not one of them holds an auto definition's
+	// earlier method, which is the pair's history, not a paused target.
+	measuring := map[string]bool{}
 	for _, e := range plan.entries {
-		inSet[e.monitorID] = true
+		measuring[e.monitorID] = true
 	}
+	inSet := plan.targetKeys()
 	owner := store.CheckDefinitionOwner(def.ID)
 	restricted := principalHasNodeRestriction(p)
 	for _, mon := range monitors {
-		if mon.ManagedBy != owner || (restricted && !checkMonitorReadable(p, mon)) {
+		if store.MonitorOwnerKey(mon) != owner || (restricted && !checkMonitorReadable(p, mon)) {
 			continue
 		}
 		view.Summary.Monitors++
-		if inSet[mon.ID] {
-			if mon.Type == model.MonitorTypeTLS {
-				view.Summary.Paths++
-			} else {
-				view.Summary.Paths += len(mon.NodeIDs)
-			}
-		} else {
+		switch {
+		case measuring[mon.ID] && mon.Type == model.MonitorTypeTLS:
+			view.Summary.Paths++
+		case measuring[mon.ID]:
+			view.Summary.Paths += len(mon.NodeIDs)
+		case !inSet[checkMonitorKey(mon)]:
 			view.Summary.PausedTargets++
 			view.Summary.PausedRuns += runs[mon.ID]
 		}
@@ -172,7 +175,7 @@ func (s *Server) checkDefinitionView(p principal, def model.CheckDefinition, pla
 			}
 			view.Monitors = append(view.Monitors, model.CheckDefinitionMonitor{
 				MonitorID: mon.ID, Method: mon.Type, Target: mon.Target, TargetNode: mon.TargetNode,
-				InSet: inSet[mon.ID], Enabled: mon.Enabled, Sources: sources, Runs: runs[mon.ID],
+				InSet: inSet[checkMonitorKey(mon)], Enabled: mon.Enabled, Sources: sources, Runs: runs[mon.ID],
 			})
 		}
 	}
@@ -314,13 +317,10 @@ func checkPlanBounds(plan checkDefinitionPlan) error {
 	if n := checkPairCount(plan); n > model.CheckDefinitionPairsMax {
 		return fmt.Errorf("the check would measure %d paths, at most %d: narrow its sources or targets", n, model.CheckDefinitionPairsMax)
 	}
-	inSet := map[string]bool{}
-	for _, e := range plan.entries {
-		inSet[e.monitorID] = true
-	}
+	inSet := plan.targetKeys()
 	paused := 0
 	for _, mon := range plan.desired {
-		if !inSet[mon.ID] {
+		if !inSet[checkMonitorKey(mon)] {
 			paused++
 		}
 	}
@@ -330,8 +330,9 @@ func checkPlanBounds(plan checkDefinitionPlan) error {
 	return nil
 }
 
-// checkPairCount is how many paths a plan measures: its sources times its
-// targets, less a node probing itself, and one per tls target.
+// checkPairCount is how many paths a plan measures: each entry's sources
+// (the definition's sources less a node probing itself and the excluded
+// pairs, split by method for auto), and one per tls target.
 func checkPairCount(plan checkDefinitionPlan) int {
 	n := 0
 	for _, e := range plan.entries {
@@ -339,11 +340,7 @@ func checkPairCount(plan checkDefinitionPlan) int {
 			n++
 			continue
 		}
-		for _, sourceID := range plan.sources {
-			if sourceID != e.targetNode {
-				n++
-			}
-		}
+		n += len(e.sources)
 	}
 	return n
 }
@@ -558,15 +555,12 @@ func (s *Server) handleCheckDefinitionForget(w http.ResponseWriter, r *http.Requ
 	c := s.checkPlanContextAt(s.now())
 	inSet := map[string]bool{}
 	for _, plan := range c.planAll(s.store.CheckDefinitions(), nil) {
-		if plan.def.ID != def.ID {
-			continue
-		}
-		for _, e := range plan.entries {
-			inSet[e.monitorID] = true
+		if plan.def.ID == def.ID {
+			inSet = plan.targetKeys()
 		}
 	}
 	for _, monitorID := range req.MonitorIDs {
-		if inSet[monitorID] {
+		if mon, ok := s.store.Monitor(monitorID); ok && inSet[checkMonitorKey(mon)] {
 			writeError(w, http.StatusConflict, errors.New("monitor "+monitorID+" measures a target still in the set; only paused targets can be forgotten"))
 			return
 		}

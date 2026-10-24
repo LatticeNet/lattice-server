@@ -102,11 +102,17 @@ func checkSelectorEmpty(sel model.TargetSelector) bool {
 // checkKindTakesNodes and checkKindTakesAddresses say which targets a
 // method takes.
 func checkKindTakesNodes(kind string) bool {
-	return kind == model.MonitorTypeTCP || kind == model.MonitorTypeICMP || kind == model.MonitorTypeBeacon
+	return kind == model.MonitorTypeTCP || kind == model.MonitorTypeICMP || kind == model.MonitorTypeBeacon || kind == model.CheckMethodAuto
 }
 
 func checkKindTakesAddresses(kind string) bool {
-	return kind != model.MonitorTypeBeacon
+	return kind != model.MonitorTypeBeacon && kind != model.CheckMethodAuto
+}
+
+// checkKindSendsPackets reports whether a definition's packets apply: an
+// auto definition's icmp and beacon pairs send them.
+func checkKindSendsPackets(kind string) bool {
+	return model.MonitorKindSendsPackets(kind) || kind == model.CheckMethodAuto
 }
 
 // normalizeCheckSelector cleans a selector: ids trimmed, repeats dropped,
@@ -235,15 +241,22 @@ func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinition
 	}
 	out.Type = strings.TrimSpace(spec.Type)
 	switch out.Type {
-	case model.MonitorTypeTCP, model.MonitorTypeICMP, model.MonitorTypeBeacon, model.MonitorTypeHTTP, model.MonitorTypeTLS:
+	case model.MonitorTypeTCP, model.MonitorTypeICMP, model.MonitorTypeBeacon, model.MonitorTypeHTTP, model.MonitorTypeTLS, model.CheckMethodAuto:
 	default:
-		return out, checkFieldf("type", "type must be tcp, icmp, beacon, http or tls")
+		return out, checkFieldf("type", "type must be tcp, icmp, beacon, http, tls or auto")
 	}
-	if failure := checkDefinitionScope(p, out.Type, spec.Sources, spec.Targets); failure != nil {
+	if failure := checkDefinitionScope(p, out.Type, spec.Sources, spec.Targets, spec.ExcludedPairs); failure != nil {
 		return out, failure
 	}
 	if failure := s.normalizeCheckTargets(&out, spec, prior); failure != nil {
 		return out, failure
+	}
+	if failure := s.normalizeExcludedPairs(&out, spec.ExcludedPairs, prior); failure != nil {
+		return out, failure
+	}
+	if prior != nil {
+		// Written once by the migration, never by a save.
+		out.Adopted = slices.Clone(prior.Adopted)
 	}
 	if failure := normalizeCheckTiming(&out, spec); failure != nil {
 		return out, failure
@@ -273,7 +286,7 @@ func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinition
 // restricted principal's targets grow to nodes it cannot read, as the path
 // set refuses for the same reason. A restricted principal may name explicit
 // nodes: sources it administers, targets and exclusions it can read.
-func checkDefinitionScope(p principal, kind string, sources, targets model.TargetSelector) *checkDefinitionError {
+func checkDefinitionScope(p principal, kind string, sources, targets model.TargetSelector, excludedPairs []model.LatencyPair) *checkDefinitionError {
 	restricted := principalHasNodeRestriction(p)
 	if restricted && checkSelectorBroad(sources) {
 		return checkForbidden("sources", "a group or whole-fleet selector needs a token with no node allowlist; name the nodes instead")
@@ -297,6 +310,11 @@ func checkDefinitionScope(p principal, kind string, sources, targets model.Targe
 			if !latencyNodeVisible(p, nodeID) {
 				return checkForbidden(rawIndexPath(list.path, list.ids, nodeID), "forbidden: the check names a node this token may not read")
 			}
+		}
+	}
+	for i, pair := range excludedPairs {
+		if !latencyNodeVisible(p, strings.TrimSpace(pair.Source)) || !latencyNodeVisible(p, strings.TrimSpace(pair.Target)) {
+			return checkForbidden(fieldIndex("excluded_pairs", i), "forbidden: the check names a node this token may not read")
 		}
 	}
 	return nil
@@ -351,11 +369,76 @@ func (s *Server) normalizeCheckTargets(out *model.CheckDefinition, spec model.Ch
 	case !checkKindTakesNodes(out.Type) && (!checkSelectorEmpty(out.Targets) || len(out.Targets.Exclude) > 0):
 		return checkFieldf("targets", "a %s check takes addresses, not target nodes", out.Type)
 	case !checkKindTakesAddresses(out.Type) && len(out.Addresses) > 0:
-		return checkFieldf("addresses", "a beacon check names target nodes; it never takes an address")
+		return checkFieldf("addresses", "a %s check names target nodes; it never takes an address", out.Type)
 	case checkSelectorEmpty(out.Targets) && len(out.Addresses) == 0:
 		return checkFieldf("targets", "the check has no target: name target nodes or addresses")
 	}
 	return nil
+}
+
+// normalizeExcludedPairs cleans the excluded pairs: trimmed, without
+// repeats, sorted and bounded, each naming two different nodes that exist
+// (or that the stored definition already excluded, so a node removed since
+// stays editable). A pair whose source is not one of the definition's
+// sources says nothing, so it is refused rather than kept.
+func (s *Server) normalizeExcludedPairs(out *model.CheckDefinition, pairs []model.LatencyPair, prior *model.CheckDefinition) *checkDefinitionError {
+	if len(pairs) == 0 {
+		return nil
+	}
+	if !checkKindTakesNodes(out.Type) {
+		return checkFieldf("excluded_pairs", "a %s check has no node pairs to exclude", out.Type)
+	}
+	nodes := map[string]bool{}
+	for _, n := range s.store.Nodes() {
+		nodes[n.ID] = true
+	}
+	known := func(pair model.LatencyPair) bool {
+		if nodes[pair.Source] && nodes[pair.Target] {
+			return true
+		}
+		return prior != nil && slices.Contains(prior.ExcludedPairs, pair)
+	}
+	sourceSet := map[string]bool{}
+	for _, nodeID := range out.Sources.Nodes {
+		sourceSet[nodeID] = true
+	}
+	broad := checkSelectorBroad(out.Sources)
+	seen := map[string]bool{}
+	for i, raw := range pairs {
+		pair := model.LatencyPair{Source: strings.TrimSpace(raw.Source), Target: strings.TrimSpace(raw.Target)}
+		field := fieldIndex("excluded_pairs", i)
+		switch {
+		case pair.Source == "" || pair.Target == "":
+			return checkFieldf(field, "an excluded pair names a source and a target node")
+		case pair.Source == pair.Target:
+			return checkFieldf(field, "an excluded pair names two different nodes")
+		case !known(pair):
+			return checkFieldf(field, "excluded pair %s to %s names a node that does not exist", pair.Source, pair.Target)
+		case !broad && !sourceSet[pair.Source]:
+			return checkFieldf(field, "excluded pair %s to %s names a node that is not a source of this check", pair.Source, pair.Target)
+		}
+		key := latencyPairKey(pair.Source, pair.Target)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out.ExcludedPairs = append(out.ExcludedPairs, pair)
+	}
+	if len(out.ExcludedPairs) > model.CheckDefinitionExcludedPairsMax {
+		return checkFieldf("excluded_pairs", "excluded_pairs holds %d entries, at most %d", len(out.ExcludedPairs), model.CheckDefinitionExcludedPairsMax)
+	}
+	sortLatencyPairs(out.ExcludedPairs)
+	return nil
+}
+
+// sortLatencyPairs orders pairs by source, then target.
+func sortLatencyPairs(pairs []model.LatencyPair) {
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Source != pairs[j].Source {
+			return pairs[i].Source < pairs[j].Source
+		}
+		return pairs[i].Target < pairs[j].Target
+	})
 }
 
 // normalizeCheckTiming fills and checks the interval, the timeout, the
@@ -378,7 +461,7 @@ func normalizeCheckTiming(out *model.CheckDefinition, spec model.CheckDefinition
 	if err := validMonitorTiming(out.IntervalSec, out.TimeoutSec); err != nil {
 		return checkFieldRefusal("interval_sec", err)
 	}
-	if model.MonitorKindSendsPackets(out.Type) {
+	if checkKindSendsPackets(out.Type) {
 		out.Packets = spec.Packets
 		if out.Packets == 0 {
 			out.Packets = model.MonitorPacketsDefault
@@ -386,7 +469,12 @@ func normalizeCheckTiming(out *model.CheckDefinition, spec model.CheckDefinition
 		if out.Packets < 1 || out.Packets > model.MonitorPacketsMax {
 			return checkFieldf("packets", "packets must be 1 to %d", model.MonitorPacketsMax)
 		}
-		if err := validMonitorRun(model.Monitor{Type: out.Type, IntervalSec: out.IntervalSec, TimeoutSec: out.TimeoutSec, Packets: out.Packets}); err != nil {
+		kind := out.Type
+		if kind == model.CheckMethodAuto {
+			// Judged as the longest run its pairs can make, an icmp one.
+			kind = model.MonitorTypeICMP
+		}
+		if err := validMonitorRun(model.Monitor{Type: kind, IntervalSec: out.IntervalSec, TimeoutSec: out.TimeoutSec, Packets: out.Packets}); err != nil {
 			return checkFieldRefusal("interval_sec", err)
 		}
 	} else if spec.Packets != 0 {
@@ -517,6 +605,11 @@ type checkPlanContext struct {
 	// load is the packets a second each (source, address) already sends,
 	// starting from every check a definition did not expand.
 	load map[monitorPacketKey]float64
+	// facts is what a target offers every source for an auto definition's
+	// choice, the path set planner's facts (latencyTargetFactsOf), and
+	// icmpFiltered whether a pair's icmp check reads icmp_filtered now.
+	facts        func(n model.Node) latencyTargetFacts
+	icmpFiltered func(monitorID, sourceID string) bool
 }
 
 func (s *Server) checkPlanContextAt(now time.Time) *checkPlanContext {
@@ -525,21 +618,30 @@ func (s *Server) checkPlanContextAt(now time.Time) *checkPlanContext {
 	for _, n := range nodes {
 		byID[n.ID] = n
 	}
+	endpoints := s.pathPlanned(now).endpoints
+	beacons := s.store.BeaconTargets()
 	c := &checkPlanContext{
 		now:      now,
 		nodes:    nodes,
 		byID:     byID,
 		groups:   s.store.Groups(),
-		targets:  monitorTargets{nodes: byID, endpoints: s.pathPlanned(now).endpoints, beacons: s.store.BeaconTargets()},
+		targets:  monitorTargets{nodes: byID, endpoints: endpoints, beacons: beacons},
 		existing: map[string]map[string]model.Monitor{},
+		facts: func(n model.Node) latencyTargetFacts {
+			return s.latencyTargetFactsOf(n, endpoints, beacons)
+		},
+		icmpFiltered: func(monitorID, sourceID string) bool {
+			return s.latencyICMPFiltered(monitorID, sourceID, now)
+		},
 	}
 	var others []model.Monitor
 	for _, mon := range s.store.Monitors() {
 		if store.MonitorOwnerOf(mon) == store.MonitorOwnerDefinition {
-			if c.existing[mon.ManagedBy] == nil {
-				c.existing[mon.ManagedBy] = map[string]model.Monitor{}
+			owner := store.MonitorOwnerKey(mon)
+			if c.existing[owner] == nil {
+				c.existing[owner] = map[string]model.Monitor{}
 			}
-			c.existing[mon.ManagedBy][mon.ID] = mon
+			c.existing[owner][mon.ID] = mon
 			continue
 		}
 		others = append(others, mon)
@@ -561,11 +663,19 @@ type checkDefinitionPlan struct {
 	notes   map[string]string
 }
 
-// checkPlanEntry is one target in a definition's set.
+// checkPlanEntry is one target in a definition's set, with one method: an
+// auto definition's target has an entry for each method its sources use.
 type checkPlanEntry struct {
 	key        string
 	targetNode string
-	monitorID  string
+	kind       string
+	// sources are the definition's sources that measure this target with
+	// kind now.
+	sources   []string
+	monitorID string
+	// adopted says monitorID is one the definition adopted from the path
+	// set (CheckDefinition.Adopted).
+	adopted bool
 	// target is what the method dials now, empty when nothing can be.
 	target string
 	// desired is the index of its monitor in the plan's desired list, -1
@@ -576,6 +686,25 @@ type checkPlanEntry struct {
 	reason, note string
 	// budget are the sources the packet budget pauses.
 	budget map[string]bool
+}
+
+// targetKeys are the targets in the set, by the key an entry and a
+// monitor share (checkMonitorKey).
+func (p *checkDefinitionPlan) targetKeys() map[string]bool {
+	out := make(map[string]bool, len(p.entries))
+	for _, e := range p.entries {
+		out[e.key] = true
+	}
+	return out
+}
+
+// checkMonitorKey is the target a definition monitor measures, as its plan
+// entry names it: the target node, else the address.
+func checkMonitorKey(mon model.Monitor) string {
+	if mon.TargetNode != "" {
+		return mon.TargetNode
+	}
+	return mon.Target
 }
 
 // monitorOf is an entry's desired monitor, nil when none is created.
@@ -718,34 +847,55 @@ func (c *checkPlanContext) plan(def model.CheckDefinition) checkDefinitionPlan {
 	if !tls {
 		out.sources = usable(def.Sources)
 	}
+	excluded := make(map[string]bool, len(def.ExcludedPairs))
+	for _, pair := range def.ExcludedPairs {
+		excluded[latencyPairKey(pair.Source, pair.Target)] = true
+	}
+	adopted := make(map[string]string, len(def.Adopted))
+	for _, a := range def.Adopted {
+		adopted[a.Method+"\x00"+a.TargetNode] = a.MonitorID
+	}
+	// idOf is the monitor of a (method, target): the adopted one for
+	// exactly the adopted keys, else the hashed one.
+	idOf := func(kind, key string) (string, bool) {
+		if monitorID, ok := adopted[kind+"\x00"+key]; ok {
+			return monitorID, true
+		}
+		return checkDefinitionMonitorID(def.ID, kind, key), false
+	}
 	for _, nodeID := range usable(def.Targets) {
-		out.entries = append(out.entries, checkPlanEntry{key: nodeID, targetNode: nodeID})
+		var sources []string
+		for _, sourceID := range out.sources {
+			if sourceID != nodeID && !excluded[latencyPairKey(sourceID, nodeID)] {
+				sources = append(sources, sourceID)
+			}
+		}
+		if def.Type != model.CheckMethodAuto {
+			out.entries = append(out.entries, checkPlanEntry{key: nodeID, targetNode: nodeID, kind: def.Type, sources: sources})
+			continue
+		}
+		out.entries = append(out.entries, c.autoEntries(nodeID, sources, existing, idOf)...)
 	}
 	for _, addr := range def.Addresses {
-		out.entries = append(out.entries, checkPlanEntry{key: addr})
+		out.entries = append(out.entries, checkPlanEntry{key: addr, kind: def.Type, sources: slices.Clone(out.sources)})
 	}
 
 	inSet := map[string]bool{}
 	for i := range out.entries {
 		e := &out.entries[i]
 		e.desired = -1
-		e.monitorID = checkDefinitionMonitorID(def.ID, def.Type, e.key)
+		e.monitorID, e.adopted = idOf(e.kind, e.key)
 		inSet[e.monitorID] = true
 		prior, had := existing[e.monitorID]
-		var sources []string
-		for _, sourceID := range out.sources {
-			if sourceID != e.targetNode {
-				sources = append(sources, sourceID)
-			}
-		}
+		sources := e.sources
 		target := e.key
 		if e.targetNode != "" {
 			target = ""
-			resolved, why := c.targets.resolve(def.Type, e.targetNode, prior.Target)
+			resolved, why := c.targets.resolve(e.kind, e.targetNode, prior.Target)
 			switch {
 			case why == "":
 				target = resolved
-			case def.Type == model.MonitorTypeBeacon:
+			case e.kind == model.MonitorTypeBeacon:
 				e.reason, e.note = model.PathReasonBeaconNotEnabled, why
 			default:
 				e.reason, e.note = model.PathReasonNotProbeable, why
@@ -767,12 +917,11 @@ func (c *checkPlanContext) plan(def model.CheckDefinition) checkDefinitionPlan {
 		}
 		mon := model.Monitor{
 			ID:            e.monitorID,
-			Type:          def.Type,
+			Type:          e.kind,
 			Target:        target,
 			TargetNode:    e.targetNode,
 			IntervalSec:   def.IntervalSec,
 			TimeoutSec:    def.TimeoutSec,
-			Packets:       def.Packets,
 			ThresholdDays: def.ThresholdDays,
 			ExpectStatus:  def.ExpectStatus,
 			Headers:       slices.Clone(def.Headers),
@@ -783,10 +932,24 @@ func (c *checkPlanContext) plan(def model.CheckDefinition) checkDefinitionPlan {
 			Enabled:       def.Enabled && runs,
 			ManagedBy:     owner,
 		}
+		if model.MonitorKindSendsPackets(e.kind) {
+			mon.Packets = def.Packets
+			if mon.Packets == 0 {
+				mon.Packets = model.MonitorPacketsDefault
+			}
+		}
+		if e.adopted {
+			// It keeps the path set's mark, so the release before the
+			// migration re-owns it after a rollback (store.MigratePathSet).
+			mon.ManagedBy, mon.CheckDefinitionID = model.MonitorManagedLatency, def.ID
+		}
 		if e.targetNode != "" {
 			mon.Name = def.Name + " to " + c.checkNodeLabel(e.targetNode)
 		} else {
 			mon.Name = def.Name + " to " + e.key
+		}
+		if def.Type == model.CheckMethodAuto {
+			mon.Name += " (" + e.kind + ")"
 		}
 		if len(mon.Headers) == 0 {
 			mon.Headers = nil
@@ -829,6 +992,38 @@ func (c *checkPlanContext) plan(def model.CheckDefinition) checkDefinitionPlan {
 		}
 		paused.SecretsOrigin = ""
 		out.desired = append(out.desired, paused)
+	}
+	return out
+}
+
+// autoEntries are an auto definition's entries for one target node: one for
+// each method its sources use now, by the path set planner's choice
+// (latencyPairMethod over latencyTargetFacts), so a pair is measured the way
+// it was before the path set became a definition. A target nothing can
+// reach reads as a tcp entry nothing can dial, as the path set read it.
+func (c *checkPlanContext) autoEntries(nodeID string, sources []string, existing map[string]model.Monitor, idOf func(kind, key string) (string, bool)) []checkPlanEntry {
+	tcpID, _ := idOf(model.MonitorTypeTCP, nodeID)
+	_, why := c.targets.resolve(model.MonitorTypeTCP, nodeID, existing[tcpID].Target)
+	facts := c.facts(c.byID[nodeID])
+	icmpID, _ := idOf(model.MonitorTypeICMP, nodeID)
+	_, hadICMP := existing[icmpID]
+	byKind := map[string][]string{}
+	for _, sourceID := range sources {
+		caps := facts.caps(why == "", sourceID)
+		if facts.icmpOK && hadICMP {
+			caps.icmpFiltered = c.icmpFiltered(icmpID, sourceID)
+		}
+		kind, _ := latencyPairMethod(model.LatencyMethodAuto, c.byID[sourceID], caps)
+		byKind[kind] = append(byKind[kind], sourceID)
+	}
+	var out []checkPlanEntry
+	for _, kind := range []string{model.MonitorTypeTCP, model.MonitorTypeICMP, model.MonitorTypeBeacon} {
+		if len(byKind[kind]) > 0 {
+			out = append(out, checkPlanEntry{key: nodeID, targetNode: nodeID, kind: kind, sources: byKind[kind]})
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, checkPlanEntry{key: nodeID, targetNode: nodeID, kind: model.MonitorTypeTCP})
 	}
 	return out
 }

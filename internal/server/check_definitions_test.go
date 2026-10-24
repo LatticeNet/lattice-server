@@ -1143,7 +1143,10 @@ func TestCheckDefinitionBounds(t *testing.T) {
 	plan.desired = nil
 	for i := range 65 {
 		plan.sources = append(plan.sources, "src-"+strconv.Itoa(i))
-		plan.entries = append(plan.entries, checkPlanEntry{key: "t-" + strconv.Itoa(i), targetNode: "t-" + strconv.Itoa(i)})
+	}
+	for i := range 65 {
+		// Each target's entry holds the sources that measure it.
+		plan.entries = append(plan.entries, checkPlanEntry{key: "t-" + strconv.Itoa(i), targetNode: "t-" + strconv.Itoa(i), sources: plan.sources})
 	}
 	if err := checkPlanBounds(plan); err == nil || !strings.Contains(err.Error(), "paths") {
 		t.Fatalf("65 by 65 = %v, want the path bound", err)

@@ -23,7 +23,8 @@ const (
 	MonitorOwnerBeaconReach
 	// MonitorOwnerDefinition: the check was expanded from a check
 	// definition (MonitorManagedCheckPrefix plus the definition id, design
-	// 32 D1). Nothing writes one yet.
+	// 32 D1), or adopted by one from the path set (CheckDefinitionID set,
+	// ManagedBy still model.MonitorManagedLatency, design 32 R1).
 	MonitorOwnerDefinition
 	// MonitorOwnerUnknown: a generated check whose owner this server does
 	// not know, say one written by a newer server. It is treated as
@@ -35,8 +36,13 @@ const (
 // check definition: "check:<definition id>".
 const MonitorManagedCheckPrefix = "check:"
 
-// MonitorOwnerOf classifies mon by its ManagedBy.
+// MonitorOwnerOf classifies mon by its CheckDefinitionID, then its
+// ManagedBy: a path set monitor a definition adopted is the definition's,
+// though it keeps ManagedBy "latency" for the release before the migration.
 func MonitorOwnerOf(mon model.Monitor) MonitorOwner {
+	if mon.CheckDefinitionID != "" {
+		return MonitorOwnerDefinition
+	}
 	switch mon.ManagedBy {
 	case "":
 		return MonitorOwnerOperator
@@ -52,8 +58,11 @@ func MonitorOwnerOf(mon model.Monitor) MonitorOwner {
 }
 
 // MonitorDefinitionID is the id of the check definition mon was expanded
-// from, false when something else owns mon.
+// from or adopted by, false when something else owns mon.
 func MonitorDefinitionID(mon model.Monitor) (string, bool) {
+	if mon.CheckDefinitionID != "" {
+		return mon.CheckDefinitionID, true
+	}
 	id, ok := strings.CutPrefix(mon.ManagedBy, MonitorManagedCheckPrefix)
 	if !ok || id == "" {
 		return "", false
@@ -75,4 +84,16 @@ func (o MonitorOwner) Generated() bool {
 // and has a node target resolved when it is handed to an agent.
 func (o MonitorOwner) Authored() bool {
 	return o == MonitorOwnerOperator || o == MonitorOwnerDefinition
+}
+
+// MonitorOwnerKey is the owner a managed sync files mon under: its check
+// definition's owner (CheckDefinitionOwner) when it names one, else its
+// ManagedBy, empty for an operator's check. Every place that groups managed
+// monitors by owner asks this, so an adopted monitor, whose ManagedBy still
+// reads "latency", is synced, deleted and forgotten with its definition.
+func MonitorOwnerKey(mon model.Monitor) string {
+	if mon.CheckDefinitionID != "" {
+		return CheckDefinitionOwner(mon.CheckDefinitionID)
+	}
+	return mon.ManagedBy
 }

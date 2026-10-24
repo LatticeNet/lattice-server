@@ -648,6 +648,7 @@ func (s *Server) pairChecksFor(p principal, source, target string, now time.Time
 	}
 	byAddress := pathNodesByAddress(nodes)
 	byKey := map[string]int{}
+	definitions := map[string]bool{}
 	var authored []pairCheck
 	for _, mon := range s.store.Monitors() {
 		if !store.MonitorOwnerOf(mon).Authored() || mon.Type == model.MonitorTypeTLS {
@@ -666,6 +667,7 @@ func (s *Server) pairChecksFor(p principal, source, target string, now time.Time
 		key, name := mon.ID, mon.Name
 		if definitionID, ok := store.MonitorDefinitionID(mon); ok {
 			key = definitionID
+			definitions[key] = true
 			if def, found := s.store.CheckDefinition(definitionID); found {
 				name = def.Name
 			}
@@ -685,6 +687,7 @@ func (s *Server) pairChecksFor(p principal, source, target string, now time.Time
 			pc.interval = time.Duration(mon.IntervalSec) * time.Second
 		}
 	}
+	s.joinAdoptedHistory(p, authored, definitions, target)
 	for i := range authored {
 		sort.Slice(authored[i].checks, func(a, b int) bool { return authored[i].checks[a].monitorID < authored[i].checks[b].monitorID })
 	}
@@ -698,6 +701,48 @@ func (s *Server) pairChecksFor(p principal, source, target string, now time.Time
 		return authored[a].id < authored[b].id
 	})
 	return append(out, authored...)
+}
+
+// joinAdoptedHistory adds to each definition's check on a pair the monitors
+// an adoption map recorded for the same method and target: when two
+// definitions' sources shared one path set monitor, one definition adopted
+// it and the other measures its pairs on a monitor of its own, and the
+// adopted monitor's rows from the pair's source are that pair's history
+// (design 32 R1). The series reads rows per source, so only the pair's own
+// runs join. Only adoption records join, never a check of the operator's
+// own, which may dial another endpoint with the same method.
+func (s *Server) joinAdoptedHistory(p principal, checks []pairCheck, definitions map[string]bool, target string) {
+	var adopted []pathCheck
+	for _, def := range s.store.CheckDefinitions() {
+		for _, a := range def.Adopted {
+			if a.TargetNode != target {
+				continue
+			}
+			if mon, ok := s.store.Monitor(a.MonitorID); ok && monitorVisibleToPrincipal(p, "monitor:read", mon) {
+				adopted = append(adopted, pathCheck{monitorID: a.MonitorID, method: a.Method})
+			}
+		}
+	}
+	if len(adopted) == 0 {
+		return
+	}
+	for i := range checks {
+		pc := &checks[i]
+		if !definitions[pc.id] {
+			continue
+		}
+		methods, have := map[string]bool{}, map[string]bool{}
+		for _, c := range pc.checks {
+			methods[c.method] = true
+			have[c.monitorID] = true
+		}
+		for _, a := range adopted {
+			if methods[a.method] && !have[a.monitorID] {
+				have[a.monitorID] = true
+				pc.checks = append(pc.checks, a)
+			}
+		}
+	}
 }
 
 // pairCheckFor is the check named id on the pair, or the first when id is

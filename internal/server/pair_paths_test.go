@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/url"
+	"slices"
 	"testing"
 	"time"
 
@@ -166,5 +167,75 @@ func TestAutoDefinitionKeepsOnePathPerPairAcrossAMethodSwitch(t *testing.T) {
 	}
 	if code != http.StatusOK || series.Check != view.ID || heard != 2 {
 		t.Fatalf("the pair's series = %d check %q heard %d: %s", code, series.Check, heard, raw)
+	}
+}
+
+// When an auto source and a pinned source shared one path set monitor, one
+// definition adopts it and the other measures its pairs on a monitor of its
+// own. The pair's series still reads its history: from the pair's source,
+// the rows of any monitor an adoption map recorded for the same method and
+// target. A check of the operator's own on the pair never picks them up.
+func TestSplitPairReadsTheHistoryItsAdoptionRecorded(t *testing.T) {
+	srv, handler, st := meshFleet(t, t.TempDir())
+	old, _ := st.Node("node-bj")
+	old.ProbeMethods = []string{"tcp"}
+	upsertNodes(t, st, old)
+	cfg := meshConfig()
+	cfg.Method = model.LatencyMethodAuto
+	cfg.Sources = []string{"cd-hs-sh", "node-bj", "node-jp"}
+	cfg.SourceMethods = map[string]string{"node-jp": model.LatencyMethodTCP}
+	storePathSet(t, st, cfg)
+	if _, _, err := srv.syncLatencyProbes(meshT0); err != nil {
+		t.Fatal(err)
+	}
+	shared, ok := st.Monitor("mon_lat_node-hk")
+	if !ok || !slices.Contains(shared.NodeIDs, "node-bj") || !slices.Contains(shared.NodeIDs, "node-jp") {
+		t.Fatalf("the fixture needs both sources on one tcp monitor: %+v", shared)
+	}
+	for _, source := range []string{"node-bj", "node-jp"} {
+		for i := range 3 {
+			reportRun(t, st, shared.ID, source, meshT0.Add(-time.Duration(i+1)*time.Minute))
+		}
+	}
+	if _, err := srv.migratePathSet(meshT0); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newCheckClient(t, handler)
+	split := 0
+	for _, source := range []string{"node-bj", "node-jp"} {
+		cells := pairCells(t, srv, source, "node-hk")
+		if len(cells) != 1 || cells[0].Method != model.MonitorTypeTCP {
+			t.Fatalf("%s to node-hk after the migration = %+v", source, cells)
+		}
+		if cells[0].MonitorID != shared.ID {
+			split++
+		}
+		code, series, raw := pairSeries(t, c, source, "node-hk", cells[0].CheckDefinitionID)
+		heard := 0
+		for _, b := range series.Buckets {
+			heard += b.N
+		}
+		if code != http.StatusOK || heard != 3 {
+			t.Fatalf("%s to node-hk by %s heard %d runs, want its 3 from before the migration: %s", source, cells[0].CheckDefinitionID, heard, raw)
+		}
+	}
+	if split != 1 {
+		t.Fatalf("%d pairs moved to a new monitor; the fixture needs exactly one", split)
+	}
+
+	// An operator's own tcp check on a split pair reads its own runs only.
+	own := model.Monitor{ID: "mon_bj_hk_tcp", Name: "TCP to Hong Kong", Type: model.MonitorTypeTCP, Target: "203.0.113.14:443", TargetNode: "node-hk", NodeIDs: []string{"node-bj"}, IntervalSec: 60, TimeoutSec: 5, Enabled: true}
+	if err := st.UpsertMonitor(own); err != nil {
+		t.Fatal(err)
+	}
+	reportRun(t, st, own.ID, "node-bj", meshT0.Add(-30*time.Second))
+	code, series, raw := pairSeries(t, c, "node-bj", "node-hk", own.ID)
+	heard := 0
+	for _, b := range series.Buckets {
+		heard += b.N
+	}
+	if code != http.StatusOK || heard != 1 {
+		t.Fatalf("the operator's check heard %d runs, want its own 1: %s", heard, raw)
 	}
 }

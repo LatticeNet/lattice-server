@@ -816,6 +816,55 @@ func TestCheckDefinitionSweepIsBatchedAndAudited(t *testing.T) {
 
 // D1: Fleet mesh is listed beside the definitions, and its ids and history
 // do not change when definitions arrive.
+// A node target's address comes from the path set planner's endpoint choice
+// (design 32 D1), so it is as sticky as the path set's: a stale inventory
+// keeps the address it dialled, a better-ranked line does not move a working
+// monitor, and losing the chosen line does.
+func TestCheckDefinitionNodeTargetIsSticky(t *testing.T) {
+	srv, handler, st := checkFleet(t)
+	c := newCheckClient(t, handler)
+	view := c.create(model.CheckDefinitionSave{CheckDefinitionSpec: model.CheckDefinitionSpec{
+		Name: "tcp jp", Type: model.MonitorTypeTCP, IntervalSec: 60, TimeoutSec: 5, Enabled: true,
+		Sources: model.TargetSelector{Nodes: []string{"node-sh"}}, Targets: model.TargetSelector{Nodes: []string{"node-jp"}},
+	}})
+	clock := serverClock(t, srv)
+	target := func(step string) string {
+		t.Helper()
+		// Past the planner's cache, so each sweep plans the fleet as it is now.
+		clock.advance(pathPlanFresh + time.Second)
+		if _, err := srv.syncCheckDefinitions(srv.now(), "sweep"); err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+		mons := definitionMonitors(st, view.ID)
+		if len(mons) != 1 {
+			t.Fatalf("%s: monitors = %+v", step, mons)
+		}
+		return mons[0].Target
+	}
+	if got := target("first plan"); got != "203.0.113.3:443" {
+		t.Fatalf("first plan dials %q", got)
+	}
+	srv.removeSingBoxInventory("node-jp")
+	if got := target("stale inventory"); got != "203.0.113.3:443" {
+		t.Fatalf("a stale inventory moved the target to %q", got)
+	}
+	setLines := func(lines ...model.SingBoxNode) {
+		srv.singboxInvMu.Lock()
+		srv.singboxInv["node-jp"] = model.SingBoxInventory{NodeID: "node-jp", At: srv.now(), Status: "ok", Nodes: lines}
+		srv.singboxInvMu.Unlock()
+	}
+	trojan := model.SingBoxNode{Name: "aaa-trojan-80", Protocol: "trojan", Network: "trojan", Port: "80", ListenHost: "::", Address: "203.0.113.3"}
+	vless := model.SingBoxNode{Name: "vless-443", Protocol: "vless", Network: "reality", Port: "443", ListenHost: "::", Address: "203.0.113.3"}
+	setLines(trojan, vless)
+	if got := target("better-ranked line"); got != "203.0.113.3:443" {
+		t.Fatalf("a better-ranked line moved a working target to %q", got)
+	}
+	setLines(trojan)
+	if got := target("chosen line gone"); got != "203.0.113.3:80" {
+		t.Fatalf("the chosen line went away and the target is %q", got)
+	}
+}
+
 func TestFleetMeshListedAndUntouched(t *testing.T) {
 	srv, handler, st := checkFleet(t)
 	c := newCheckClient(t, handler)

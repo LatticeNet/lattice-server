@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"maps"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -206,12 +207,28 @@ func (s *Store) SyncManagedMonitors(managedBy string, desired []model.Monitor, n
 	return changes, nil
 }
 
-// managedMonitorEqual compares what an agent and the console act on; the
-// timestamps are bookkeeping.
+// managedMonitorEqual compares every field an agent, the console or the
+// alerting acts on, which is every field but the version and the
+// timestamps: those are bookkeeping. The comparison is of whole records, so
+// a field added to the model is compared without being named here.
 func managedMonitorEqual(a, b model.Monitor) bool {
-	return a.Name == b.Name && a.Type == b.Type && a.Target == b.Target &&
-		a.IntervalSec == b.IntervalSec && a.TimeoutSec == b.TimeoutSec &&
-		a.AssignAll == b.AssignAll && slices.Equal(a.NodeIDs, b.NodeIDs) &&
-		a.ThresholdDays == b.ThresholdDays && a.Enabled == b.Enabled &&
-		a.ManagedBy == b.ManagedBy && a.TargetNode == b.TargetNode && a.Packets == b.Packets
+	return reflect.DeepEqual(managedMonitorCompared(a), managedMonitorCompared(b))
+}
+
+// managedMonitorCompared is mon without its bookkeeping, and with an empty
+// list read as a missing one, as the stored copy reads once it has been
+// written and loaded again.
+func managedMonitorCompared(mon model.Monitor) model.Monitor {
+	mon.Version = 0
+	mon.CreatedAt, mon.UpdatedAt = time.Time{}, time.Time{}
+	if len(mon.NodeIDs) == 0 {
+		mon.NodeIDs = nil
+	}
+	if len(mon.PausedNodeIDs) == 0 {
+		mon.PausedNodeIDs = nil
+	}
+	if len(mon.Headers) == 0 {
+		mon.Headers = nil
+	}
+	return mon
 }

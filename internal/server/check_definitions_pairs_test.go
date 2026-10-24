@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
+
+	"github.com/LatticeNet/lattice-server/internal/rbac"
 )
 
 // Design 32 R1 and R3: an excluded pair is a pair both sets hold that the
@@ -99,6 +101,28 @@ func TestExcludedPairRefusals(t *testing.T) {
 	own := tcpMesh([]string{"node-sh"}, []string{"node-jp"})
 	own.ExcludedPairs = []model.LatencyPair{{Source: "node-sh", Target: "node-us"}}
 	refused(confined, own, http.StatusForbidden, "excluded_pairs[0]")
+}
+
+// Excluded pairs and the adoption name nodes as the selectors do: a token
+// confined to some nodes reads a definition only when every node named
+// there is one it reads too (a target that left a migrated definition stays
+// in its adoption).
+func TestDefinitionNamesNoNodeAConfinedReaderCannotRead(t *testing.T) {
+	p := principal{Principal: rbac.Principal{ActorID: "token", Scopes: []string{"monitor:read"}, ServerAllowlist: []string{"node-sh", "node-jp"}}}
+	def := model.CheckDefinition{CheckDefinitionSpec: model.CheckDefinitionSpec{
+		Type: model.MonitorTypeTCP, Sources: model.TargetSelector{Nodes: []string{"node-sh"}}, Targets: model.TargetSelector{Nodes: []string{"node-jp"}},
+	}}
+	if !checkDefinitionVisible(p, def) {
+		t.Fatal("a definition of the token's own nodes is hidden from it")
+	}
+	excluded, adopted := def, def
+	excluded.ExcludedPairs = []model.LatencyPair{{Source: "node-sh", Target: "node-us"}}
+	adopted.Adopted = []model.CheckAdoption{{Method: model.MonitorTypeTCP, TargetNode: "node-us", MonitorID: "mon_lat_node-us"}}
+	for name, d := range map[string]model.CheckDefinition{"an excluded pair": excluded, "an adoption": adopted} {
+		if checkDefinitionVisible(p, d) {
+			t.Fatalf("%s naming node-us leaves the definition readable to a token confined to node-sh and node-jp", name)
+		}
+	}
 }
 
 // Auto takes target nodes only, and the adoption the migration wrote is

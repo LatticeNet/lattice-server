@@ -31,7 +31,8 @@ import (
 // no node allowlist reads every definition; a restricted one reads only a
 // definition that names its nodes explicitly, every one of them a node it
 // may read, since a group or whole-fleet selector would tell it about nodes
-// outside its scope.
+// outside its scope. Excluded pairs and the adoption name nodes too, and a
+// target that left a migrated definition stays in its adoption.
 func checkDefinitionVisible(p principal, def model.CheckDefinition) bool {
 	if !principalHasNodeRestriction(p) {
 		return rbac.Allows(p.Principal, "monitor:read", "")
@@ -39,11 +40,16 @@ func checkDefinitionVisible(p principal, def model.CheckDefinition) bool {
 	if def.Type == model.MonitorTypeTLS || checkSelectorBroad(def.Sources) || checkSelectorBroad(def.Targets) {
 		return false
 	}
-	for _, list := range [][]string{def.Sources.Nodes, def.Sources.Exclude, def.Targets.Nodes, def.Targets.Exclude} {
-		for _, nodeID := range list {
-			if !latencyNodeVisible(p, nodeID) {
-				return false
-			}
+	named := slices.Concat(def.Sources.Nodes, def.Sources.Exclude, def.Targets.Nodes, def.Targets.Exclude)
+	for _, pair := range def.ExcludedPairs {
+		named = append(named, pair.Source, pair.Target)
+	}
+	for _, a := range def.Adopted {
+		named = append(named, a.TargetNode)
+	}
+	for _, nodeID := range named {
+		if !latencyNodeVisible(p, nodeID) {
+			return false
 		}
 	}
 	return true

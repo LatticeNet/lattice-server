@@ -103,7 +103,11 @@ func (s *Store) SyncManagedMonitors(managedBy string, desired []model.Monitor, n
 
 // SyncManagedMonitorSets is SyncManagedMonitors for several owners at once,
 // keyed by owner: every owner's monitors are brought in line under one lock
-// and written in one state write.
+// and written in one state write, so a sweep that changes many check
+// definitions pays for one write, not one per definition. An owner of a
+// check definition that no longer exists keeps no monitors, whatever its set
+// says, so a sync racing a delete cannot bring the deleted definition's
+// monitors back.
 func (s *Store) SyncManagedMonitorSets(sets map[string][]model.Monitor, now time.Time) (map[string]ManagedMonitorChanges, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -215,6 +219,11 @@ func (s *Store) applyManagedSetsLocked(sets map[string][]model.Monitor, now time
 		if strings.TrimSpace(owner) == "" {
 			return nil, undo, errors.New("managed monitors need an owner")
 		}
+		if definitionID, ok := strings.CutPrefix(owner, MonitorManagedCheckPrefix); ok {
+			if _, exists := s.state.CheckDefinitions[definitionID]; !exists {
+				desired = nil
+			}
+		}
 		owners = append(owners, owner)
 		set := make(map[string]model.Monitor, len(desired))
 		for _, mon := range desired {
@@ -290,6 +299,39 @@ func managedDesired(owner string, mon model.Monitor) model.Monitor {
 	mon.NodeIDs = slices.Clone(mon.NodeIDs)
 	sort.Strings(mon.NodeIDs)
 	return mon
+}
+
+// DiffManagedMonitors says what SyncManagedMonitors(owner, desired) would
+// do now, and writes nothing. A dry run reads it, so it judges by the same
+// comparison the sync writes by.
+func (s *Store) DiffManagedMonitors(owner string, desired []model.Monitor) ManagedMonitorChanges {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := make(map[string]model.Monitor, len(desired))
+	for _, mon := range desired {
+		want[mon.ID] = managedDesired(owner, mon)
+	}
+	var c ManagedMonitorChanges
+	for id, mon := range s.state.Monitors {
+		if _, ok := want[id]; !ok && mon.ManagedBy == owner {
+			c.Deleted = append(c.Deleted, id)
+		}
+	}
+	for id, next := range want {
+		current, exists := s.state.Monitors[id]
+		switch {
+		case exists && current.ManagedBy != owner:
+		case exists && managedMonitorEqual(current, next):
+		case exists:
+			c.Updated = append(c.Updated, id)
+		default:
+			c.Created = append(c.Created, id)
+		}
+	}
+	sort.Strings(c.Created)
+	sort.Strings(c.Updated)
+	sort.Strings(c.Deleted)
+	return c
 }
 
 // managedMonitorEqual compares every field an agent, the console or the

@@ -199,6 +199,10 @@ type monitorView struct {
 	// ("latency"); empty for a monitor an operator made. The console hides
 	// generated monitors from the operator's list and its failing count.
 	ManagedBy string `json:"managed_by,omitempty"`
+	// CheckDefinitionID names the check definition the monitor was
+	// expanded from (design 32 D1), empty for any other owner, so a
+	// console finds the definition without reading managed_by.
+	CheckDefinitionID string `json:"check_definition_id,omitempty"`
 	// PausedNodeIDs are sources that keep their history but do not run the
 	// monitor now. Their pairs are left out of Latest.
 	PausedNodeIDs []string `json:"paused_node_ids,omitempty"`
@@ -275,8 +279,10 @@ func monitorAlertOf(m model.Monitor) string {
 func toMonitorViews(in []model.Monitor) []monitorView {
 	out := make([]monitorView, 0, len(in))
 	for _, m := range in {
+		definitionID, _ := store.MonitorDefinitionID(m)
 		out = append(out, monitorView{
-			ID: m.ID, Name: m.Name, Type: m.Type, Target: m.Target,
+			CheckDefinitionID: definitionID,
+			ID:                m.ID, Name: m.Name, Type: m.Type, Target: m.Target,
 			IntervalSec: m.IntervalSec, TimeoutSec: m.TimeoutSec, AssignAll: m.AssignAll,
 			NodeIDs: m.NodeIDs, ThresholdDays: m.ThresholdDays,
 			TargetNode: m.TargetNode, Packets: m.Packets, ExpectStatus: m.ExpectStatus,

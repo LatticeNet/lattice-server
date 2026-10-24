@@ -433,6 +433,9 @@ func (s *Server) upsertGroup(req model.Group, p principal) (groupView, error) {
 		Scope:    "group:admin",
 		Metadata: map[string]string{"group_id": stored.ID, "slug": stored.Slug},
 	})
+	// A check definition that names the group follows its membership now,
+	// not at the next sweep (design 32 D1).
+	s.resyncCheckDefinitions("group")
 
 	// Resolved over the caller's readable nodes, not the fleet. Resolving a
 	// caller-supplied selector over every node and echoing the matches is the
@@ -471,6 +474,7 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request, p pri
 		Scope:    "group:admin",
 		Metadata: map[string]string{"group_id": req.ID},
 	})
+	s.resyncCheckDefinitions("group")
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -618,6 +622,7 @@ func (s *Server) handleGroupMembers(w http.ResponseWriter, r *http.Request, p pr
 		Scope:    "group:admin",
 		Metadata: map[string]string{"group_id": stored.ID},
 	})
+	s.resyncCheckDefinitions("group")
 	resolved := groups.ResolveMembers(stored, nodes)
 	rollup, rm := rollupFor(resolved, s.nodeStatusIndex(nodes, s.now()))
 	writeJSON(w, http.StatusOK, toGroupView(p, stored, rm, rollup))

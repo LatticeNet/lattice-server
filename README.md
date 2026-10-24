@@ -779,6 +779,46 @@ Use the compose file and deployment guide in the umbrella repository:
   method, and `auto` prefers the beacon for approved sources of a listening
   target, then icmp unless that pair reads `icmp_filtered` (then tcp, and it
   stays there), then tcp; generated beacon checks are `mon_latb_<target>`.
+- Check definitions (design 32 D1): one check with a source set and a
+  target set. A definition holds a method (`tcp`, `icmp`, `beacon`, `http`
+  or `tls`), `sources` and `targets` as selectors (`{nodes, groups, all,
+  exclude}`, design 32 D5, resolved through the group resolver every time,
+  so a node that joins a named group joins the check), `addresses` for
+  external targets, and the fields every monitor it expands into carries.
+  The control plane expands it into monitors marked
+  `managed_by: "check:<definition id>"`, one per (target, method), with
+  opaque ids hashed from the method and the normalized target, so removing
+  one target never hands another its history and a method change starts new
+  series. Expanded monitors behave as operator checks (matrix rows keyed
+  `<source>~@<monitor id>` and never marked managed, paging by the
+  definition's policy, visibility, beacon sources, node targets resolved by
+  the path set's port rule and sticky endpoint) except that a direct edit or
+  delete answers 409 naming the definition. A target that leaves the set
+  keeps its monitor, paused, with its history; a target node removed from
+  the fleet loses it. `GET /api/monitors/definitions` (`monitor:read`) lists
+  the definitions the caller may read with their path and paused-target
+  counts, beside `fleet_mesh`, the path set listed as the built-in check
+  named Fleet mesh with its own editor; `?id=` returns one with its
+  monitors and their stored runs. `POST /api/monitors/definitions` creates,
+  `POST /api/monitors/definitions/update` edits with the `version` read
+  (409 when stale; header edits are keep, set or delete as on a check), and
+  `POST /api/monitors/definitions/preview` returns what the same body would
+  write and measure: targets with the reason nothing can be dialled, every
+  pair with the reason it would read unknown (including `packet_budget` and
+  `beacon_source_pending`), and the monitors created, rewritten, paused and
+  deleted. `POST /api/monitors/definitions/delete` and `/forget` name the
+  monitors the operator confirmed (409 when they no longer match) and delete
+  them with their history. A group or whole-fleet selector needs a token
+  with no node allowlist; a restricted token may name explicit nodes it can
+  read (sources it can administer), and sees only such definitions. Secret
+  headers need explicit source nodes and stay bound to the origins they were
+  saved for. Definitions resync on save, on the two-minute sweep, after a
+  beacon approval, and after group edits, node edits and node removal; every
+  changed definition is written in one state write and audited as
+  `monitor.check.sync`. Each sync shares the per-source packet budget:
+  pairs that already run keep their share and a pair that would push a
+  source over it is paused, reading `packet_budget`, until there is room.
+  A group a definition names cannot be deleted (409).
 - `GET /api/monitors/settings` (`monitor:read`, no node allowlist, since the
   figures cover the fleet) returns the history setting
   (`fine_retention_days`, 3 to 14, 7 by default; the hourly tier is fixed at

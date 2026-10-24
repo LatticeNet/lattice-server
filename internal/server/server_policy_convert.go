@@ -84,12 +84,14 @@ func (s *Server) handleNetPolicyConvert(w http.ResponseWriter, r *http.Request, 
 		Enabled:  manual.Enabled,
 		Priority: req.Priority,
 	}
-	if !s.authorizeOutboundPolicyWrite(w, p, "this outbound policy", scope, rules, nil) {
+	if !s.authorizeOutboundPolicyWrite(w, p, "this outbound policy", scope, rules, nil, false) {
 		return
 	}
 	for i, rule := range rules {
 		if err := s.validateGroupRule(rule); err != nil {
-			writeError(w, http.StatusConflict, fmt.Errorf("rule %d cannot be converted: %w", i+1, err))
+			// The rules are the stored policy's, not the request's, so the
+			// refusal names no request field.
+			writeError(w, http.StatusConflict, fmt.Errorf("rule %d cannot be converted: %s", i+1, err))
 			return
 		}
 	}

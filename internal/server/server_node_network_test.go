@@ -27,6 +27,7 @@ type nodeNetworkOut struct {
 		SecurityGroups        []nodeNetworkSecurityGroup `json:"security_groups"`
 		DerivedSecurityGroups []nodeNetworkSecurityGroup `json:"derived_security_groups"`
 		ExtraPorts            []nodeNetworkPort          `json:"extra_ports"`
+		LegacyIngress         *nodeNetworkLegacyIngress  `json:"legacy_ingress"`
 	} `json:"inbound"`
 	Outbound struct {
 		State    string                 `json:"state"`
@@ -43,12 +44,13 @@ type nodeNetworkOut struct {
 		Stage         string `json:"stage"`
 	} `json:"access"`
 	Mesh struct {
-		State       string   `json:"state"`
-		Scope       string   `json:"scope"`
-		Ready       bool     `json:"ready"`
-		Missing     []string `json:"missing"`
-		Peers       int      `json:"peers"`
-		NotReported []string `json:"not_reported"`
+		State        string   `json:"state"`
+		Scope        string   `json:"scope"`
+		Ready        bool     `json:"ready"`
+		Missing      []string `json:"missing"`
+		Peers        int      `json:"peers"`
+		PeersRefused string   `json:"peers_refused"`
+		NotReported  []string `json:"not_reported"`
 	} `json:"mesh"`
 	Groups struct {
 		State string             `json:"state"`
@@ -546,6 +548,76 @@ func TestNodeNetworkRefusesAManualPolicyNamingAnUnreadableNode(t *testing.T) {
 		if strings.Contains(raw, leak) {
 			t.Fatalf("confined body leaks %q: %s", leak, raw)
 		}
+	}
+}
+
+// A confined token learns nothing countable about nodes outside its reach:
+// the mesh peer count is refused unless every member is readable, a group
+// remote counts once whatever the group's size, the beacon source count is
+// sent only when every source is readable, and the manual document's ingress
+// rules need the scope that reads that document.
+func TestNodeNetworkCountsNothingOutsideTheCallersScope(t *testing.T) {
+	_, handler, st, cookies, csrf := nodeNetworkFleet(t)
+	if err := st.UpsertGroup(model.Group{ID: "grp_all", Name: "all", Slug: "all", Members: []string{"n1", "n2", "n3"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertGroupPolicy(model.GroupNetPolicy{ID: "gnp_mesh", Priority: 40, Enabled: true, Scope: &model.TargetSelector{Nodes: []string{"n1"}},
+		Rules: []model.GroupNetRule{{ID: "all", Action: model.NetRuleAllow, Direction: model.NetDirEgress, Protocol: "tcp", Ports: []int{22}, Remote: model.NetEndpoint{Kind: model.NetRefGroup, GroupID: "grp_all"}}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateBeaconTarget("n1", func(target *store.BeaconTarget, _ bool) (bool, error) {
+		target.Settings = model.BeaconSettings{Enabled: true, Port: 47000}
+		target.Approved = []model.BeaconPlanSource{{NodeID: "n2", Name: "la-1"}}
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertNetPolicy(model.NetPolicy{ID: "n2", TargetNodeID: "n2", Enabled: true,
+		Rules: []model.NetRule{{ID: "in", Action: model.NetRuleAllow, Direction: model.NetDirIngress, Protocol: "tcp", Ports: []int{8080}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	beaconSources := func(view nodeNetworkOut) int {
+		for _, port := range view.Inbound.ExtraPorts {
+			if port.Source == "beacon" {
+				return port.Sources
+			}
+		}
+		t.Fatalf("no beacon port in %+v", view.Inbound.ExtraPorts)
+		return -1
+	}
+	policyRules := func(view nodeNetworkOut, id string) int {
+		for _, p := range view.Outbound.Policies {
+			if p.ID == id {
+				return p.Rules
+			}
+		}
+		t.Fatalf("no policy %s in %+v", id, view.Outbound.Policies)
+		return -1
+	}
+
+	_, full, raw := getNodeNetwork(t, handler, cookies, "node_id=n1")
+	if full.Mesh.Peers != 1 || full.Mesh.PeersRefused != "" || beaconSources(full) != 1 || policyRules(full, "gnp_mesh") != 1 {
+		t.Fatalf("unrestricted view = %s", raw)
+	}
+	if _, legacy, raw := getNodeNetwork(t, handler, cookies, "node_id=n2"); legacy.Inbound.LegacyIngress == nil || legacy.Inbound.LegacyIngress.Rules != 1 {
+		t.Fatalf("an unrestricted reader sees the manual document's ingress rules: %s", raw)
+	}
+
+	confined := createPAT(t, handler, cookies, csrf, []string{"node:read", "netguard:read", "netpolicy:read", "wireguard:read", "monitor:read"}, []string{"n1"})
+	_, view, raw := bearerNodeNetwork(t, handler, confined, "node_id=n1")
+	if view.Mesh.State != "ok" || view.Mesh.PeersRefused != "wireguard:read" || view.Mesh.Peers != 0 || !view.Mesh.Ready {
+		t.Fatalf("a confined mesh keeps the node's own facts and refuses the peer count: %+v", view.Mesh)
+	}
+	if beaconSources(view) != 0 {
+		t.Fatalf("the beacon source count names an unreadable source: %s", raw)
+	}
+	if policyRules(view, "gnp_mesh") != 1 {
+		t.Fatalf("a group remote counts once, not once per member: %s", raw)
+	}
+	n2Only := createPAT(t, handler, cookies, csrf, []string{"node:read", "netguard:read"}, []string{"n2"})
+	if _, view, raw := bearerNodeNetwork(t, handler, n2Only, "node_id=n2"); view.Inbound.State != "ok" || view.Inbound.LegacyIngress != nil {
+		t.Fatalf("the manual document's ingress rules need netpolicy:read: %s", raw)
 	}
 }
 

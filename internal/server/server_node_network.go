@@ -108,7 +108,10 @@ type nodeNetworkPort struct {
 	Protocols []string `json:"protocols"`
 	Port      int      `json:"port"`
 	Exposure  string   `json:"exposure,omitempty"`
-	// Sources counts the beacon sources the applied plan admits.
+	// Sources counts the beacon sources the applied plan admits. The
+	// sources are other nodes, so the count is sent only when the caller may
+	// read every one of them under monitor:read, the scope a beacon plan is
+	// read under.
 	Sources int `json:"sources,omitempty"`
 }
 
@@ -154,8 +157,10 @@ type nodeNetworkPolicy struct {
 	// State is applies, disabled, excluded, blocked (a manual policy owns
 	// the node) or empty (no rule of it reaches this node).
 	State string `json:"state"`
-	// Rules counts what the policy contributes to this node after
-	// expansion; a group remote counts once per member.
+	// Rules counts the policy's own rules that put a rule on this node. A
+	// rule whose remote is a node group counts once, however many members
+	// expansion writes for it, so the figure says nothing about how large a
+	// group is, members the caller may not read included.
 	Rules             int `json:"rules"`
 	Allow             int `json:"allow"`
 	Deny              int `json:"deny"`
@@ -213,8 +218,12 @@ type nodeNetworkMesh struct {
 	// public_key.
 	Missing []string `json:"missing"`
 	// Peers is how many peers a WireGuard plan for this node renders now.
-	Peers       int                 `json:"peers"`
-	LastApplied *nodeNetworkApplied `json:"last_applied,omitempty"`
+	// The peers are the rest of the mesh, so the count is refused, and
+	// PeersRefused names the scope, unless the caller may read every member
+	// under wireguard:read, as the WireGuard plan requires.
+	Peers        int                 `json:"peers"`
+	PeersRefused string              `json:"peers_refused,omitempty"`
+	LastApplied  *nodeNetworkApplied `json:"last_applied,omitempty"`
 	// NotReported names what only the node knows and no agent reports to
 	// the server, so this view cannot show it.
 	NotReported []string `json:"not_reported"`
@@ -409,16 +418,22 @@ func (s *Server) nodeNetworkInbound(p principal, node model.Node, binding model.
 		in.ExtraPorts = append(in.ExtraPorts, port)
 	}
 	if t, ok := s.store.BeaconTarget(node.ID); ok && t.Settings.Enabled && t.Settings.Port > 0 {
-		in.ExtraPorts = append(in.ExtraPorts, nodeNetworkPort{
-			Source:    ownerBeacon,
-			Protocols: []string{network.NFTProtoUDP},
-			Port:      t.Settings.Port,
-			Exposure:  t.Exposure,
-			Sources:   len(t.Approved),
-		})
+		port := nodeNetworkPort{Source: ownerBeacon, Protocols: []string{network.NFTProtoUDP}, Port: t.Settings.Port, Exposure: t.Exposure}
+		readable := true
+		for _, source := range t.Approved {
+			if !rbac.Allows(p.Principal, "monitor:read", source.NodeID) {
+				readable = false
+				break
+			}
+		}
+		if readable {
+			port.Sources = len(t.Approved)
+		}
+		in.ExtraPorts = append(in.ExtraPorts, port)
 	}
 
-	if policy, ok := s.store.NetPolicy(node.ID); ok && policy.Enabled && !policy.GroupDerived {
+	// The rules live in the outbound document, read under netpolicy:read.
+	if policy, ok := s.store.NetPolicy(node.ID); ok && policy.Enabled && !policy.GroupDerived && rbac.Allows(p.Principal, "netpolicy:read", node.ID) {
 		ingress := 0
 		for _, rule := range policy.Rules {
 			if strings.EqualFold(rule.Direction, model.NetDirIngress) {
@@ -449,8 +464,17 @@ func (s *Server) nodeNetworkOutbound(p principal, node model.Node, nodes []model
 	}
 	out := nodeNetworkOutbound{nodeNetworkSection: sectionOK(), Policies: []nodeNetworkPolicy{}}
 	policies := s.store.GroupPolicies()
-	effective := netpolicy.ExpandGroupPolicies(policies, netpolicy.PolicyTargets(policies, nodes, groupList), resolved)
-	eff, covered := effective[node.ID]
+	// Expansion is per node, so expanding the policies that reach this node
+	// for this node alone gives its document without building the fleet's.
+	targets := netpolicy.PolicyTargets(policies, nodes, groupList)
+	for policyID, nodeIDs := range targets {
+		if slices.Contains(nodeIDs, node.ID) {
+			targets[policyID] = []string{node.ID}
+		} else {
+			delete(targets, policyID)
+		}
+	}
+	eff, covered := netpolicy.ExpandGroupPolicies(policies, targets, resolved)[node.ID]
 
 	stored, hasStored := s.store.NetPolicy(node.ID)
 	// The clobber guard of handleGroupPolicyPlan, read the same way.
@@ -494,13 +518,13 @@ func (s *Server) nodeNetworkOutbound(p principal, node model.Node, nodes []model
 		target, hidden := viewerTarget(p, sel)
 		entry.Label = outboundPolicyLabel(gp.Name, target, hidden, groupNames, nodeNames)
 		entry.HiddenTargetNodes = hidden
-		// Counted as expansion would merge it, whether or not it is on, so a
-		// disabled policy says what turning it on would add.
-		probe := gp
-		probe.Enabled = true
-		contributed := netpolicy.ExpandGroupPolicies([]model.GroupNetPolicy{probe}, map[string][]string{gp.ID: {node.ID}}, resolved)[node.ID]
-		entry.Rules = len(contributed.Rules)
-		for _, rule := range contributed.Rules {
+		// Counted whether or not the policy is on, so a disabled policy says
+		// what turning it on would add.
+		for _, rule := range gp.Rules {
+			if !policyRuleReaches(rule, node.ID, resolved) {
+				continue
+			}
+			entry.Rules++
 			if strings.EqualFold(rule.Action, model.NetRuleDeny) {
 				entry.Deny++
 			} else {
@@ -539,6 +563,24 @@ func (s *Server) nodeNetworkOutbound(p principal, node model.Node, nodes []model
 		out.Source = "none"
 	}
 	return out, compile
+}
+
+// policyRuleReaches reports whether expansion writes at least one rule for
+// this authored rule on the node: an enabled rule does, unless its remote is
+// a node group with no member other than the node itself.
+func policyRuleReaches(rule model.GroupNetRule, nodeID string, resolved map[string][]string) bool {
+	if rule.Disabled {
+		return false
+	}
+	if rule.Remote.Kind != model.NetRefGroup {
+		return true
+	}
+	for _, member := range resolved[rule.Remote.GroupID] {
+		if member != nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) nodeNetworkAccess(p principal, nodeID string, now time.Time) nodeNetworkAccess {
@@ -583,9 +625,20 @@ func (s *Server) nodeNetworkMesh(p principal, node model.Node, nodes []model.Nod
 	}
 	mesh.Ready = len(mesh.Missing) == 0
 	if node.WireGuardIP != "" {
-		// The rule a WireGuard plan applies, so the count is what a plan for
-		// this node would render now.
-		if _, peers, err := wireguard.BuildMesh(nodes, node, 0); err == nil {
+		// The members a WireGuard plan for this node is refused over
+		// (handleWireGuardPlan): every other node with a key and an address.
+		readable := true
+		for _, n := range nodes {
+			if n.ID != node.ID && n.WireGuardPublicKey != "" && n.WireGuardIP != "" && !rbac.Allows(p.Principal, "wireguard:read", n.ID) {
+				readable = false
+				break
+			}
+		}
+		if !readable {
+			mesh.PeersRefused = "wireguard:read"
+		} else if _, peers, err := wireguard.BuildMesh(nodes, node, 0); err == nil {
+			// The rule a WireGuard plan applies, so the count is what a plan
+			// for this node would render now.
 			mesh.Peers = len(peers)
 		}
 	}

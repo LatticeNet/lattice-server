@@ -29,17 +29,18 @@ const groupUseOutboundPolicy = "outbound_policy"
 // scope that reveals it. Checks (design 32 S2b), security-group bindings (S4)
 // and mesh membership rules (design 13 W1) add a source here when they start
 // storing group references; the console already renders all four kinds.
+// collect builds labels for viewer, or for the system when viewer is nil.
 type groupUseSource struct {
 	kind    string
 	scope   string
-	collect func(s *Server, groupID string) []groupUse
+	collect func(s *Server, groupID string, viewer *principal) []groupUse
 }
 
 var groupUseSources = []groupUseSource{
 	{kind: groupUseOutboundPolicy, scope: "netpolicy:read", collect: (*Server).outboundPolicyGroupUses},
 }
 
-func (s *Server) outboundPolicyGroupUses(groupID string) []groupUse {
+func (s *Server) outboundPolicyGroupUses(groupID string, viewer *principal) []groupUse {
 	names := groupNamesOf(s.store.Groups())
 	out := make([]groupUse, 0)
 	for _, gp := range s.store.GroupPolicies() {
@@ -52,19 +53,28 @@ func (s *Server) outboundPolicyGroupUses(groupID string) []groupUse {
 				role = "target"
 			}
 		}
-		out = append(out, groupUse{Kind: groupUseOutboundPolicy, ID: gp.ID, Label: outboundPolicyLabel(gp, names), Role: role})
+		target, hidden := gp.TargetScope(), 0
+		if viewer != nil {
+			target, hidden = viewerTarget(*viewer, target)
+		}
+		out = append(out, groupUse{Kind: groupUseOutboundPolicy, ID: gp.ID, Label: outboundPolicyLabel(gp.Name, target, hidden, names), Role: role})
 	}
 	return out
 }
 
 // groupUses lists every object that names the group, sorted by kind, then
-// label. visible decides which kinds are listed; the rest are counted.
-func (s *Server) groupUses(groupID string, visible func(scope string) bool) (uses []groupUse, hidden int) {
+// label. For a viewer, a kind it lacks the read scope for is counted, not
+// listed, and labels leave out nodes it cannot read; a nil viewer is the
+// system and sees everything.
+func (s *Server) groupUses(groupID string, viewer *principal) (uses []groupUse, hidden map[string]int) {
 	uses = make([]groupUse, 0)
+	hidden = make(map[string]int)
 	for _, source := range groupUseSources {
-		found := source.collect(s, groupID)
-		if visible != nil && !visible(source.scope) {
-			hidden += len(found)
+		found := source.collect(s, groupID, viewer)
+		if viewer != nil && !rbac.Allows(viewer.Principal, source.scope, "") {
+			if len(found) > 0 {
+				hidden[source.kind] += len(found)
+			}
 			continue
 		}
 		uses = append(uses, found...)
@@ -98,17 +108,19 @@ func (s *Server) handleGroupUsedBy(w http.ResponseWriter, r *http.Request, p pri
 		writeError(w, http.StatusNotFound, fmt.Errorf("node group %q not found", groupID))
 		return
 	}
-	uses, hidden := s.groupUses(groupID, func(scope string) bool {
-		return rbac.Allows(p.Principal, scope, "")
-	})
-	writeJSON(w, http.StatusOK, map[string]any{"group_id": groupID, "used_by": uses, "hidden": hidden})
+	uses, hidden := s.groupUses(groupID, &p)
+	total := 0
+	for _, n := range hidden {
+		total += n
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"group_id": groupID, "used_by": uses, "hidden": total})
 }
 
 // groupInUseMessage is the sentence a refused group delete answers with. It
-// names every user; the deleter holds group:admin and the policy names are
-// listable under netpolicy:read, and naming them is what lets the operator
-// act on the refusal.
-func (s *Server) groupInUseMessage(groupID string, inUse *store.GroupInUseError) string {
+// names every user the deleter may read, as the Used by list would show it to
+// them, and counts the kinds it may not, so the refusal says why without
+// naming what the deleter cannot see.
+func (s *Server) groupInUseMessage(p principal, groupID string, inUse *store.GroupInUseError) string {
 	name := groupID
 	if g, ok := s.store.Group(groupID); ok && g.Name != "" {
 		name = g.Name
@@ -121,9 +133,17 @@ func (s *Server) groupInUseMessage(groupID string, inUse *store.GroupInUseError)
 		}
 		parts = append(parts, fmt.Sprintf("child group %q", label))
 	}
-	uses, _ := s.groupUses(groupID, nil)
+	uses, hidden := s.groupUses(groupID, &p)
 	for _, use := range uses {
-		parts = append(parts, fmt.Sprintf("%s %q (%s)", groupUseNoun(use.Kind), use.Label, use.Role))
+		parts = append(parts, fmt.Sprintf("%s %q (%s)", groupUseNoun(use.Kind, 1), use.Label, use.Role))
+	}
+	kinds := make([]string, 0, len(hidden))
+	for kind := range hidden {
+		kinds = append(kinds, kind)
+	}
+	sort.Strings(kinds)
+	for _, kind := range kinds {
+		parts = append(parts, fmt.Sprintf("%d %s you cannot read", hidden[kind], groupUseNoun(kind, hidden[kind])))
 	}
 	if len(parts) == 0 {
 		return inUse.Error()
@@ -131,11 +151,13 @@ func (s *Server) groupInUseMessage(groupID string, inUse *store.GroupInUseError)
 	return fmt.Sprintf("node group %q is in use, so it was not deleted: %s. Reparent the children and change or delete the rest first.", name, strings.Join(parts, ", "))
 }
 
-func groupUseNoun(kind string) string {
-	switch kind {
-	case groupUseOutboundPolicy:
-		return "outbound policy"
-	default:
-		return strings.ReplaceAll(kind, "_", " ")
+func groupUseNoun(kind string, n int) string {
+	noun := strings.ReplaceAll(kind, "_", " ")
+	if kind == groupUseOutboundPolicy {
+		noun = "outbound policy"
+		if n != 1 {
+			noun = "outbound policies"
+		}
 	}
+	return noun
 }

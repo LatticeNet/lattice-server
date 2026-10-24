@@ -38,6 +38,9 @@ type groupPolicyView struct {
 	TargetNodeIDs []string `json:"target_node_ids"`
 	// Label names the policy where it is listed: its name, or its target.
 	Label string `json:"label"`
+	// HiddenTargetNodes counts the named and excluded nodes left out of
+	// Target, Scope and Label for a node-restricted reader (viewerTarget).
+	HiddenTargetNodes int `json:"hidden_target_nodes,omitempty"`
 }
 
 func (s *Server) toGroupPolicyView(p principal, gp model.GroupNetPolicy, nodes []model.Node, groupList []model.Group) groupPolicyView {
@@ -45,21 +48,58 @@ func (s *Server) toGroupPolicyView(p principal, gp model.GroupNetPolicy, nodes [
 	if g, ok := s.store.Group(gp.ScopeGroupID); ok {
 		name = g.Name
 	}
-	target := gp.TargetScope()
 	readable := make([]string, 0)
-	for _, nodeID := range groups.ResolveTargets(target, nodes, groupList) {
+	for _, nodeID := range groups.ResolveTargets(gp.TargetScope(), nodes, groupList) {
 		if rbac.Allows(p.Principal, "netpolicy:read", nodeID) {
 			readable = append(readable, nodeID)
 		}
 	}
-	return groupPolicyView{
-		GroupNetPolicy: gp,
-		ScopeGroupName: name,
-		GroupRuleCount: len(gp.Rules),
-		Target:         target,
-		TargetNodeIDs:  readable,
-		Label:          outboundPolicyLabel(gp, groupNamesOf(groupList)),
+	target, hidden := viewerTarget(p, gp.TargetScope())
+	if gp.Scope != nil && hidden > 0 {
+		visible := target
+		gp.Scope = &visible
 	}
+	return groupPolicyView{
+		GroupNetPolicy:    gp,
+		ScopeGroupName:    name,
+		GroupRuleCount:    len(gp.Rules),
+		Target:            target,
+		TargetNodeIDs:     readable,
+		Label:             outboundPolicyLabel(gp.Name, target, hidden, groupNamesOf(groupList)),
+		HiddenTargetNodes: hidden,
+	}
+}
+
+// viewerTarget is the part of a selector a principal may read. For a
+// node-restricted principal the named and excluded nodes it cannot read under
+// netpolicy:read are left out and counted, the way TargetNodeIDs is filtered:
+// otherwise the selector would list node ids outside its allowlist, which
+// the filtered TargetNodeIDs beside it exists to withhold. Groups and the
+// whole-fleet flag stay, since groups are listable under group:read. A
+// redacted selector never feeds a write: such a principal may not write a
+// policy naming a node it cannot administer.
+func viewerTarget(p principal, sel model.TargetSelector) (model.TargetSelector, int) {
+	if !principalHasNodeRestriction(p) {
+		return sel, 0
+	}
+	hidden := 0
+	keep := func(ids []string) []string {
+		out := make([]string, 0, len(ids))
+		for _, nodeID := range ids {
+			if rbac.Allows(p.Principal, "netpolicy:read", nodeID) {
+				out = append(out, nodeID)
+			} else {
+				hidden++
+			}
+		}
+		return out
+	}
+	return model.TargetSelector{
+		Nodes:   keep(sel.Nodes),
+		Groups:  append([]string(nil), sel.Groups...),
+		All:     sel.All,
+		Exclude: keep(sel.Exclude),
+	}, hidden
 }
 
 func groupNamesOf(groupList []model.Group) map[string]string {
@@ -71,13 +111,18 @@ func groupNamesOf(groupList []model.Group) map[string]string {
 }
 
 // outboundPolicyLabel names a policy: its name, or "targeting" and a short
-// description of its target. Nodes appear by id, the form every policy view
-// already carries in its scope and rules, and groups by name.
-func outboundPolicyLabel(gp model.GroupNetPolicy, groupNames map[string]string) string {
-	if name := strings.TrimSpace(gp.Name); name != "" {
+// description of its target as the reader may see it (viewerTarget), with
+// the nodes left out counted. Nodes appear by id, the form every policy view
+// already carries in its scope, and groups by name.
+func outboundPolicyLabel(name string, sel model.TargetSelector, hidden int, groupNames map[string]string) string {
+	if name = strings.TrimSpace(name); name != "" {
 		return name
 	}
-	return "targeting " + describeTargetSelector(gp.TargetScope(), groupNames)
+	label := "targeting " + describeTargetSelector(sel, groupNames)
+	if hidden > 0 {
+		label += fmt.Sprintf(" (and %d node(s) you cannot read)", hidden)
+	}
+	return label
 }
 
 func describeTargetSelector(sel model.TargetSelector, groupNames map[string]string) string {
@@ -149,7 +194,15 @@ func (s *Server) handleGroupPolicy(w http.ResponseWriter, r *http.Request, p pri
 		// second existence probe with different wording.
 		var prior *model.GroupNetPolicy
 		if priorID := strings.TrimSpace(req.ID); priorID != "" {
-			if gp, ok := s.store.GroupPolicy(priorID); ok {
+			gp, ok := s.store.GroupPolicy(priorID)
+			if !ok && principalHasNodeRestriction(p) {
+				// The same refusal as for a policy out of reach, so a
+				// confined caller cannot tell an unknown id from one it
+				// may not touch (security review of S3a).
+				s.refuseConfinedPolicyChange(w, p, "this outbound policy")
+				return
+			}
+			if ok {
 				prior = &gp
 			}
 		}
@@ -248,8 +301,8 @@ func (s *Server) authorizeOutboundPolicyWrite(w http.ResponseWriter, p principal
 	if prior != nil {
 		priorScope := prior.TargetScope()
 		if len(priorScope.Groups) > 0 || priorScope.All {
-			return deny("node-restricted token tried to change a group or fleet policy",
-				what+" currently targets a node group or the whole fleet, which a token carrying a server allowlist cannot change")
+			s.refuseConfinedPolicyChange(w, p, what)
+			return false
 		}
 		ids = append(append(ids, priorScope.Nodes...), priorScope.Exclude...)
 	}
@@ -274,9 +327,42 @@ func (s *Server) authorizeOutboundPolicyWrite(w http.ResponseWriter, p principal
 	return s.requireReadableNodes(w, p, "netpolicy:read", "a remote of "+what, remotes)
 }
 
+// refuseConfinedPolicyChange answers a node-restricted caller that names an
+// existing group or fleet policy, or an id that resolves to nothing, with one
+// refusal, so the answer does not say which.
+func (s *Server) refuseConfinedPolicyChange(w http.ResponseWriter, p principal, what string) {
+	s.recordPrincipalAudit(p, model.AuditEvent{
+		ID:       id.New("audit"),
+		Action:   "authorize.nodeset",
+		Scope:    "netpolicy:admin",
+		Decision: "deny",
+		Reason:   "node-restricted token named a policy it cannot change",
+	})
+	writeError(w, http.StatusForbidden, apiError(model.APIErrorCapabilityDenied,
+		what+" is not one a token carrying a server allowlist can change"))
+}
+
 func (s *Server) upsertGroupPolicy(req model.GroupNetPolicy, scope model.TargetSelector, p principal) (groupPolicyView, error) {
-	for _, nodeID := range append(append([]string(nil), scope.Nodes...), scope.Exclude...) {
+	for _, nodeID := range scope.Nodes {
 		if _, ok := s.store.Node(nodeID); !ok {
+			return groupPolicyView{}, fmt.Errorf("node %q not found", nodeID)
+		}
+	}
+	// An exclusion is a veto and outlives the node it names (the node delete
+	// cascade keeps it), so an edit may keep one the policy already holds;
+	// a new one must name a real node.
+	var keptExclusions map[string]struct{}
+	if prior, ok := s.store.GroupPolicy(strings.TrimSpace(req.ID)); ok {
+		keptExclusions = make(map[string]struct{})
+		for _, nodeID := range prior.TargetScope().Exclude {
+			keptExclusions[nodeID] = struct{}{}
+		}
+	}
+	for _, nodeID := range scope.Exclude {
+		if _, ok := s.store.Node(nodeID); ok {
+			continue
+		}
+		if _, kept := keptExclusions[nodeID]; !kept {
 			return groupPolicyView{}, fmt.Errorf("node %q not found", nodeID)
 		}
 	}
@@ -292,6 +378,9 @@ func (s *Server) upsertGroupPolicy(req model.GroupNetPolicy, scope model.TargetS
 	req.Scope = &scope
 	req.ScopeGroupID = store.ScopeGroupAlias(scope)
 	ruleIDs := make(map[string]struct{}, len(req.Rules))
+	for i := range req.Rules {
+		req.Rules[i].ID = strings.TrimSpace(req.Rules[i].ID)
+	}
 	for i, rule := range req.Rules {
 		if err := s.validateGroupRule(rule); err != nil {
 			return groupPolicyView{}, fmt.Errorf("rule %d: %w", i+1, err)
@@ -387,10 +476,13 @@ func (s *Server) handleDeleteGroupPolicy(w http.ResponseWriter, r *http.Request,
 	// does not resolve falls through to the store's own not-found answer;
 	// policies are listable under netpolicy:read, so the id is not a secret
 	// this check could turn into an oracle.
-	if gp, ok := s.store.GroupPolicy(req.ID); ok {
-		if !s.authorizeOutboundPolicyWrite(w, p, "deleting this outbound policy", gp.TargetScope(), nil, &gp) {
-			return
-		}
+	gp, ok := s.store.GroupPolicy(req.ID)
+	if !ok && principalHasNodeRestriction(p) {
+		s.refuseConfinedPolicyChange(w, p, "deleting this outbound policy")
+		return
+	}
+	if ok && !s.authorizeOutboundPolicyWrite(w, p, "deleting this outbound policy", gp.TargetScope(), nil, &gp) {
+		return
 	}
 	if err := s.store.DeleteGroupPolicy(req.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -751,7 +843,9 @@ func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p
 	external := map[string]int{}
 	// The matrix is the group-pair view of outbound policy: a row is a node
 	// group a policy targets. A policy that targets only nodes or the whole
-	// fleet has no group row and is read on the policy page instead.
+	// fleet has no group row and is read on the policy page instead, and a
+	// group row does not show a policy's exclusions, so it reads a cell as
+	// the group's even when some members are left out.
 	for _, gp := range s.store.GroupPolicies() {
 		if !gp.Enabled {
 			continue

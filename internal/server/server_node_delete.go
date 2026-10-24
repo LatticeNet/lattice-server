@@ -29,6 +29,7 @@ type nodeDeleteSummary struct {
 	NetPolicies                 int    `json:"net_policies"`
 	NetPeerRulesStripped        int    `json:"net_peer_rules_stripped"`
 	GroupPolicyRulesStripped    int    `json:"group_policy_rules_stripped"`
+	GroupPolicyScopesStripped   int    `json:"group_policy_scopes_stripped"`
 	GeoRoutingStripped          int    `json:"geo_routing_stripped"`
 	GeoRoutingDeleted           int    `json:"geo_routing_deleted"`
 	AgentUpdatePolicies         int    `json:"agent_update_policies"`
@@ -62,7 +63,8 @@ func newNodeDeleteSummary(nodeID, name string, mutated bool, r store.NodeCascade
 		DDNSProfiles: r.DDNSProfiles, MachineProfiles: r.MachineProfiles, NFTInputs: r.NFTInputs,
 		DNSDeployments: r.DNSDeployments, NetPolicies: r.NetPolicies,
 		NetPeerRulesStripped: r.NetPeerRulesStripped, GroupPolicyRulesStripped: r.GroupPolicyRulesStripped,
-		GeoRoutingStripped: r.GeoRoutingStripped, GeoRoutingDeleted: r.GeoRoutingDeleted,
+		GroupPolicyScopesStripped: r.GroupPolicyScopesStripped,
+		GeoRoutingStripped:        r.GeoRoutingStripped, GeoRoutingDeleted: r.GeoRoutingDeleted,
 		AgentUpdatePolicies: r.AgentUpdatePolicies, ProxyNodeProfiles: r.ProxyNodeProfiles,
 		ProxyUsageSnapshots: r.ProxyUsageSnapshots, MonitorsStripped: r.MonitorsStripped,
 		MonitorResults: r.MonitorResults, LogSources: r.LogSources, Groups: r.Groups,
@@ -232,6 +234,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 			"net_policies":            strconv.Itoa(summary.NetPolicies),
 			"net_peer_rules":          strconv.Itoa(summary.NetPeerRulesStripped),
 			"group_policy_rules":      strconv.Itoa(summary.GroupPolicyRulesStripped),
+			"group_policy_scopes":     strconv.Itoa(summary.GroupPolicyScopesStripped),
 			"geo_stripped":            strconv.Itoa(summary.GeoRoutingStripped),
 			"geo_deleted":             strconv.Itoa(summary.GeoRoutingDeleted),
 			"agent_updates":           strconv.Itoa(summary.AgentUpdatePolicies),

@@ -466,7 +466,7 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request, p pri
 		// it; the refusal names every user so the operator can act on it.
 		var inUse *store.GroupInUseError
 		if errors.As(err, &inUse) {
-			writeError(w, http.StatusConflict, errors.New(s.groupInUseMessage(req.ID, inUse)))
+			writeError(w, http.StatusConflict, errors.New(s.groupInUseMessage(p, req.ID, inUse)))
 			return
 		}
 		writeError(w, http.StatusConflict, err)

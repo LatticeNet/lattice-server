@@ -38,7 +38,8 @@ type NodeCascadeReport struct {
 	NetPeerRulesStripped     int `json:"net_peer_rules_stripped"`
 	GroupPolicyRulesStripped int `json:"group_policy_rules_stripped"`
 	// GroupPolicyScopesStripped counts outbound policies whose target selector
-	// named the node, as a target or an exclusion (SHARED: strip, keep).
+	// named the node as a target (SHARED: strip the target, keep the policy;
+	// an exclusion naming the node stays).
 	GroupPolicyScopesStripped   int `json:"group_policy_scopes_stripped"`
 	GeoRoutingStripped          int `json:"geo_routing_stripped"` // SHARED: stripped, kept
 	GeoRoutingDeleted           int `json:"geo_routing_deleted"`  // became empty -> deleted
@@ -458,21 +459,22 @@ func (s *Store) buildNodeCascadeLocked(nodeID string, mutate bool) (NodeCascadeR
 		}
 	}
 
-	// Step 7c: the node inside outbound policy target selectors. A stored
-	// selector is resolved against the live fleet, so a gone node already
-	// drops out of every target; stripping it keeps a deleted id from coming
-	// back as a target if a node with the same id enrolls later. The policy is
-	// kept even when its last explicit node goes: it then targets nothing,
-	// which the console shows, and the operator retargets or deletes it.
+	// Step 7c: the node among outbound policy targets. A stored selector is
+	// resolved against the live fleet, so a gone node already drops out of
+	// every target; stripping it keeps a deleted id from coming back as a
+	// target if a node with the same id enrolls later. An exclusion is the
+	// opposite, a veto, so it stays: a node that enrolls later under the same
+	// id is still left out. The policy is kept even when its last explicit
+	// node goes: it then targets nothing, which the console shows, and the
+	// operator retargets or deletes it.
 	for key, gp := range s.state.GroupPolicies {
-		if gp.Scope == nil || (!contains(gp.Scope.Nodes, nodeID) && !contains(gp.Scope.Exclude, nodeID)) {
+		if gp.Scope == nil || !contains(gp.Scope.Nodes, nodeID) {
 			continue
 		}
 		report.GroupPolicyScopesStripped++
 		if mutate {
 			clone := cloneGroupPolicy(gp)
 			clone.Scope.Nodes = withoutString(clone.Scope.Nodes, nodeID)
-			clone.Scope.Exclude = withoutString(clone.Scope.Exclude, nodeID)
 			clone.ScopeGroupID = ScopeGroupAlias(*clone.Scope)
 			s.state.GroupPolicies[key] = clone
 		}

@@ -314,10 +314,20 @@ func TestOutboundPolicyRestrictedPrincipalScope(t *testing.T) {
 	if code := del(ownID); code != http.StatusOK {
 		t.Fatalf("confined token must delete its own node policy, got %d", code)
 	}
+
+	// An id that resolves to nothing gets the same refusal as one out of
+	// reach, so the answers do not tell the two apart.
+	if code, _ := post(`{"id":"gnp_ghost","scope":{"nodes":["n1"]},"enabled":true}`); code != http.StatusForbidden {
+		t.Fatalf("confined write naming an unknown policy id: want 403, got %d", code)
+	}
+	if code := del("gnp_ghost"); code != http.StatusForbidden {
+		t.Fatalf("confined delete of an unknown policy id: want 403, got %d", code)
+	}
 }
 
-// Removing a node from the fleet strips it from every outbound policy scope,
-// so a deleted node never comes back as a target.
+// Removing a node from the fleet strips it from every outbound policy's
+// targets, so a deleted node never comes back as a target; its exclusions
+// stay.
 func TestNodeDeleteStripsOutboundPolicyScopes(t *testing.T) {
 	_, st, _, _ := outboundFleet(t, "n1", "n2")
 	if err := st.UpsertGroupPolicy(model.GroupNetPolicy{ID: "gnp_s", Enabled: true,
@@ -332,12 +342,14 @@ func TestNodeDeleteStripsOutboundPolicyScopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.GroupPolicyScopesStripped != 2 {
-		t.Fatalf("cascade report counted %d scopes, want 2", report.GroupPolicyScopesStripped)
+	if report.GroupPolicyScopesStripped != 1 {
+		t.Fatalf("cascade report counted %d scopes, want 1", report.GroupPolicyScopesStripped)
 	}
 	s, _ := st.GroupPolicy("gnp_s")
 	x, _ := st.GroupPolicy("gnp_x")
-	if !reflect.DeepEqual(s.Scope.Nodes, []string{"n1"}) || len(x.Scope.Exclude) != 0 || !x.Scope.All {
+	// A target is stripped; an exclusion is a veto and stays, so a node that
+	// enrolls later under the same id is still left out (Go review of S3a).
+	if !reflect.DeepEqual(s.Scope.Nodes, []string{"n1"}) || !reflect.DeepEqual(x.Scope.Exclude, []string{"n2"}) || !x.Scope.All {
 		t.Fatalf("scopes after delete: %+v / %+v", s.Scope, x.Scope)
 	}
 }
@@ -388,5 +400,24 @@ func TestOutboundPolicyOverlappingTargetsPlanWithReusedRuleIDs(t *testing.T) {
 	n1, _ := st.NetPolicy("n1")
 	if len(n1.Rules) != 2 || n1.Rules[0].Ports[0] != 22 {
 		t.Fatalf("n1 must merge the node policy (priority 0) before the fleet one: %+v", n1.Rules)
+	}
+}
+
+// An exclusion naming a node that left the fleet stays on the policy, and an
+// edit that keeps it saves; a new exclusion must still name a real node.
+func TestOutboundPolicyKeepsAStaleExclusionOnEdit(t *testing.T) {
+	handler, st, cookies, csrf := outboundFleet(t, "n1", "n2")
+	code, view, raw := postPolicy(t, handler, cookies, csrf, `{"scope":{"all":true,"exclude":["n2"]},"enabled":true}`)
+	if code != http.StatusOK {
+		t.Fatalf("create = %d %s", code, raw)
+	}
+	if _, _, err := st.DeleteNode("n2"); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, raw := postPolicy(t, handler, cookies, csrf, `{"id":"`+view.ID+`","scope":{"all":true,"exclude":["n2"]},"enabled":false}`); code != http.StatusOK {
+		t.Fatalf("an edit keeping the stale exclusion must save, got %d %s", code, raw)
+	}
+	if code, _, _ := postPolicy(t, handler, cookies, csrf, `{"id":"`+view.ID+`","scope":{"all":true,"exclude":["n2","ghost"]},"enabled":false}`); code != http.StatusBadRequest {
+		t.Fatalf("a new unknown exclusion must be refused, got %d", code)
 	}
 }

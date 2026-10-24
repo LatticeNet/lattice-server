@@ -150,16 +150,13 @@ func (s *Server) handleNetPolicyConvert(w http.ResponseWriter, r *http.Request, 
 		derived = &normalized
 	}
 
-	if err := s.store.ConvertNetPolicy(nodeID, gp, derived); err != nil {
-		if errors.Is(err, store.ErrNetPolicyNotManual) {
-			writeError(w, http.StatusConflict, fmt.Errorf("the policy on node %q changed while converting; reload and try again", nodeID))
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	stored, _ := s.store.GroupPolicy(gp.ID)
-
+	// The reviewed plan is submitted before the store write, so a conversion
+	// is never stored without its plan: if the approval cannot be created,
+	// nothing changed (Go review of S3a). If the write then loses a race with
+	// another change to the node's document, the approval stays pending and
+	// meets the approve-time freshness check like any plan
+	// (requireCurrentNetPolicyApproval), which refuses it unless its ruleset
+	// is still what the node's document compiles to.
 	var approvalOut *approvalView
 	approvalID := ""
 	if derived != nil {
@@ -187,6 +184,17 @@ func (s *Server) handleNetPolicyConvert(w http.ResponseWriter, r *http.Request, 
 		approvalOut = &view
 		approvalID = approval.ID
 	}
+
+	if err := s.store.ConvertNetPolicy(nodeID, gp, derived); err != nil {
+		if errors.Is(err, store.ErrNetPolicyNotManual) {
+			writeError(w, http.StatusConflict, fmt.Errorf("the policy on node %q changed while converting, so nothing was converted; reload and try again", nodeID))
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	stored, _ := s.store.GroupPolicy(gp.ID)
+
 	s.recordPrincipalAudit(p, model.AuditEvent{
 		ID:     id.New("audit"),
 		NodeID: nodeID,

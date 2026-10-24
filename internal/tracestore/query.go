@@ -190,7 +190,7 @@ func (s *Store) QueryRecords(f Filter) (RecordPage, error) {
 
 	query := "SELECT " + recordColumns + " FROM conn_records"
 	if len(where) > 0 {
-		query += "\nWHERE " + strings.Join(where, "\n  AND ")
+		query += "\nWHERE " + strings.Join(where, "\n  AND ") // #nosec G202 -- constant fragments; values are bound parameters
 	}
 	// The order is the primary key reversed, so the cursor comparison above and
 	// this ordering are the same tuple and paging cannot skip or repeat a row.
@@ -221,7 +221,7 @@ func (s *Store) QueryRecords(f Filter) (RecordPage, error) {
 		page.NextCursor = encodeCursor(cursor{
 			StartedAt:      nanos(last.StartedAt),
 			NodeID:         last.NodeID,
-			CoreGeneration: int64(last.CoreGeneration),
+			CoreGeneration: counterSQL(last.CoreGeneration),
 			LogID:          int64(last.LogID),
 		})
 	}
@@ -242,7 +242,7 @@ func (s *Store) QueryRecords(f Filter) (RecordPage, error) {
 func (s *Store) RecordByKey(nodeID string, coreGeneration uint64, logID uint32, startedAt time.Time) (model.ConnRecord, bool, error) {
 	query := `SELECT ` + recordColumns + ` FROM conn_records
 		WHERE node_id = ? AND core_generation = ? AND log_id = ?`
-	args := []any{nodeID, int64(coreGeneration), int64(logID)}
+	args := []any{nodeID, counterSQL(coreGeneration), int64(logID)}
 	if !startedAt.IsZero() {
 		query += ` AND started_at = ?`
 		args = append(args, nanos(startedAt))
@@ -275,7 +275,7 @@ func (s *Store) QueryLines(sessionID string, afterSeq uint64, limit int) ([]mode
 	}
 	rows, err := s.db.Query(`SELECT session_id, node_id, seq, at, level, log_id, tag, message, raw
 		FROM trace_lines WHERE session_id = ? AND seq > ?
-		ORDER BY seq ASC, node_id ASC LIMIT ?`, sessionID, int64(afterSeq), limit)
+		ORDER BY seq ASC, node_id ASC LIMIT ?`, sessionID, counterSQL(afterSeq), limit)
 	if err != nil {
 		return nil, fmt.Errorf("tracestore: query lines: %w", err)
 	}
@@ -291,9 +291,9 @@ func (s *Store) QueryLines(sessionID string, afterSeq uint64, limit int) ([]mode
 		if err := rows.Scan(&l.SessionID, &l.NodeID, &seq, &at, &l.Level, &logID, &l.Tag, &message, &raw); err != nil {
 			return nil, fmt.Errorf("tracestore: query lines: %w", err)
 		}
-		l.Seq = uint64(seq)
+		l.Seq = counterFromSQL(seq)
 		l.At = time.Unix(0, at).UTC()
-		l.LogID = uint32(logID)
+		l.LogID = uint32(logID) // #nosec G115 -- log_id is stored from a uint32
 		if l.Message, err = s.unseal(message); err != nil {
 			return nil, err
 		}
@@ -347,7 +347,7 @@ func (s *Store) Rollups(f RollupFilter) ([]Rollup, error) {
 	query := `SELECT bucket_start, user_id, line_uuid, node_id, connections, bytes_known_count, upload, download, close_reasons
 		FROM rollups_5m`
 	if len(where) > 0 {
-		query += "\nWHERE " + strings.Join(where, "\n  AND ")
+		query += "\nWHERE " + strings.Join(where, "\n  AND ") // #nosec G202 -- constant fragments; values are bound parameters
 	}
 	query += "\nORDER BY bucket_start ASC, user_id ASC, line_uuid ASC, node_id ASC\nLIMIT ?"
 	args = append(args, limit)
@@ -722,7 +722,7 @@ func (s *Store) scanRollupSeries(ctx context.Context, f RollupSeriesFilter, keyC
 	if keyColumn != "" {
 		columns = "bucket_start, close_reasons, " + keyColumn + ", connections, bytes_known_count, upload, download"
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+columns+` FROM rollups_5m WHERE `+strings.Join(where, " AND "), args...)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+columns+` FROM rollups_5m WHERE `+strings.Join(where, " AND "), args...) // #nosec G202 -- keyColumn comes from the rollupKeyColumns allowlist
 	if err != nil {
 		return nil, fmt.Errorf("tracestore: rollup series: %w", err)
 	}
@@ -939,8 +939,8 @@ func (s *Store) scanRecord(rows *sql.Rows) (model.ConnRecord, error) {
 		&sessionIDs, &r.HopPathID); err != nil {
 		return model.ConnRecord{}, err
 	}
-	r.CoreGeneration = uint64(coreGeneration)
-	r.LogID = uint32(logID)
+	r.CoreGeneration = counterFromSQL(coreGeneration)
+	r.LogID = uint32(logID) // #nosec G115 -- log_id is stored from a uint32
 	r.StartedAt = time.Unix(0, startedAt).UTC()
 	r.SrcPort = int(srcPort)
 	r.DstPort = int(dstPort)

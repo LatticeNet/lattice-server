@@ -75,7 +75,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if *out == "" {
 		_, err = stdout.Write(source)
 	} else {
-		err = os.WriteFile(*out, source, 0o644)
+		err = os.WriteFile(*out, source, 0o644) // #nosec G306 -- generated source checked into the console repo
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "tsgen:", err)
@@ -210,7 +210,7 @@ type scriptNetworkSample struct {
 // scriptNetworkSamples is the samples file as a TypeScript declaration and
 // constant.
 func scriptNetworkSamples(path string) (string, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the samples path is inside this tool's own -server dir
 	if err != nil {
 		return "", fmt.Errorf("read the refusal samples: %w", err)
 	}

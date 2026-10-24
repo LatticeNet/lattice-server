@@ -237,7 +237,7 @@ func Resolve(dataDir, keyFileOverride string) (ResolveResult, error) {
 // resolveFromFile reads the key file, or — when generate is true and the file
 // is absent — creates a new random key with 0600 permissions.
 func resolveFromFile(path string, generate bool) (ResolveResult, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 G703 -- the key path is the operator's flag or LATTICE_MASTER_KEY_FILE, or the data dir
 	switch {
 	case err == nil:
 		key, perr := parseKey(data)
@@ -268,7 +268,7 @@ func resolveFromFile(path string, generate bool) (ResolveResult, error) {
 // creating the parent directory if needed, and returns the raw key.
 func generateKeyFile(path string) ([]byte, error) {
 	if dir := filepath.Dir(path); dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil { // #nosec G703 -- the key path is the operator's flag or LATTICE_MASTER_KEY_FILE, or the data dir
 			return nil, fmt.Errorf("secret: mkdir for key file: %w", err)
 		}
 	}
@@ -278,11 +278,11 @@ func generateKeyFile(path string) ([]byte, error) {
 	}
 	encoded := base64.StdEncoding.EncodeToString(key) + "\n"
 	// O_EXCL so we never clobber a concurrently-created key.
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 G703 -- the key path is the operator's flag or LATTICE_MASTER_KEY_FILE, or the data dir
 	if err != nil {
 		// Lost a race or pre-existing; re-read rather than overwrite.
 		if errors.Is(err, os.ErrExist) {
-			data, rerr := os.ReadFile(path)
+			data, rerr := os.ReadFile(path) // #nosec G304 G703 -- the key path is the operator's flag or LATTICE_MASTER_KEY_FILE, or the data dir
 			if rerr != nil {
 				return nil, fmt.Errorf("secret: read key file after race: %w", rerr)
 			}

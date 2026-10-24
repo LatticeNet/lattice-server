@@ -227,7 +227,7 @@ func (s *Server) startMonitorHistoryPrune() {
 			if ctx.Err() != nil {
 				return
 			}
-			s.pruneMonitorHistory(ctx)
+			_, _ = s.pruneMonitorHistory(ctx)
 		}
 	}()
 }

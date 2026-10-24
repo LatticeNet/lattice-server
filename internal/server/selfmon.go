@@ -307,7 +307,7 @@ func (m *selfMonitor) sample(now time.Time) selfSample {
 			}
 		case "/sched/goroutines:goroutines":
 			if r.Value.Kind() == metrics.KindUint64 {
-				s.Goroutines = int(r.Value.Uint64())
+				s.Goroutines = int(r.Value.Uint64()) // #nosec G115 -- a goroutine count fits an int
 			}
 		case "/sched/pauses/total/gc:seconds":
 			if r.Value.Kind() == metrics.KindFloat64Histogram {

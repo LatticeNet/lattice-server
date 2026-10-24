@@ -273,7 +273,7 @@ func NewSystemRunner(opts SystemRunnerOptions) (*SystemRunner, error) {
 			return nil, err
 		}
 		uids = newPluginUIDMap(*opts.PluginUIDs)
-		layout = isolatedStagedLayout(uint32(os.Geteuid()))
+		layout = isolatedStagedLayout(uint32(os.Geteuid())) // #nosec G115 -- POSIX uids and gids are 32-bit kernel ids
 	}
 	return &SystemRunner{opts: opts, poolConfig: poolConfig, st: map[string]map[uint64]*systemPluginState{}, budgetWarnings: map[string]bool{}, startLocks: map[string]*sync.Mutex{}, draining: map[*systemPool]string{}, uids: uids, layout: layout}, nil
 }
@@ -452,7 +452,7 @@ func (r *SystemRunner) Prepare(ctx context.Context, req RunnerStartRequest) (Run
 		byGeneration = map[uint64]*systemPluginState{}
 		r.st[pluginID] = byGeneration
 	}
-	rootCtx, rootCancel := context.WithCancel(context.Background())
+	rootCtx, rootCancel := context.WithCancel(context.Background()) // #nosec G118 -- kept as systemPluginState.rootCancel, called by broadcastCleanup
 	refsDone := make(chan struct{})
 	close(refsDone)
 	byGeneration[req.Generation] = &systemPluginState{pluginID: pluginID, execPath: execPath, execSHA256: execSHA256, workDir: workDir, broker: req.Broker, pool: pool, isV2: isV2, generation: req.Generation, cleanupDone: make(chan struct{}), refsDone: refsDone, v1Active: map[uint64]context.CancelFunc{}, rootCtx: rootCtx, rootCancel: rootCancel, credential: credential}
@@ -760,7 +760,7 @@ func (r *SystemRunner) verifiedRuntimeBytes(loaded Loaded) ([]byte, error) {
 		if artifactPath == "" {
 			artifactPath = filepath.Join(loaded.BundlePath, artifactFileName)
 		}
-		data, err := os.ReadFile(artifactPath)
+		data, err := os.ReadFile(artifactPath) // #nosec G304 -- the artifact of a bundle the loader verified
 		if err != nil {
 			return nil, fmt.Errorf("read artifact: %w", err)
 		}
@@ -949,7 +949,7 @@ func (r *SystemRunner) AcquireInvocation(pluginID string, generation uint64) (In
 	}
 	st.refs++
 	if st.rootCtx == nil {
-		st.rootCtx, st.rootCancel = context.WithCancel(context.Background())
+		st.rootCtx, st.rootCancel = context.WithCancel(context.Background()) // #nosec G118 -- kept as systemPluginState.rootCancel, called by broadcastCleanup
 	}
 	leaseCtx, leaseCancel := context.WithCancel(st.rootCtx)
 	r.mu.Unlock()
@@ -2032,7 +2032,7 @@ func setStagedChainMode(root, dir string) error {
 		return err
 	}
 	for _, d := range chain {
-		if err := os.Chmod(d, stagedDirMode); err != nil {
+		if err := os.Chmod(d, stagedDirMode); err != nil { // #nosec G302 -- 0711 lets the dropped plugin uid traverse but not list (design 30)
 			return err
 		}
 	}
@@ -2105,7 +2105,7 @@ func stagedArtifactMatches(path, wantSHA256 string, l stagedLayout) error {
 	if wantSHA256 == "" {
 		return fmt.Errorf("%w: no verified digest is recorded for %s", errStagedArtifactChanged, path)
 	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) // #nosec G304 -- the runner's own staged path, opened with O_NOFOLLOW
 	if err != nil {
 		return fmt.Errorf("%w: %v", errStagedArtifactChanged, err)
 	}
@@ -2146,11 +2146,11 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Chmod(mode); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {

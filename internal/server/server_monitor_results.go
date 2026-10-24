@@ -161,7 +161,7 @@ func (s *Server) ingestAgentMonitorResults(nodeID string, results []model.Monito
 	for i, out := range outcomes {
 		switch {
 		case out.Dropped != "":
-			resp.Dropped = append(resp.Dropped, agentMonitorResultDrop{Index: i, MonitorID: results[i].MonitorID, Reason: out.Dropped})
+			resp.Dropped = append(resp.Dropped, agentMonitorResultDrop{Index: i, MonitorID: results[i].MonitorID, Reason: out.Dropped}) // #nosec G602 -- len(outcomes) == len(results) is checked above
 			if _, seen := firstDrop[out.Dropped]; !seen {
 				firstDrop[out.Dropped] = i
 				dropReasons = append(dropReasons, out.Dropped)

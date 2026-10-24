@@ -24,7 +24,7 @@ func processRSS() (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	return pages * uint64(os.Getpagesize()), true
+	return pages * uint64(os.Getpagesize()), true // #nosec G115 -- the page size is positive
 }
 
 // hostLoad reads the 1, 5 and 15 minute load averages. Inside a container

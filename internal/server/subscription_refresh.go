@@ -238,7 +238,7 @@ func (s *Server) snapshotForGeneration(ctx context.Context, pluginID, subscripti
 	flight := &subscriptionRefreshFlight{done: make(chan struct{}), force: force}
 	s.subscriptionRefreshFlights[key] = flight
 	s.subscriptionRefreshMu.Unlock()
-	go func() {
+	go func() { // #nosec G118 -- a shared flight outlives any one waiter's request; it has its own timeout
 		refreshCtx, cancel := context.WithTimeout(context.Background(), subscriptionRefreshTimeout)
 		defer cancel()
 		flight.snapshot, flight.err = s.refreshSubscriptionSnapshot(refreshCtx, pluginID, subscriptionID, force)

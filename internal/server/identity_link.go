@@ -100,7 +100,7 @@ const (
 	identityLineProtocol          = "protocol_unsupported"
 	identityLineNotApplied        = "credential_not_applied"
 	identityLineRotationPending   = "rotation_not_applied"
-	identityLineCredentialUnknown = "credential_unknown"
+	identityLineCredentialUnknown = "credential_unknown" // #nosec G101 -- a status code, not a credential
 	identityLineParked            = "parked_on_line"
 	identityLineNoTemplate        = "no_client_template"
 	identityLineTemplateLossy     = "template_lossy"
@@ -693,7 +693,7 @@ func (s *Server) convertIdentityLinkShared(ctx context.Context, key subscription
 		flight = &shareRenderFlight{done: make(chan struct{})}
 		s.identityConvertFlights[flightKey] = flight
 		entries = append([]string(nil), entries...)
-		go func() {
+		go func() { // #nosec G118 -- a shared flight outlives any one waiter's request; it has its own timeout
 			convertCtx, cancel := context.WithTimeout(context.Background(), identityLinkConvertTimeout)
 			defer cancel()
 			outcome := s.convertIdentityLinkOnce(convertCtx, key, version, entries, variant)

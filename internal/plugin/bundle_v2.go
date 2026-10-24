@@ -93,7 +93,7 @@ func ExtractBundleV2(cacheDir string, manifest Manifest, artifact []byte, platfo
 	if err != nil {
 		return ExtractedBundle{}, fmt.Errorf("create bundle staging directory: %w", err)
 	}
-	if err := os.Chmod(staging, 0o700); err != nil {
+	if err := os.Chmod(staging, 0o700); err != nil { // #nosec G302 -- a directory needs the execute bit; owner only
 		_ = os.RemoveAll(staging)
 		return ExtractedBundle{}, fmt.Errorf("secure bundle staging directory: %w", err)
 	}
@@ -198,7 +198,7 @@ func prepareBundleCache(cacheDir string) (string, error) {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return "", errors.New("bundle cache must resolve to a directory")
 	}
-	if err := os.Chmod(resolved, 0o700); err != nil {
+	if err := os.Chmod(resolved, 0o700); err != nil { // #nosec G302 -- a directory needs the execute bit; owner only
 		return "", fmt.Errorf("secure bundle cache: %w", err)
 	}
 	return resolved, nil
@@ -247,7 +247,7 @@ func extractBundleArchive(root string, artifact []byte, runtimeEntry string, lim
 			if err := os.MkdirAll(dst, 0o700); err != nil {
 				return nil, fmt.Errorf("create bundle directory %q: %w", rel, err)
 			}
-			if err := os.Chmod(dst, 0o700); err != nil {
+			if err := os.Chmod(dst, 0o700); err != nil { // #nosec G302 -- a directory needs the execute bit; owner only
 				return nil, fmt.Errorf("secure bundle directory %q: %w", rel, err)
 			}
 			continue
@@ -266,7 +266,7 @@ func extractBundleArchive(root string, artifact []byte, runtimeEntry string, lim
 		if rel == runtimeEntry {
 			mode = 0o700
 		}
-		file, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		file, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode) // #nosec G304 -- rel passed normalizeArchivePath and dst is inside a fresh staging dir
 		if err != nil {
 			return nil, fmt.Errorf("create bundle file %q: %w", rel, err)
 		}
@@ -404,7 +404,7 @@ func treeDirectories(root string) (map[string]bool, error) {
 }
 
 func digestFile(filePath string) (string, error) {
-	file, err := os.Open(filePath)
+	file, err := os.Open(filePath) // #nosec G304 -- callers pass files of the tree this package extracted
 	if err != nil {
 		return "", err
 	}
@@ -439,7 +439,7 @@ func syncTree(root string) error {
 }
 
 func syncDir(dir string) error {
-	file, err := os.Open(dir)
+	file, err := os.Open(dir) // #nosec G304 -- callers pass directories of the tree this package extracted
 	if err != nil {
 		return err
 	}
@@ -465,7 +465,7 @@ func secureDirectoryChain(root, leaf string) error {
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("bundle cache path %q is not a regular directory", current)
 		}
-		if err := os.Chmod(current, 0o700); err != nil {
+		if err := os.Chmod(current, 0o700); err != nil { // #nosec G302 -- a directory needs the execute bit; owner only
 			return fmt.Errorf("secure bundle cache directory: %w", err)
 		}
 	}
@@ -509,7 +509,7 @@ func ReadVerifiedBundleFile(loaded Loaded, rel string) ([]byte, BundleFile, erro
 	if err := validateRuntimePath(loaded.ExtractedRoot, filePath, os.FileMode(want.Mode)); err != nil {
 		return nil, BundleFile{}, err
 	}
-	data, err := os.ReadFile(filePath)
+	data, err := os.ReadFile(filePath) // #nosec G304 -- rel is inventory-pinned and validateRuntimePath checked the path
 	if err != nil {
 		return nil, BundleFile{}, err
 	}

@@ -235,7 +235,7 @@ func requireDevPublisher(publisher string) error {
 }
 
 func readSeed(path string) (ed25519.PrivateKey, ed25519.PublicKey, error) {
-	seed, err := os.ReadFile(path)
+	seed, err := os.ReadFile(path) // #nosec G304 -- the seed path is this tool's own flag
 	if err != nil {
 		return nil, nil, fmt.Errorf("read seed: %w", err)
 	}

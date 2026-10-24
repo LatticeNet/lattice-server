@@ -833,6 +833,30 @@ type matrixGroup struct {
 	Color string `json:"color"`
 }
 
+type matrixExcludedNode struct {
+	ID   string `json:"id"`
+	Name string `json:"name,omitempty"`
+}
+
+// matrixExclusion is the members one policy leaves out of a row: nodes of
+// the row's group for a group row, any node for the fleet row. Nodes the
+// reader may not read under netpolicy:read are counted in Hidden, not named.
+type matrixExclusion struct {
+	From     string               `json:"from,omitempty"`
+	PolicyID string               `json:"policy_id"`
+	Label    string               `json:"label"`
+	Nodes    []matrixExcludedNode `json:"nodes"`
+	Hidden   int                  `json:"hidden,omitempty"`
+}
+
+// matrixFleetRow is the row of policies that target the whole fleet. It is
+// sent only when one exists, and its cells carry no source group.
+type matrixFleetRow struct {
+	Cells      []matrixCell      `json:"cells"`
+	External   int               `json:"external"`
+	Exclusions []matrixExclusion `json:"exclusions"`
+}
+
 func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -857,15 +881,67 @@ func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p
 	cells := map[string]*agg{} // key: from|to
 	external := map[string]int{}
 	// The matrix is the group-pair view of outbound policy: a row is a node
-	// group a policy targets. A policy that targets only nodes or the whole
-	// fleet has no group row and is read on the policy page instead, and a
-	// group row does not show a policy's exclusions, so it reads a cell as
-	// the group's even when some members are left out.
-	for _, gp := range s.store.GroupPolicies() {
-		if !gp.Enabled {
+	// group a policy targets, plus one fleet row (source "") for policies
+	// that target the whole fleet. A policy that targets only nodes has no
+	// row and is read on the policy page instead. Each row lists the members
+	// a policy excludes, so a cell is not read as the whole group's when some
+	// members are left out.
+	nodes := s.store.Nodes()
+	resolved := groups.ResolveAll(gs, nodes)
+	nodeNames, groupNames := nodeNamesOf(nodes), groupNamesOf(gs)
+	exclusions := make([]matrixExclusion, 0)
+	fleetExclusions := make([]matrixExclusion, 0)
+	hasFleet := false
+	policies := s.store.GroupPolicies()
+	sort.Slice(policies, func(i, j int) bool {
+		if policies[i].Priority != policies[j].Priority {
+			return policies[i].Priority < policies[j].Priority
+		}
+		return policies[i].ID < policies[j].ID
+	})
+	for _, gp := range policies {
+		if !gp.Enabled || !policyHasRuleIn(gp, direction) {
 			continue
 		}
-		for _, from := range gp.TargetScope().Groups {
+		sel := gp.TargetScope()
+		rows := append([]string(nil), sel.Groups...)
+		if sel.All {
+			hasFleet = true
+			rows = append(rows, "")
+		}
+		target, hidden := viewerTarget(p, sel)
+		label := outboundPolicyLabel(gp.Name, target, hidden, groupNames, nodeNames)
+		for _, from := range rows {
+			var members map[string]bool
+			if from != "" {
+				members = make(map[string]bool, len(resolved[from]))
+				for _, nodeID := range resolved[from] {
+					members[nodeID] = true
+				}
+			}
+			ex := matrixExclusion{From: from, PolicyID: gp.ID, Label: label, Nodes: make([]matrixExcludedNode, 0)}
+			for _, nodeID := range sel.Exclude {
+				// An exclusion outlives its node; one that names no member of
+				// the row changes nothing on it.
+				if _, known := nodeNames[nodeID]; !known || (members != nil && !members[nodeID]) {
+					continue
+				}
+				if rbac.Allows(p.Principal, "netpolicy:read", nodeID) {
+					ex.Nodes = append(ex.Nodes, matrixExcludedNode{ID: nodeID, Name: nodeNames[nodeID]})
+				} else {
+					ex.Hidden++
+				}
+			}
+			if len(ex.Nodes)+ex.Hidden == 0 {
+				continue
+			}
+			if from == "" {
+				fleetExclusions = append(fleetExclusions, ex)
+			} else {
+				exclusions = append(exclusions, ex)
+			}
+		}
+		for _, from := range rows {
 			for _, rule := range gp.Rules {
 				if rule.Disabled || strings.ToLower(rule.Direction) != direction {
 					continue
@@ -893,6 +969,7 @@ func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p
 	}
 
 	out := make([]matrixCell, 0, len(cells))
+	fleetCells := make([]matrixCell, 0)
 	for key, a := range cells {
 		parts := strings.SplitN(key, "|", 2)
 		action := "allow"
@@ -908,8 +985,13 @@ func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p
 			RuleCount: a.count,
 			Mixed:     a.actions["allow"] && a.actions["deny"],
 		}
+		if cell.From == "" {
+			fleetCells = append(fleetCells, cell)
+			continue
+		}
 		out = append(out, cell)
 	}
+	sort.Slice(fleetCells, func(i, j int) bool { return fleetCells[i].To < fleetCells[j].To })
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].From != out[j].From {
 			return out[i].From < out[j].From
@@ -918,16 +1000,36 @@ func (s *Server) handleNetPolicyMatrix(w http.ResponseWriter, r *http.Request, p
 	})
 	ext := make([]map[string]any, 0, len(external))
 	for from, n := range external {
+		if from == "" {
+			continue
+		}
 		ext = append(ext, map[string]any{"from": from, "rule_count": n})
 	}
 	sort.Slice(ext, func(i, j int) bool { return ext[i]["from"].(string) < ext[j]["from"].(string) })
+	sort.SliceStable(exclusions, func(i, j int) bool { return exclusions[i].From < exclusions[j].From })
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"direction": direction,
-		"groups":    mgs,
-		"cells":     out,
-		"external":  ext,
-	})
+	body := map[string]any{
+		"direction":  direction,
+		"groups":     mgs,
+		"cells":      out,
+		"external":   ext,
+		"exclusions": exclusions,
+	}
+	if hasFleet {
+		body["fleet"] = matrixFleetRow{Cells: fleetCells, External: external[""], Exclusions: fleetExclusions}
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// policyHasRuleIn reports whether a policy has an enabled rule in the
+// matrix direction, which is what puts it on a row.
+func policyHasRuleIn(gp model.GroupNetPolicy, direction string) bool {
+	for _, rule := range gp.Rules {
+		if !rule.Disabled && strings.ToLower(rule.Direction) == direction {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeys(m map[string]bool) []string {

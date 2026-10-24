@@ -65,12 +65,19 @@ func rollbackSnapshotOf(t *testing.T, srv *Server, st *store.Store) rollbackSnap
 		if ps.monitorID == "" {
 			continue
 		}
-		source := strings.SplitN(key, "~", 2)[0]
-		rows, err := st.MonitorPairResultsBetween(ps.monitorID, source, rollbackRunsFrom, rollbackRunsTo)
-		if err != nil {
-			t.Fatal(err)
+		// The runs the pair's series reads: its monitor's, and those of any
+		// monitor its check joins for the pair's history (a split pair's
+		// adopted monitor), each under the id that holds them.
+		source, target, _ := strings.Cut(key, "~")
+		for _, monitorID := range pairHistoryMonitors(srv, source, target, ps.monitorID) {
+			rows, err := st.MonitorPairResultsBetween(monitorID, source, rollbackRunsFrom, rollbackRunsTo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) > 0 || monitorID == ps.monitorID {
+				snap.Runs[monitorID+"/"+source] = len(rows)
+			}
 		}
-		snap.Runs[ps.monitorID+"/"+source] = len(rows)
 	}
 	for _, def := range st.CheckDefinitions() {
 		snap.Definitions = append(snap.Definitions, rollbackDefinition{ID: def.ID, Type: def.Type, Enabled: def.Enabled, Targets: def.Targets, Sources: def.Sources, Adopted: def.Adopted})
@@ -80,6 +87,24 @@ func rollbackSnapshotOf(t *testing.T, srv *Server, st *store.Store) rollbackSnap
 	}
 	sort.Strings(snap.Monitors)
 	return snap
+}
+
+// pairHistoryMonitors are the monitors the series of the check measuring
+// (source, target) on monitorID reads, monitorID alone when no check holds
+// it (the unmigrated path set).
+func pairHistoryMonitors(srv *Server, source, target, monitorID string) []string {
+	for _, pc := range srv.pairChecksFor(principal{Principal: adminPrincipalForTest()}, source, target, srv.now()) {
+		var ids []string
+		held := false
+		for _, c := range pc.checks {
+			ids = append(ids, c.monitorID)
+			held = held || c.monitorID == monitorID
+		}
+		if held {
+			return ids
+		}
+	}
+	return []string{monitorID}
 }
 
 func writeRollbackSnapshot(t *testing.T, path string, snap rollbackSnapshot) {
@@ -180,11 +205,27 @@ func rollbackProduce(t *testing.T, dir string) {
 		t.Fatalf("migrate = %v %v", migrated, err)
 	}
 	after := rollbackSnapshotOf(t, srv, st)
+	split := 0
 	for key, want := range before.Pairs {
-		if got := after.Pairs[key]; got.Measure == model.PathMeasured && got != want {
-			t.Fatalf("pair %s: path set %+v, Fleet mesh %+v", key, want, got)
+		got := after.Pairs[key]
+		if got.Measure != model.PathMeasured {
+			continue
+		}
+		if got.MonitorID == want.MonitorID {
+			if got != want {
+				t.Fatalf("pair %s: path set %+v, Fleet mesh %+v", key, want, got)
+			}
+			continue
+		}
+		// A pair whose path set monitor another definition adopted: the same
+		// method, and the history it had still read on the pair.
+		split++
+		history := want.MonitorID + "/" + strings.SplitN(key, "~", 2)[0]
+		if got.Method != want.Method || after.Runs[history] != before.Runs[history] || before.Runs[history] == 0 {
+			t.Fatalf("split pair %s: path set %+v with %d runs, Fleet mesh %+v reads %d", key, want, before.Runs[history], got, after.Runs[history])
 		}
 	}
+	t.Logf("pairs on a new monitor with their history joined: %d", split)
 	writeRollbackSnapshot(t, filepath.Join(dir, "produce.json"), after)
 	t.Logf("produced: %d pairs, %d monitors, definitions %+v", len(after.Pairs), len(after.Monitors), after.Definitions)
 }

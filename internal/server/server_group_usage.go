@@ -41,7 +41,7 @@ var groupUseSources = []groupUseSource{
 }
 
 func (s *Server) outboundPolicyGroupUses(groupID string, viewer *principal) []groupUse {
-	names := groupNamesOf(s.store.Groups())
+	names, nodeNames := groupNamesOf(s.store.Groups()), nodeNamesOf(s.store.Nodes())
 	out := make([]groupUse, 0)
 	for _, gp := range s.store.GroupPolicies() {
 		if !store.GroupPolicyNamesGroup(gp, groupID) {
@@ -57,7 +57,7 @@ func (s *Server) outboundPolicyGroupUses(groupID string, viewer *principal) []gr
 		if viewer != nil {
 			target, hidden = viewerTarget(*viewer, target)
 		}
-		out = append(out, groupUse{Kind: groupUseOutboundPolicy, ID: gp.ID, Label: outboundPolicyLabel(gp.Name, target, hidden, names), Role: role})
+		out = append(out, groupUse{Kind: groupUseOutboundPolicy, ID: gp.ID, Label: outboundPolicyLabel(gp.Name, target, hidden, names, nodeNames), Role: role})
 	}
 	return out
 }
@@ -148,7 +148,11 @@ func (s *Server) groupInUseMessage(p principal, groupID string, inUse *store.Gro
 	if len(parts) == 0 {
 		return inUse.Error()
 	}
-	return fmt.Sprintf("node group %q is in use, so it was not deleted: %s. Reparent the children and change or delete the rest first.", name, strings.Join(parts, ", "))
+	next := "Change or delete them first."
+	if len(inUse.ChildIDs) > 0 {
+		next = "Reparent the child groups and change or delete the rest first."
+	}
+	return fmt.Sprintf("node group %q is in use, so it was not deleted: %s. %s", name, strings.Join(parts, ", "), next)
 }
 
 func groupUseNoun(kind string, n int) string {

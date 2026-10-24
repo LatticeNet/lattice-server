@@ -65,7 +65,7 @@ func (s *Server) toGroupPolicyView(p principal, gp model.GroupNetPolicy, nodes [
 		GroupRuleCount:    len(gp.Rules),
 		Target:            target,
 		TargetNodeIDs:     readable,
-		Label:             outboundPolicyLabel(gp.Name, target, hidden, groupNamesOf(groupList)),
+		Label:             outboundPolicyLabel(gp.Name, target, hidden, groupNamesOf(groupList), nodeNamesOf(nodes)),
 		HiddenTargetNodes: hidden,
 	}
 }
@@ -102,6 +102,14 @@ func viewerTarget(p principal, sel model.TargetSelector) (model.TargetSelector, 
 	}, hidden
 }
 
+func nodeNamesOf(nodes []model.Node) map[string]string {
+	out := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		out[n.ID] = n.Name
+	}
+	return out
+}
+
 func groupNamesOf(groupList []model.Group) map[string]string {
 	out := make(map[string]string, len(groupList))
 	for _, g := range groupList {
@@ -112,41 +120,47 @@ func groupNamesOf(groupList []model.Group) map[string]string {
 
 // outboundPolicyLabel names a policy: its name, or "targeting" and a short
 // description of its target as the reader may see it (viewerTarget), with
-// the nodes left out counted. Nodes appear by id, the form every policy view
-// already carries in its scope, and groups by name.
-func outboundPolicyLabel(name string, sel model.TargetSelector, hidden int, groupNames map[string]string) string {
+// the nodes left out counted. Nodes and groups appear by name, the way the
+// console lists the policy, and by id when they have no name or no record.
+// Only nodes viewerTarget kept are named, so a confined reader learns no
+// name it could not read.
+func outboundPolicyLabel(name string, sel model.TargetSelector, hidden int, groupNames, nodeNames map[string]string) string {
 	if name = strings.TrimSpace(name); name != "" {
 		return name
 	}
-	label := "targeting " + describeTargetSelector(sel, groupNames)
+	label := "targeting " + describeTargetSelector(sel, groupNames, nodeNames)
 	if hidden > 0 {
 		label += fmt.Sprintf(" (and %d node(s) you cannot read)", hidden)
 	}
 	return label
 }
 
-func describeTargetSelector(sel model.TargetSelector, groupNames map[string]string) string {
+func describeTargetSelector(sel model.TargetSelector, groupNames, nodeNames map[string]string) string {
+	named := func(names map[string]string, ids []string) []string {
+		out := make([]string, 0, len(ids))
+		for _, id := range ids {
+			if name := names[id]; name != "" {
+				out = append(out, name)
+			} else {
+				out = append(out, id)
+			}
+		}
+		return out
+	}
+	excluded := named(nodeNames, sel.Exclude)
 	if sel.All {
-		if len(sel.Exclude) == 0 {
+		if len(excluded) == 0 {
 			return "the whole fleet"
 		}
-		return "the whole fleet except " + shortList(sel.Exclude)
+		return "the whole fleet except " + shortList(excluded)
 	}
-	names := make([]string, 0, len(sel.Groups)+len(sel.Nodes))
-	for _, gid := range sel.Groups {
-		if name := groupNames[gid]; name != "" {
-			names = append(names, name)
-		} else {
-			names = append(names, gid)
-		}
-	}
-	names = append(names, sel.Nodes...)
+	names := append(named(groupNames, sel.Groups), named(nodeNames, sel.Nodes)...)
 	if len(names) == 0 {
 		return "nothing"
 	}
 	out := shortList(names)
-	if len(sel.Exclude) > 0 {
-		out += " except " + shortList(sel.Exclude)
+	if len(excluded) > 0 {
+		out += " except " + shortList(excluded)
 	}
 	return out
 }
@@ -420,7 +434,8 @@ func (s *Server) upsertGroupPolicy(req model.GroupNetPolicy, scope model.TargetS
 		Metadata: map[string]string{
 			"group_policy_id": stored.ID,
 			"scope_group_id":  stored.ScopeGroupID,
-			"target":          describeTargetSelector(stored.TargetScope(), groupNamesOf(groupList)),
+			// The audit keeps node ids, which stay stable across renames.
+			"target": describeTargetSelector(stored.TargetScope(), groupNamesOf(groupList), nil),
 		},
 	})
 	return s.toGroupPolicyView(p, stored, s.store.Nodes(), groupList), nil

@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/LatticeNet/lattice-sdk/model"
 )
 
 type groupUseOut struct {
@@ -56,6 +58,10 @@ func TestNodeGroupUsedByAndDeleteRefusalNameTheUsers(t *testing.T) {
 	code, raw := del(web.ID)
 	if code != http.StatusConflict || !strings.Contains(raw, "web egress") {
 		t.Fatalf("deleting a target group: want 409 naming the policy, got %d %s", code, raw)
+	}
+	// Web has no child groups, so the refusal does not ask to reparent any.
+	if strings.Contains(raw, "Reparent") || strings.Contains(raw, "children") {
+		t.Fatalf("a refusal with no child groups must not mention children: %s", raw)
 	}
 	// A group named only as a remote was deletable before, which left a rule
 	// pointing at nothing. It is in use now too.
@@ -122,5 +128,30 @@ func TestConfinedViewerSeesNoNodeIDsOutsideItsAllowlist(t *testing.T) {
 	}
 	if !strings.Contains(raw, "1 outbound policy") {
 		t.Fatalf("refused delete must still say why: %s", raw)
+	}
+}
+
+// An unnamed policy is labelled by its target in node and group names, the
+// way the console lists it, so Used by and a refused group delete name a
+// policy the operator can find on the outbound policy page. A node or group
+// with no record keeps its id.
+func TestOutboundPolicyLabelNamesNodesAndGroups(t *testing.T) {
+	groups := map[string]string{"g-web": "Web edge"}
+	nodes := map[string]string{"hk-edge-2": "[Metix]-HK-Edge-2", "sg-1": "[Metix]-SG-1"}
+	cases := []struct {
+		sel  model.TargetSelector
+		want string
+	}{
+		{model.TargetSelector{All: true, Exclude: []string{"hk-edge-2"}}, "targeting the whole fleet except [Metix]-HK-Edge-2"},
+		{model.TargetSelector{Groups: []string{"g-web", "g-gone"}, Nodes: []string{"sg-1", "gone"}}, "targeting Web edge, g-gone, [Metix]-SG-1 and 1 more"},
+		{model.TargetSelector{Groups: []string{"g-web"}, Exclude: []string{"sg-1"}}, "targeting Web edge except [Metix]-SG-1"},
+	}
+	for _, c := range cases {
+		if got := outboundPolicyLabel("", c.sel, 0, groups, nodes); got != c.want {
+			t.Errorf("label(%+v) = %q, want %q", c.sel, got, c.want)
+		}
+	}
+	if got := outboundPolicyLabel(" web egress ", model.TargetSelector{All: true}, 0, groups, nodes); got != "web egress" {
+		t.Errorf("a named policy is labelled by its name, got %q", got)
 	}
 }

@@ -23,7 +23,7 @@ var checkT0 = time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC)
 func checkFleet(t *testing.T) (*Server, http.Handler, *store.Store) {
 	t.Helper()
 	srv, handler, st := newPathsServer(t)
-	srv.now = func() time.Time { return checkT0 }
+	serverClock(t, srv).set(checkT0)
 	all := []string{"beacon", "http", "icmp", "tcp"}
 	upsertNodes(t, st,
 		model.Node{ID: "node-sh", Name: "sh", PublicIP: "203.0.113.1", Online: true, ProbeMethods: all, Geo: &model.NodeGeo{Country: "CN"}, Tags: []string{"domestic"}},
@@ -911,7 +911,7 @@ func TestCheckDefinitionPacketBudgetKeepsRunningPairs(t *testing.T) {
 		}}
 	}
 	older := c.create(ping("older", model.TargetSelector{Groups: []string{"grp_src"}}))
-	srv.now = func() time.Time { return checkT0.Add(time.Minute) }
+	serverClock(t, srv).set(checkT0.Add(time.Minute))
 	newer := c.create(ping("newer", model.TargetSelector{Nodes: []string{"node-sh"}}))
 	if mon := definitionMonitors(st, newer.ID)[0]; len(mon.PausedNodeIDs) != 0 {
 		t.Fatalf("newer definition within the budget: %+v", mon)

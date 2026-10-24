@@ -10922,6 +10922,7 @@ func writeError(w http.ResponseWriter, status int, err error) {
 			Code:      publicAPIErrorCode(status, err),
 			Message:   apiErrorMessage(status, err),
 			RequestID: requestID,
+			Field:     apiErrorField(err),
 		},
 	})
 }

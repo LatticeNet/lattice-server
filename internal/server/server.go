@@ -7342,6 +7342,16 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 		return
 	}
+	// This route composes lattice_guard from NFTInputs and the request, and
+	// knows nothing of security groups. On a node NetGuard has adopted, the
+	// plan would replace the node's firewall with the legacy baseline and
+	// drop every bound group, so it is refused. An observe-only binding is
+	// only the record the port plan wrote; the legacy path still owns that
+	// node's table.
+	if s.nodeGuardManaged(req.NodeID) {
+		writeError(w, http.StatusConflict, errors.New("node is managed by NetGuard: plan its firewall with /api/netguard/plan; this legacy route would rebuild lattice_guard without the node's security groups"))
+		return
+	}
 	planInput := req.NFTPlan
 	source := "request"
 	if !nftPlanRequestHasInputs(planInput) {
@@ -8908,6 +8918,14 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 		if err := s.requireCurrentNetGuardApproval(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
+	}
+	// NetGuard is the only writer of lattice_guard on a node it manages. A
+	// legacy Network Guard plan made before the node was adopted, or one an
+	// auto-approve rule decides, would replace the adopted firewall with the
+	// legacy baseline; this path serves both, so it refuses here as well as
+	// at the plan route.
+	if approval.Plugin == "nft" && approval.Action == "apply-ruleset" && s.nodeGuardManaged(approval.NodeID) {
+		return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "node is managed by NetGuard, which is the only writer of its lattice_guard table; plan its firewall with /api/netguard/plan")}
 	}
 	if approval.Plugin == proxyCorePlugin {
 		if err := s.requireCurrentProxyCoreApproval(approval); err != nil {

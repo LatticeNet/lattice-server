@@ -475,6 +475,14 @@ func (s *Server) compileInputSnapshotFor(p principal, nodeID string) (netguard.C
 	}, snapshot, resolver, nil
 }
 
+// nodeGuardManaged reports whether NetGuard has adopted the node, the test
+// the beacon plan uses: an observe-only binding is only the record the port
+// plan writes for a node it looked at, and leaves the node on the legacy path.
+func (s *Server) nodeGuardManaged(nodeID string) bool {
+	binding, ok := s.store.NodeGuardBinding(nodeID)
+	return ok && binding.Managed
+}
+
 // beaconCompanionFor is the beacon companion rule set the node's applied
 // node.beacon plan put in force, nil when there is none. Every NetGuard
 // compile of the node carries it, so a NetGuard plan made later keeps the

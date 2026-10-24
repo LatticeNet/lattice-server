@@ -1572,6 +1572,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/netpolicy", s.withAuth("", s.handleNetPolicy))
 	mux.HandleFunc("/api/netpolicy/plan", s.withAuth("", s.handleNetPolicyPlan))
 	mux.HandleFunc("/api/netpolicy/delete", s.withAuth("", s.handleDeleteNetPolicy))
+	mux.HandleFunc("/api/netpolicy/convert", s.withAuth("", s.handleNetPolicyConvert))
 	mux.HandleFunc("/api/netpolicy/graph", s.withAuth("", s.handleNetPolicyGraph))
 	mux.HandleFunc("/api/groups", s.withAuth("", s.handleGroups))
 	mux.HandleFunc("/api/groups/delete", s.withAuth("group:admin", s.handleDeleteGroup))

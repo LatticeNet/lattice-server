@@ -31,10 +31,14 @@ type netPolicyView struct {
 	TargetNodeName string          `json:"target_node_name,omitempty"`
 	Rules          []model.NetRule `json:"rules"`
 	Enabled        bool            `json:"enabled"`
-	LastPlanSHA    string          `json:"last_plan_sha,omitempty"`
-	LastAppliedAt  time.Time       `json:"last_applied_at,omitzero"`
-	LastError      string          `json:"last_error,omitempty"`
-	UpdatedAt      time.Time       `json:"updated_at"`
+	// GroupDerived marks the node's document as built from outbound policies
+	// by the group plan, not authored on its own; only an authored one can be
+	// converted.
+	GroupDerived  bool      `json:"group_derived,omitempty"`
+	LastPlanSHA   string    `json:"last_plan_sha,omitempty"`
+	LastAppliedAt time.Time `json:"last_applied_at,omitzero"`
+	LastError     string    `json:"last_error,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 func (s *Server) handleNetPolicy(w http.ResponseWriter, r *http.Request, p principal) {
@@ -365,6 +369,7 @@ func (s *Server) toNetPolicyView(policy model.NetPolicy) netPolicyView {
 		TargetNodeName: nodeName,
 		Rules:          append([]model.NetRule(nil), policy.Rules...),
 		Enabled:        policy.Enabled,
+		GroupDerived:   policy.GroupDerived,
 		LastPlanSHA:    policy.LastPlanSHA,
 		LastAppliedAt:  policy.LastAppliedAt,
 		LastError:      policy.LastError,

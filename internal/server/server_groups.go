@@ -13,6 +13,7 @@ import (
 	"github.com/LatticeNet/lattice-server/internal/groups"
 	"github.com/LatticeNet/lattice-server/internal/id"
 	"github.com/LatticeNet/lattice-server/internal/rbac"
+	"github.com/LatticeNet/lattice-server/internal/store"
 )
 
 // Grouping (iter-063, Phase 1). A Group is a first-class organizational entity.
@@ -461,7 +462,13 @@ func (s *Server) handleDeleteGroup(w http.ResponseWriter, r *http.Request, p pri
 		return
 	}
 	if err := s.store.DeleteGroup(req.ID); err != nil {
-		// Store rejects delete when the group has children or is policy-referenced.
+		// Store rejects delete when the group has children or a policy names
+		// it; the refusal names every user so the operator can act on it.
+		var inUse *store.GroupInUseError
+		if errors.As(err, &inUse) {
+			writeError(w, http.StatusConflict, errors.New(s.groupInUseMessage(req.ID, inUse)))
+			return
+		}
 		writeError(w, http.StatusConflict, err)
 		return
 	}

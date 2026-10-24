@@ -1579,6 +1579,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/groups/reorder", s.withAuth("group:admin", s.handleReorderGroups))
 	mux.HandleFunc("/api/groups/members", s.withAuth("group:admin", s.handleGroupMembers))
 	mux.HandleFunc("/api/groups/preview", s.withAuth("group:read", s.handleGroupPreview))
+	mux.HandleFunc("/api/groups/used-by", s.withAuth("group:read", s.handleGroupUsedBy))
 	mux.HandleFunc("/api/groups/seed", s.withAuth("group:admin", s.handleGroupSeed))
 	mux.HandleFunc("/api/group-policies", s.withAuth("", s.handleGroupPolicy))
 	mux.HandleFunc("/api/group-policies/delete", s.withAuth("netpolicy:admin", s.handleDeleteGroupPolicy))

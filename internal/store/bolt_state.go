@@ -2883,19 +2883,12 @@ func (bs *BoltStateStore) DeleteGroup(id string) error {
 		if err != nil {
 			return err
 		}
-		for _, child := range groups {
-			if child.ParentID == id {
-				return fmt.Errorf("group %q has child group %q; reparent or delete children first", id, child.ID)
-			}
-		}
 		policies, err := listMapValues[model.GroupNetPolicy](tx, boltBucketGroupPolicies)
 		if err != nil {
 			return err
 		}
-		for _, gp := range policies {
-			if gp.ScopeGroupID == id {
-				return fmt.Errorf("group %q is referenced by group policy %q; delete the policy first", id, gp.ID)
-			}
+		if err := groupInUse(id, groups, policies); err != nil {
+			return err
 		}
 		return deleteRecord(tx, boltBucketGroups, id)
 	})

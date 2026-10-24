@@ -56,7 +56,7 @@ func TestNoteSingBoxLivenessDebounce(t *testing.T) {
 	s, st := newShareTestServer(t)
 	base := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
 	at := base
-	s.now = func() time.Time { return at }
+	serverClock(t, s).set(at)
 
 	probe := func(running bool, active string) *model.SingBoxRuntime {
 		return &model.SingBoxRuntime{Running: running, ActiveState: active, ProbedAt: at}
@@ -71,6 +71,7 @@ func TestNoteSingBoxLivenessDebounce(t *testing.T) {
 
 	// Goes down: recorded immediately, not yet notified (hold).
 	at = base.Add(10 * time.Second)
+	serverClock(t, s).set(at)
 	s.noteSingBoxLiveness("node-x", probe(false, "failed"))
 	rec, _ = st.SingBoxLivenessRecord("node-x")
 	if rec.State != "down" || rec.ProblemSince != at || !rec.NotifiedDownAt.IsZero() {
@@ -79,6 +80,7 @@ func TestNoteSingBoxLivenessDebounce(t *testing.T) {
 
 	// Still down within the hold: still silent.
 	at = base.Add(40 * time.Second)
+	serverClock(t, s).set(at)
 	s.noteSingBoxLiveness("node-x", probe(false, "failed"))
 	if rec, _ = st.SingBoxLivenessRecord("node-x"); !rec.NotifiedDownAt.IsZero() {
 		t.Fatalf("notified inside the hold: %+v", rec)
@@ -86,6 +88,7 @@ func TestNoteSingBoxLivenessDebounce(t *testing.T) {
 
 	// Past the hold: notified exactly once.
 	at = base.Add(2 * time.Minute)
+	serverClock(t, s).set(at)
 	s.noteSingBoxLiveness("node-x", probe(false, "failed"))
 	rec, _ = st.SingBoxLivenessRecord("node-x")
 	firstNotified := rec.NotifiedDownAt
@@ -93,6 +96,7 @@ func TestNoteSingBoxLivenessDebounce(t *testing.T) {
 		t.Fatalf("hold elapsed but not notified: %+v", rec)
 	}
 	at = base.Add(3 * time.Minute)
+	serverClock(t, s).set(at)
 	s.noteSingBoxLiveness("node-x", probe(false, "failed"))
 	if rec, _ = st.SingBoxLivenessRecord("node-x"); rec.NotifiedDownAt != firstNotified {
 		t.Fatalf("second notification for one episode: %+v", rec)
@@ -100,6 +104,7 @@ func TestNoteSingBoxLivenessDebounce(t *testing.T) {
 
 	// A probe outage mid-incident must not reset the episode.
 	at = base.Add(4 * time.Minute)
+	serverClock(t, s).set(at)
 	s.noteSingBoxLiveness("node-x", &model.SingBoxRuntime{})
 	rec, _ = st.SingBoxLivenessRecord("node-x")
 	if rec.State != "unknown" || rec.ProblemSince.IsZero() || rec.NotifiedDownAt != firstNotified {
@@ -108,6 +113,7 @@ func TestNoteSingBoxLivenessDebounce(t *testing.T) {
 
 	// Recovery clears the episode.
 	at = base.Add(5 * time.Minute)
+	serverClock(t, s).set(at)
 	s.noteSingBoxLiveness("node-x", probe(true, "active"))
 	rec, _ = st.SingBoxLivenessRecord("node-x")
 	if rec.State != "running" || !rec.ProblemSince.IsZero() || !rec.NotifiedDownAt.IsZero() {

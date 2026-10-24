@@ -19,7 +19,7 @@ func newNetworkPluginRPCServer(t *testing.T) (*Server, *store.Store, context.Con
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +280,7 @@ func TestWireGuardPlanRefusesPeersTheSessionCannotRead(t *testing.T) {
 func TestWireGuardOverviewSaysNeverReportedWithoutYearOne(t *testing.T) {
 	srv, st, ctx := newNetworkPluginRPCServer(t)
 	now := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	for _, n := range []model.Node{
 		{ID: "n-never", Name: "fresh-box", WireGuardIP: "10.9.0.1", WireGuardPublicKey: "k1"},
 		{ID: "n-online", Name: "beating", Online: true, LastSeen: now.Add(-10 * time.Second)},

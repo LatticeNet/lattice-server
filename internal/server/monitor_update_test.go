@@ -194,7 +194,7 @@ func TestMonitorUpdateIsNodeScoped(t *testing.T) {
 func TestNonPagingMonitorsOpenNoIncidents(t *testing.T) {
 	srv, _, st := newPathsServer(t)
 	now := time.Now().UTC()
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	upsertNodes(t, st, model.Node{ID: "node-a", Name: "a", Online: true, LastSeen: now})
 	for _, mon := range []model.Monitor{
 		{ID: latencyMonitorID("node-t"), Name: "Latency to t", Type: model.MonitorTypeTCP, Target: "203.0.113.2:443", IntervalSec: 60, TimeoutSec: 5, NodeIDs: []string{"node-a"}, Enabled: true, ManagedBy: model.MonitorManagedLatency},
@@ -327,7 +327,7 @@ func TestGeneratedCheckWithHistoryOutlivesConfigurationChanges(t *testing.T) {
 func TestLatencyHistoryKeepsItsIDsUnderTheNewTiers(t *testing.T) {
 	srv, _, st := newPathsServer(t)
 	now := time.Now().UTC()
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	upsertNodes(t, st,
 		model.Node{ID: "node-sh", Name: "cd-hs-sh", Online: true, Geo: &model.NodeGeo{Country: "CN"}},
 		model.Node{ID: "node-jp", Name: "jp", PublicIP: "203.0.113.3", Online: true, Geo: &model.NodeGeo{Country: "JP"}},

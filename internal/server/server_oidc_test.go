@@ -133,7 +133,7 @@ func newOIDCServer(t *testing.T, clients ...*http.Client) (*Server, *store.Store
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: "correct horse battery staple", PublicURL: "https://lattice.test"})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: "correct horse battery staple", PublicURL: "https://lattice.test"})
 	if err != nil {
 		t.Fatal(err)
 	}

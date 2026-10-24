@@ -21,7 +21,7 @@ func TestALaggingNodeClockKeepsItsLinesInTheReadModel(t *testing.T) {
 	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
 
 	now := time.Date(2026, 10, 3, 16, 24, 32, 0, time.UTC)
-	f.srv.now = func() time.Time { return now }
+	serverClock(t, f.srv).set(now)
 	logs := &bytes.Buffer{}
 	f.srv.logger = log.New(logs, "", 0)
 
@@ -53,6 +53,7 @@ func TestALaggingNodeClockKeepsItsLinesInTheReadModel(t *testing.T) {
 	// The next report a minute later is still behind; the notice stays quiet
 	// within the hour, and the lines stay.
 	now = now.Add(time.Minute)
+	serverClock(t, f.srv).set(now)
 	post(now.Add(-130 * time.Second))
 	if got := linesOf("node-a"); got != 1 {
 		t.Fatalf("lines after a second lagging report = %d, want 1", got)
@@ -63,6 +64,7 @@ func TestALaggingNodeClockKeepsItsLinesInTheReadModel(t *testing.T) {
 
 	// An hour on, the notice repeats once.
 	now = now.Add(time.Hour)
+	serverClock(t, f.srv).set(now)
 	post(now.Add(-130 * time.Second))
 	if n := strings.Count(logs.String(), "stamps its inventory"); n != 2 {
 		t.Fatalf("skew notices after an hour = %d, want 2", n)
@@ -71,6 +73,7 @@ func TestALaggingNodeClockKeepsItsLinesInTheReadModel(t *testing.T) {
 	// The mirror still expires a node that stops reporting, judged by the
 	// control plane's clock.
 	now = now.Add(nodeOfflineThreshold + time.Second)
+	serverClock(t, f.srv).set(now)
 	if got := linesOf("node-a"); got != 0 {
 		t.Fatalf("lines after %s without a report = %d, want 0", nodeOfflineThreshold, got)
 	}

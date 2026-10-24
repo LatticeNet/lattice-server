@@ -18,7 +18,7 @@ func flightShareServer(t *testing.T) (*Server, *store.Store, string) {
 	t.Helper()
 	s, st := newShareTestServer(t)
 	now := time.Unix(1_700_000_000, 0).UTC()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	token := strings.Repeat("f", 32)
 	mustUpsertShare(t, st, model.SubscriptionShare{ID: "s1", Slug: "team", Token: token, Enabled: true,
 		Source: model.ShareSource{Kind: model.ShareSourcePlugin, PluginID: "p", SubscriptionID: "rec"}})
@@ -198,7 +198,7 @@ func TestCoreShareReflectsASuspensionOnTheNextFetch(t *testing.T) {
 func TestAnUnchangedRefreshExtendsInsteadOfRendering(t *testing.T) {
 	s, _, path := flightShareServer(t)
 	now := s.now()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	var renders, fetches atomic.Int64
 	s.subscriptionRender = flightRender(s, &renders, nil)
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
@@ -215,6 +215,7 @@ func TestAnUnchangedRefreshExtendsInsteadOfRendering(t *testing.T) {
 	}
 	first := fetch()
 	now = now.Add(subscriptionCacheTTL + time.Minute)
+	serverClock(t, s).set(now)
 	if got := fetch(); got != first {
 		t.Fatalf("body changed across an identical refresh: %q then %q", first, got)
 	}
@@ -236,7 +237,7 @@ func TestAnUnchangedRefreshExtendsInsteadOfRendering(t *testing.T) {
 func TestOutageRetriesDoNotRepublishTheStaleBody(t *testing.T) {
 	s, _, path := flightShareServer(t)
 	now := s.now()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	var renders, fetches atomic.Int64
 	s.subscriptionRender = func(_ context.Context, share model.SubscriptionShare, _, _ string, _ shareRenderVariant, snap model.SubscriptionSnapshot) (renderedSubscription, error) {
 		renders.Add(1)
@@ -254,12 +255,14 @@ func TestOutageRetriesDoNotRepublishTheStaleBody(t *testing.T) {
 		return rec
 	}
 	now = now.Add(subscriptionRefreshInterval + time.Minute)
+	serverClock(t, s).set(now)
 	if rec := fetch(); rec.Code != http.StatusOK || rec.Header().Get("X-Lattice-Subscription-Stale") != "true" {
 		t.Fatalf("first outage fetch answered %d stale=%q", rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"))
 	}
 	rendersAfterFirst := renders.Load()
 	for i := 0; i < 3; i++ {
 		now = now.Add(subscriptionStaleRetryInterval + time.Second)
+		serverClock(t, s).set(now)
 		if rec := fetch(); rec.Code != http.StatusOK || rec.Header().Get("X-Lattice-Subscription-Stale") != "true" {
 			t.Fatalf("retry %d answered %d stale=%q", i, rec.Code, rec.Header().Get("X-Lattice-Subscription-Stale"))
 		}
@@ -276,7 +279,7 @@ func TestOutageRetriesDoNotRepublishTheStaleBody(t *testing.T) {
 func TestALinkCannotSpendRendersPastItsBudget(t *testing.T) {
 	s, st, path := flightShareServer(t)
 	now := s.now()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	var renders atomic.Int64
 	s.subscriptionRender = flightRender(s, &renders, nil)
 	otherToken := strings.Repeat("o", 32)
@@ -309,6 +312,7 @@ func TestALinkCannotSpendRendersPastItsBudget(t *testing.T) {
 		t.Fatalf("another link answered %d; budgets are per link", code)
 	}
 	now = now.Add(time.Hour / shareRenderBudgetPerHour)
+	serverClock(t, s).set(now)
 	if code := fetch(path + variants[shareRenderBudgetBurst]); code != http.StatusOK {
 		t.Fatalf("the budget did not refill: %d", code)
 	}
@@ -334,7 +338,7 @@ func TestALinkCannotSpendRendersPastItsBudget(t *testing.T) {
 func TestAVPNCoreChangeReachesPluginLinksOnTheNextFetch(t *testing.T) {
 	s, _, path := flightShareServer(t)
 	now := s.now()
-	s.now = func() time.Time { return now }
+	serverClock(t, s).set(now)
 	var renders, fetches atomic.Int64
 	content := "nodes"
 	s.subscriptionFetch = func(context.Context, string, string) (model.SubscriptionSnapshot, error) {
@@ -373,6 +377,7 @@ func TestAVPNCoreChangeReachesPluginLinksOnTheNextFetch(t *testing.T) {
 	// quiet pacing interval, so it advances the generation at once.
 	content = "nodes without the suspended identity"
 	now = now.Add(vpnCoreLinkChangeInterval)
+	serverClock(t, s).set(now)
 	s.triggerVPNCoreMutation()
 	if got := fetch(); got != "render of nodes without the suspended identity" || renders.Load() != 2 {
 		t.Fatalf("moved content: %q after %d renders", got, renders.Load())

@@ -607,7 +607,7 @@ func newTestServerWithPublicURL(t *testing.T, publicURL string) (http.Handler, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, PublicURL: publicURL})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, PublicURL: publicURL})
 	if err != nil {
 		t.Fatal(err)
 	}

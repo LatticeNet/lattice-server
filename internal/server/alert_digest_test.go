@@ -133,7 +133,7 @@ func TestMonitorRecoveryIsOwedAcrossARestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv1, err := New(Options{Store: st1, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv1, err := newClockedServer(t, Options{Store: st1, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +158,7 @@ func TestMonitorRecoveryIsOwedAcrossARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st2.Close() })
-	srv2, err := New(Options{Store: st2, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv2, err := newClockedServer(t, Options{Store: st2, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestServiceDownForManyNodesIsOneDigest(t *testing.T) {
 	cookies, csrf := loginSession(t, handler)
 	base := time.Date(2026, 10, 2, 9, 0, 0, 0, time.UTC)
 	at := base
-	srv.now = func() time.Time { return at }
+	serverClock(t, srv).set(at)
 	tokens := map[string]string{}
 	for _, n := range []struct{ id, name string }{{"n-a", "alpha"}, {"n-b", "bravo"}, {"n-c", "charlie"}} {
 		tokens[n.id] = enrollAndBeat(t, handler, cookies, csrf, n.id, n.name)
@@ -204,6 +204,7 @@ func TestServiceDownForManyNodesIsOneDigest(t *testing.T) {
 		postNodeLiveness(t, handler, id, token, true, at)
 	}
 	at = base.Add(10 * time.Second)
+	serverClock(t, srv).set(at)
 	for id, token := range tokens {
 		postNodeLiveness(t, handler, id, token, false, at)
 	}
@@ -211,6 +212,7 @@ func TestServiceDownForManyNodesIsOneDigest(t *testing.T) {
 		t.Fatalf("inside the hold: %+v", got)
 	}
 	at = at.Add(serviceDownHold)
+	serverClock(t, srv).set(at)
 	for id, token := range tokens {
 		postNodeLiveness(t, handler, id, token, false, at)
 	}
@@ -224,6 +226,7 @@ func TestServiceDownForManyNodesIsOneDigest(t *testing.T) {
 	}
 
 	at = at.Add(10 * time.Second)
+	serverClock(t, srv).set(at)
 	for id, token := range tokens {
 		postNodeLiveness(t, handler, id, token, true, at)
 	}
@@ -234,8 +237,10 @@ func TestServiceDownForManyNodesIsOneDigest(t *testing.T) {
 
 	// One node alone keeps the single-node title and a body that names it.
 	at = at.Add(10 * time.Second)
+	serverClock(t, srv).set(at)
 	postNodeLiveness(t, handler, "n-a", tokens["n-a"], false, at)
 	at = at.Add(serviceDownHold)
+	serverClock(t, srv).set(at)
 	postNodeLiveness(t, handler, "n-a", tokens["n-a"], false, at)
 	got = flushTake(srv, sent)
 	if len(got) != 1 || got[0].title != "sing-box down on alpha" || !strings.HasPrefix(got[0].body, "alpha (n-a): sing-box has been down since ") {

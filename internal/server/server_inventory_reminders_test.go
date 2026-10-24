@@ -123,7 +123,7 @@ func TestReminderDefaultsMigrationRunsOnceAndKeepsOperatorChoice(t *testing.T) {
 	)
 	boot := func() {
 		t.Helper()
-		if _, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true}); err != nil {
+		if _, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -166,7 +166,7 @@ func TestReminderDefaultsMigrationRunsOnceAndKeepsOperatorChoice(t *testing.T) {
 func TestRenewalRemindersArriveAsOneDigest(t *testing.T) {
 	srv, handler, st := newInventoryServer(t)
 	now := time.Date(2026, 9, 29, 8, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	mustUpsertNodes(t, st, "node-a", "node-b", "node-c", "node-d")
 	mustUpsertProfiles(t, st,
 		model.MachineProfile{ID: "mp-a", NodeID: "node-a", Label: "openjobs-vpn-dmit-1", NextRenewal: day(2026, 10, 6), RemindDaysBefore: []int{7}, RemindersEnabled: true, PriceCents: 500, Currency: "USD"},
@@ -470,7 +470,7 @@ func TestReminderSentWhenItsWriteCommitsWithoutDurability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}

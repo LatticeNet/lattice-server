@@ -22,7 +22,7 @@ func TestLineMetaSyncQueueAndDedup(t *testing.T) {
 	}
 	srv := newLinemetaTestServer(t, st)
 	now := time.Date(2026, 7, 22, 1, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	seedLinemetaNodes(t, srv)
 
 	out, err := srv.vpnCoreLinesSyncMetadata(lineUserTestPrincipal(), json.RawMessage(`{"node_id":"node-a"}`))
@@ -49,6 +49,7 @@ func TestLineMetaSyncQueueAndDedup(t *testing.T) {
 
 	// Second sync of unchanged state returns the same pending approval.
 	now = now.Add(time.Second)
+	serverClock(t, srv).set(now)
 	out2, err := srv.vpnCoreLinesSyncMetadata(lineUserTestPrincipal(), json.RawMessage(`{"node_id":"node-a"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -326,7 +327,7 @@ func TestLineMetaNoRequeueAfterApplyWhenUnchanged(t *testing.T) {
 	}
 	srv := newLinemetaTestServer(t, st)
 	now := time.Date(2026, 8, 27, 3, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	seedLinemetaNodes(t, srv)
 
 	decode := func(out []byte) (model.Approval, bool) {
@@ -363,6 +364,7 @@ func TestLineMetaNoRequeueAfterApplyWhenUnchanged(t *testing.T) {
 	// current; without refreshing it the seeded report ages out and the render
 	// would collapse to an empty inbound list, which is a different change.
 	now = now.Add(2 * time.Hour)
+	serverClock(t, srv).set(now)
 	srv.linemetaSyncFP = nil
 	srv.singboxInvMu.Lock()
 	for nodeID, inv := range srv.singboxInv {

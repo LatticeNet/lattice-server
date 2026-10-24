@@ -123,7 +123,7 @@ func TestDDNSRunNowNamesAMissingSetting(t *testing.T) {
 	srv, handler, st := newDDNSServer(t)
 	cookies, csrf := loginSession(t, handler)
 	clock := time.Date(2026, 10, 16, 1, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return clock }
+	serverClock(t, srv).set(clock)
 	made := seedAddressProfile(t, srv, model.DDNSProfile{Provider: model.DDNSProviderCloudflare})
 
 	status, apiErr := runNowError(t, handler, cookies, csrf, made.ID)

@@ -55,7 +55,7 @@ func TestUsageDayRollAndRetention(t *testing.T) {
 	// Ten minutes later it is the next UTC day: a new delta opens day 2 and
 	// the sweep removes the row past retention while keeping the edge row.
 	day2 := day1.Add(10 * time.Minute)
-	srv.now = func() time.Time { return day2 }
+	serverClock(t, srv).set(day2)
 	srv.singboxInvMu.Lock()
 	for id, inv := range srv.singboxInv {
 		inv.At = day2

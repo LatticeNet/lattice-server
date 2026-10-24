@@ -168,7 +168,7 @@ func openGoldenFleet(t *testing.T) *goldenFleet {
 	history = append(history, tlsHistory("mon-cert", goldenBase)...)
 
 	f := openDegradedFixture(t, t.TempDir(), history)
-	f.clock.at = goldenBase
+	f.clock.set(goldenBase)
 	g := &goldenFleet{degradedFixture: f}
 	st := f.st
 	for _, n := range []model.Node{

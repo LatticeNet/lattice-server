@@ -102,7 +102,7 @@ func TestBeaconApprovalSurvivesARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	srv2, _, st2 := newPathsServerAt(t, dir)
-	srv2.now = func() time.Time { return beaconT0.Add(time.Minute) }
+	serverClock(t, srv2).set(beaconT0.Add(time.Minute))
 	srv2.replaceAgentCapabilities("node-t", []string{netGuardManagedSHACapability})
 	approval, ok := st2.Approval(out.Approval.ID)
 	if !ok || approval.Status != model.ApprovalPending {

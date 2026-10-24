@@ -122,11 +122,11 @@ func TestSplitEphemeralSocketsRule(t *testing.T) {
 // ephemeralTestReporter drives one agent through the guard reality and
 // inventory routes on a clock the test moves.
 type ephemeralTestReporter struct {
-	t       *testing.T
-	handler http.Handler
-	token   string
-	clock   *guardRealityTestClock
-	at      time.Time
+	t        *testing.T
+	handler  http.Handler
+	token    string
+	setClock func(time.Time)
+	at       time.Time
 	// step is the time between reports, ten seconds when zero.
 	step time.Duration
 	// srv, when set, has the inventory placed in its mirror directly instead
@@ -144,7 +144,7 @@ func (r *ephemeralTestReporter) report(listeners []model.GuardListener) {
 		step = 10 * time.Second
 	}
 	r.at = r.at.Add(step)
-	r.clock.Set(r.at)
+	r.setClock(r.at)
 	switch {
 	case r.noInventory:
 	case r.srv != nil:
@@ -182,8 +182,8 @@ func withSockets(listeners []model.GuardListener, more ...model.GuardListener) [
 func TestEphemeralClientSocketChurnDoesNotWriteState(t *testing.T) {
 	f := openIngestFixture(t, t.TempDir())
 	defer f.st.Close()
-	clock := newGuardRealityTestClock(time.Now().UTC().Truncate(time.Second))
-	f.srv.now = clock.Now
+	clock := serverClock(t, f.srv)
+	clock.set(time.Now().UTC().Truncate(time.Second))
 	cookies, csrf := loginSession(t, f.handler)
 	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
 	if rec := doAgentRaw(t, f.handler, http.MethodPost, "/api/agent/hello", `{"node_id":"node-a","version":"0.3.10"}`, token); rec.Code != http.StatusOK {
@@ -192,7 +192,7 @@ func TestEphemeralClientSocketChurnDoesNotWriteState(t *testing.T) {
 	// Reports three seconds apart keep the agent token cache (10 s) warm; at
 	// ten seconds every request derives the token hash again, which is slow
 	// under -race and is not what this test measures.
-	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now(), step: 3 * time.Second}
+	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, setClock: clock.set, at: clock.now(), step: 3 * time.Second}
 	services := []model.GuardListener{
 		{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"},
 		{Protocol: "tcp", Port: 443, Address: "::", Process: "sing-box"},
@@ -239,7 +239,7 @@ func TestRealityAPIServesEphemeralSocketsBesideListeners(t *testing.T) {
 	clock := newGuardRealityTestClock(time.Now().UTC().Truncate(time.Second))
 	_, handler, _, cookies, csrf := newGuardRealityServerForTest(t, clock)
 	token := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
-	r := &ephemeralTestReporter{t: t, handler: handler, token: token, clock: clock, at: clock.Now()}
+	r := &ephemeralTestReporter{t: t, handler: handler, token: token, setClock: clock.Set, at: clock.Now()}
 	services := []model.GuardListener{
 		{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"},
 		{Protocol: "tcp", Port: 443, Address: "::", Process: "sing-box"},
@@ -417,15 +417,15 @@ func TestEphemeralSocketTrackerAuditsOncePerEpisode(t *testing.T) {
 func TestPersistentEphemeralSocketAuditsWithoutWritingState(t *testing.T) {
 	f := openIngestFixture(t, t.TempDir())
 	defer f.st.Close()
-	clock := newGuardRealityTestClock(time.Date(2026, 10, 4, 9, 0, 0, 0, time.UTC))
-	f.srv.now = clock.Now
+	clock := serverClock(t, f.srv)
+	clock.set(time.Date(2026, 10, 4, 9, 0, 0, 0, time.UTC))
 	cookies, csrf := loginSession(t, f.handler)
 	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
 	// Reports five seconds apart keep the agent token cache (10 s) warm, and a
 	// one minute threshold crosses in a dozen reports; the tracker tests pin
 	// the real ephemeralPersistAfter.
 	f.srv.ephemeralSockets.after = time.Minute
-	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now(), step: 5 * time.Second, srv: f.srv}
+	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, setClock: clock.set, at: clock.now(), step: 5 * time.Second, srv: f.srv}
 	services := []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"}}
 	persistent := singBoxUDP(45678)
 	persistentAudits := func() []model.AuditEvent {
@@ -559,13 +559,13 @@ func TestSplitClientOnlyOwnersNeedNoInventory(t *testing.T) {
 func TestTimesyncdClientSocketChurnDoesNotWriteState(t *testing.T) {
 	f := openIngestFixture(t, t.TempDir())
 	defer f.st.Close()
-	clock := newGuardRealityTestClock(time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC))
-	f.srv.now = clock.Now
+	clock := serverClock(t, f.srv)
+	clock.set(time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC))
 	cookies, csrf := loginSession(t, f.handler)
 	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
 	// Three seconds apart keeps the agent token cache warm (see the sing-box
 	// churn test).
-	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now(), step: 3 * time.Second, noInventory: true}
+	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, setClock: clock.set, at: clock.now(), step: 3 * time.Second, noInventory: true}
 	services := []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"}}
 	query := func(i int) model.GuardListener { return timesyncdUDP(32768 + (i*6151)%28000) }
 	r.report(withSockets(services, query(0)))
@@ -606,11 +606,11 @@ func TestTimesyncdClientSocketChurnDoesNotWriteState(t *testing.T) {
 func TestTimesyncdSocketHeldThirtyMinutesIsAudited(t *testing.T) {
 	f := openIngestFixture(t, t.TempDir())
 	defer f.st.Close()
-	clock := newGuardRealityTestClock(time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC))
-	f.srv.now = clock.Now
+	clock := serverClock(t, f.srv)
+	clock.set(time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC))
 	cookies, csrf := loginSession(t, f.handler)
 	token := enrollNamedNodeToken(t, f.handler, cookies, csrf, "node-a", "Node A")
-	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, clock: clock, at: clock.Now(), step: 10 * time.Minute, noInventory: true}
+	r := &ephemeralTestReporter{t: t, handler: f.handler, token: token, setClock: clock.set, at: clock.now(), step: 10 * time.Minute, noInventory: true}
 	services := []model.GuardListener{{Protocol: "tcp", Port: 22, Address: "0.0.0.0", Process: "sshd"}}
 	held := timesyncdUDP(45678)
 	audits := func() []model.AuditEvent {

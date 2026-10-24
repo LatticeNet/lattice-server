@@ -108,7 +108,7 @@ func TestSingBoxDiscoverReportAuditIsThrottledForUnchangedInventory(t *testing.T
 	cookies, csrf := loginSession(t, handler)
 	nodeToken := enrollNamedNodeToken(t, handler, cookies, csrf, "node-a", "Node A")
 	now := time.Unix(1_700_000_000, 0).UTC()
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 
 	body := `{
 		"node_id":"node-a",
@@ -122,6 +122,7 @@ func TestSingBoxDiscoverReportAuditIsThrottledForUnchangedInventory(t *testing.T
 	}
 
 	now = now.Add(time.Minute)
+	serverClock(t, srv).set(now)
 	reportSingBoxInventory(t, handler, nodeToken, body)
 	if got := countAuditAction(st, "singbox.discover.report"); got != 1 {
 		t.Fatalf("unchanged report inside throttle window should not audit again, got %d", got)
@@ -140,6 +141,7 @@ func TestSingBoxDiscoverReportAuditIsThrottledForUnchangedInventory(t *testing.T
 	}
 
 	now = now.Add(singBoxDiscoveryAuditInterval)
+	serverClock(t, srv).set(now)
 	reportSingBoxInventory(t, handler, nodeToken, changed)
 	if got := countAuditAction(st, "singbox.discover.report"); got != 3 {
 		t.Fatalf("unchanged report after throttle window should audit a sample, got %d", got)
@@ -219,7 +221,7 @@ func newSingBoxDiscoverAuditTestServer(t *testing.T) (http.Handler, *store.Store
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -34,7 +34,7 @@ func newTestServerWithGeoResolver(t *testing.T, resolver geoip.Resolver) (http.H
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, GeoResolver: resolver})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, GeoResolver: resolver})
 	if err != nil {
 		t.Fatal(err)
 	}

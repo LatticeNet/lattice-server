@@ -54,7 +54,7 @@ func newSkipTOTPFixture(t *testing.T, skip bool, opts ...func(*Options)) *skipTO
 	for _, f := range opts {
 		f(&o)
 	}
-	srv, err := New(o)
+	srv, err := newClockedServer(t, o)
 	if err != nil {
 		t.Fatal(err)
 	}

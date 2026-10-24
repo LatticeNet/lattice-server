@@ -138,7 +138,7 @@ func TestManagedRenderFollowsIdentityQuota(t *testing.T) {
 		t.Fatal("precondition: over the quota again")
 	}
 	next := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return next }
+	serverClock(t, srv).set(next)
 	if !managedRenderHas(t, srv, uuid) {
 		t.Fatal("a new quota period must bring the identity back")
 	}

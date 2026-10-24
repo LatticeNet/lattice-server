@@ -36,7 +36,7 @@ func newWitnessFixture(t *testing.T, publicURL string) witnessFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PublicURL: publicURL})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true, PublicURL: publicURL})
 	if err != nil {
 		t.Fatal(err)
 	}

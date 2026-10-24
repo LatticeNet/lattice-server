@@ -270,7 +270,7 @@ func TestWebAuthnSignCountRegressionWarnsButAllows(t *testing.T) {
 		t.Fatal(err)
 	}
 	var logBuf bytes.Buffer
-	srv, err := New(Options{
+	srv, err := newClockedServer(t, Options{
 		Store:                   st,
 		AdminPassword:           testAdminPass,
 		PublicURL:               testWebAuthnOrigin,

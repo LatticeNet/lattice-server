@@ -64,7 +64,7 @@ func TestAgentUpdateTaskResultKeepsTheLastFetchOnThePolicy(t *testing.T) {
 		t.Fatal("no planned approval")
 	}
 	at := time.Date(2026, 10, 17, 9, 30, 0, 0, time.UTC)
-	srv.now = func() time.Time { return at }
+	serverClock(t, srv).set(at)
 	req := httptest.NewRequest("POST", "/api/tasks/results", nil)
 	lastFetch := func() *model.AgentUpdateFetch {
 		t.Helper()
@@ -103,6 +103,7 @@ func TestAgentUpdateTaskResultKeepsTheLastFetchOnThePolicy(t *testing.T) {
 	}
 
 	at = at.Add(time.Hour)
+	serverClock(t, srv).set(at)
 	run(model.ApprovalApproved, model.TaskResult{ExitCode: 1, Stderr: "lattice-agent-fetch v1 1:cp:0:9000:20 result:1:verify\n"})
 	failed := lastFetch()
 	if failed == nil || failed.Stage != "verify" || failed.ExitCode != 1 || !failed.At.Equal(at) || len(failed.Fetches) != 1 {
@@ -129,6 +130,7 @@ func TestAgentUpdateTaskResultKeepsTheLastFetchOnThePolicy(t *testing.T) {
 		{"applied before the write", model.ApprovalApplied, model.ApprovalApproved},
 	} {
 		at = at.Add(time.Hour)
+		serverClock(t, srv).set(at)
 		policy, _ := st.AgentUpdatePolicy("node-a")
 		policy.LastAppliedVersion, policy.LastAppliedAt = "0.3.4", at
 		if err := st.UpsertAgentUpdatePolicy(policy); err != nil {

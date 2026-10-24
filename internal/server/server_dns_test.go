@@ -51,7 +51,7 @@ func newDNSServerWithOptions(t *testing.T, opts Options) (*Server, http.Handler,
 	}
 	opts.Store = st
 	opts.AdminPassword = testAdminPass
-	srv, err := New(opts)
+	srv, err := newClockedServer(t, opts)
 	if err != nil {
 		t.Fatal(err)
 	}

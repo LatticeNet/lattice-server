@@ -19,11 +19,11 @@ func readinessServer(t *testing.T, at time.Time) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv.now = func() time.Time { return at }
+	serverClock(t, srv).set(at)
 	return srv
 }
 
@@ -65,7 +65,7 @@ func TestReadinessSaysDisabledWhenThereIsNoWAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,11 +83,11 @@ func TestReadinessSurfacesABrokenChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv.now = func() time.Time { return at }
+	serverClock(t, srv).set(at)
 
 	if err := corruptAuditWALTail(dir + "/state.json.audit-wal"); err != nil {
 		t.Fatal(err)

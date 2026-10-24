@@ -26,7 +26,7 @@ func TestLatencyRollupsAndSeries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, DisableRenewalScheduler: true})
 	if err != nil {
 		t.Fatal(err)
 	}

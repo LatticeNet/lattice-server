@@ -65,12 +65,13 @@ func newTraceFixture(t *testing.T, clock *testClock) traceFixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { lstore.Close() })
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts, LogStore: lstore, DisableRenewalScheduler: clock != nil})
+	opts := Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts, LogStore: lstore, DisableRenewalScheduler: clock != nil}
+	if clock != nil {
+		opts.Now = clock.now
+	}
+	srv, err := newClockedServer(t, opts)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if clock != nil {
-		srv.now = clock.now
 	}
 	return traceFixture{srv: srv, handler: srv.Handler(), st: st, ts: ts, logs: lstore}
 }
@@ -348,7 +349,7 @@ func TestTraceStoreDisabledReportsUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,7 +371,7 @@ func TestAgentTraceConfigWithoutStoreReportsDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +482,7 @@ func TestNodeConfinedOperatorCannotStartAFleetWideCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ts.Close() })
-	srv, err := New(Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts})
+	srv, err := newClockedServer(t, Options{Store: st, AdminPassword: testAdminPass, TraceStore: ts})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -278,8 +278,8 @@ func TestDDNSCNAMESweepRepairsDrift(t *testing.T) {
 	cookies, csrf := loginSession(t, handler)
 	seedFrontierNode(t, srv)
 	clock := time.Date(2026, 10, 8, 9, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return clock }
-	tick := func() { clock = clock.Add(10 * time.Minute) }
+	serverClock(t, srv).set(clock)
+	tick := func() { clock = clock.Add(10 * time.Minute); serverClock(t, srv).set(clock) }
 	var mu sync.Mutex
 	ran := 0
 	build := srv.ddnsProvider

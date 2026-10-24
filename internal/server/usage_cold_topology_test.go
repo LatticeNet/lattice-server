@@ -26,7 +26,10 @@ import (
 type coldTopologyFixture struct {
 	srv   *Server
 	fleet usageFleet
+	// now is the test's own reading of clock, the server's; advance moves
+	// both.
 	now   *time.Time
+	clock *testClock
 	saved map[string]model.SingBoxInventory
 }
 
@@ -35,8 +38,7 @@ func newColdTopologyFixture(t *testing.T) *coldTopologyFixture {
 	start := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	clock := start
 	srv := usageTestServer(t, start)
-	srv.now = func() time.Time { return clock }
-	f := &coldTopologyFixture{srv: srv, now: &clock}
+	f := &coldTopologyFixture{srv: srv, now: &clock, clock: serverClock(t, srv)}
 	f.fleet = seedUsageFleet(t, srv)
 	srv.singboxInvMu.RLock()
 	f.saved = srv.singboxInv
@@ -44,7 +46,10 @@ func newColdTopologyFixture(t *testing.T) *coldTopologyFixture {
 	return f
 }
 
-func (f *coldTopologyFixture) advance(d time.Duration) { *f.now = f.now.Add(d) }
+func (f *coldTopologyFixture) advance(d time.Duration) {
+	*f.now = f.now.Add(d)
+	f.clock.set(*f.now)
+}
 
 // goCold drops the discovery mirror the way liveSingBoxInventories' eviction
 // leaves it: the node exists, its profile exists, and it has no lines.

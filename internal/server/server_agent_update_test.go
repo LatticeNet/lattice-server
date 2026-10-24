@@ -602,7 +602,7 @@ func TestFetchAgentReleaseTextRejectsOversizedMetadata(t *testing.T) {
 func TestFetchAgentReleaseTextCachesFailures(t *testing.T) {
 	srv, _, _ := newInventoryServer(t)
 	now := time.Date(2026, 7, 5, 14, 0, 0, 0, time.UTC)
-	srv.now = func() time.Time { return now }
+	serverClock(t, srv).set(now)
 	calls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -619,6 +619,7 @@ func TestFetchAgentReleaseTextCachesFailures(t *testing.T) {
 		t.Fatalf("release metadata failures should be cached briefly, got %d upstream calls", calls)
 	}
 	now = now.Add(agentReleaseErrorCacheTTL + time.Second)
+	serverClock(t, srv).set(now)
 	if _, err := srv.fetchAgentReleaseText(upstream.URL); err == nil || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("expired cached release metadata error should refetch and fail with 403, got %v", err)
 	}

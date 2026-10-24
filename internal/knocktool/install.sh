@@ -2,11 +2,11 @@
 # Install lattice-knock, the UDP port-knock client for Lattice SSH Guard.
 #
 # From GitHub:
-#   curl -fsSL https://raw.githubusercontent.com/LatticeNet/lattice-knock/v0.1.0-alpha.1/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/LatticeNet/lattice-knock/v0.1.0-alpha.2/install.sh | sh
 # From a Lattice control plane, for networks that cannot reach GitHub:
 #   curl -fsSL https://lattice.example.com/tools/knock/install.sh | sh
 # Through a GitHub mirror:
-#   curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/LatticeNet/lattice-knock/v0.1.0-alpha.1/install.sh \
+#   curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/LatticeNet/lattice-knock/v0.1.0-alpha.2/install.sh \
 #     | sh -s -- --github-mirror https://ghfast.top/ --sha256 <hash>
 #
 # What the checks are worth: SHA256SUMS comes from the same place as the script
@@ -16,7 +16,7 @@
 # control plane's own install.sh already carries its sha256.
 set -eu
 
-KNOCK_RELEASE="v0.1.0-alpha.1"
+KNOCK_RELEASE="v0.1.0-alpha.2"
 MARKER="lattice-knock"
 
 repo="${KNOCK_REPO:-LatticeNet/lattice-knock}"

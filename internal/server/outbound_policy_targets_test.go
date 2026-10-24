@@ -236,6 +236,7 @@ func TestOutboundPolicyScopeValidation(t *testing.T) {
 		"exclude with only nodes":       `{"scope":{"nodes":["n1","n2"],"exclude":["n2"]},"enabled":true}`,
 		"unknown remote group":          `{"scope":{"nodes":["n1"]},"enabled":true,"rules":[{"id":"r","action":"allow","direction":"egress","protocol":"tcp","ports":[22],"remote":{"kind":"group","group_id":"grp_ghost"}}]}`,
 		"alias naming an unknown group": `{"scope_group_id":"grp_ghost","enabled":true}`,
+		"duplicate rule id":             `{"scope":{"nodes":["n1"]},"enabled":true,"rules":[{"id":"r","action":"allow","direction":"egress","protocol":"tcp","ports":[22],"remote":{"kind":"any"}},{"id":"r","action":"allow","direction":"egress","protocol":"tcp","ports":[80],"remote":{"kind":"any"}}]}`,
 	}
 	for name, body := range cases {
 		if code, _, raw := postPolicy(t, handler, cookies, csrf, body); code != http.StatusBadRequest {
@@ -367,5 +368,25 @@ func TestNetPolicyMatrixReadsSelectorGroups(t *testing.T) {
 	}
 	if !got[a.ID+">"+c.ID] || !got[b.ID+">"+c.ID] || len(got) != 2 {
 		t.Fatalf("matrix cells %+v, want A>C and B>C", out.Cells)
+	}
+}
+
+// Overlapping targets are the point of selectors, and two policies written
+// by the same form both carry "rule_001". The node they share still plans.
+func TestOutboundPolicyOverlappingTargetsPlanWithReusedRuleIDs(t *testing.T) {
+	handler, st, cookies, csrf := outboundFleet(t, "n1", "n2")
+	if code, _, raw := postPolicy(t, handler, cookies, csrf, `{"scope":{"all":true},"enabled":true,"priority":10,"rules":[{"id":"rule_001","action":"allow","direction":"egress","protocol":"tcp","ports":[443],"remote":{"kind":"any"}}]}`); code != http.StatusOK {
+		t.Fatalf("fleet policy = %d %s", code, raw)
+	}
+	if code, _, raw := postPolicy(t, handler, cookies, csrf, `{"scope":{"nodes":["n1"]},"enabled":true,"rules":[{"id":"rule_001","action":"allow","direction":"egress","protocol":"tcp","ports":[22],"remote":{"kind":"any"}}]}`); code != http.StatusOK {
+		t.Fatalf("node policy = %d %s", code, raw)
+	}
+	plan := planOutbound(t, handler, cookies, csrf)
+	if len(plan.Conflicts) != 0 || !reflect.DeepEqual(affectedNodes(plan), []string{"n1", "n2"}) {
+		t.Fatalf("overlapping policies must plan both nodes, got affected %v conflicts %+v", affectedNodes(plan), plan.Conflicts)
+	}
+	n1, _ := st.NetPolicy("n1")
+	if len(n1.Rules) != 2 || n1.Rules[0].Ports[0] != 22 {
+		t.Fatalf("n1 must merge the node policy (priority 0) before the fleet one: %+v", n1.Rules)
 	}
 }

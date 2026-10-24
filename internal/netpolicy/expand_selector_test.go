@@ -105,3 +105,27 @@ func TestExpandRemoteGroupOnNodeTarget(t *testing.T) {
 		t.Fatalf("remote not expanded to a node ref: %+v", np.Rules[0].Remote)
 	}
 }
+
+// Two policies written by the same form both carry "rule_001". Before
+// selectors that collision needed one node in two scope groups; with
+// overlapping targets it is the common case, and NormalizePolicy refuses a
+// node policy with a duplicate rule id, so the node got no plan at all. The
+// later policy's colliding rule is renamed with its policy id, and a node
+// with no collision keeps the ids, and so the ruleset, it had.
+func TestExpandKeepsRuleIDsUniqueAcrossPolicies(t *testing.T) {
+	nodes, groupList := selectorFleet()
+	rule := func(id string, port int) model.GroupNetRule {
+		return model.GroupNetRule{ID: id, Action: "allow", Direction: "egress", Protocol: "tcp", Ports: []int{port}, Remote: model.NetEndpoint{Kind: model.NetRefAny}}
+	}
+	policies := []model.GroupNetPolicy{
+		{ID: "gnp_a", Enabled: true, Scope: &model.TargetSelector{All: true}, Rules: []model.GroupNetRule{rule("rule_001", 443)}},
+		{ID: "gnp_b", Enabled: true, Scope: &model.TargetSelector{Nodes: []string{"n1"}}, Rules: []model.GroupNetRule{rule("rule_001", 22), rule("rule_002", 80)}},
+	}
+	out := ExpandGroupPolicies(policies, PolicyTargets(policies, nodes, groupList), groups.ResolveAll(groupList, nodes))
+	if got := ruleIDs(out["n1"]); !reflect.DeepEqual(got, []string{"rule_001", "gnp_b:rule_001", "rule_002"}) {
+		t.Fatalf("n1 rules %v, want the later collision renamed", got)
+	}
+	if got := ruleIDs(out["n2"]); !reflect.DeepEqual(got, []string{"rule_001"}) {
+		t.Fatalf("n2 rules %v, want its ids unchanged", got)
+	}
+}

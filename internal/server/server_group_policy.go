@@ -291,10 +291,18 @@ func (s *Server) upsertGroupPolicy(req model.GroupNetPolicy, scope model.TargetS
 	}
 	req.Scope = &scope
 	req.ScopeGroupID = store.ScopeGroupAlias(scope)
+	ruleIDs := make(map[string]struct{}, len(req.Rules))
 	for i, rule := range req.Rules {
 		if err := s.validateGroupRule(rule); err != nil {
 			return groupPolicyView{}, fmt.Errorf("rule %d: %w", i+1, err)
 		}
+		// Expansion renames a rule that collides with another policy's on
+		// the same node, but two rules of one policy sharing an id would be
+		// refused at plan time on every node it reaches.
+		if _, dup := ruleIDs[rule.ID]; dup {
+			return groupPolicyView{}, fmt.Errorf("rule %d: duplicate rule id %q", i+1, rule.ID)
+		}
+		ruleIDs[rule.ID] = struct{}{}
 	}
 	creating := strings.TrimSpace(req.ID) == ""
 	if creating {

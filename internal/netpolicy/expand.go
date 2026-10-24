@@ -1,6 +1,7 @@
 package netpolicy
 
 import (
+	"fmt"
 	"sort"
 
 	"github.com/LatticeNet/lattice-sdk/model"
@@ -44,6 +45,7 @@ func ExpandGroupPolicies(policies []model.GroupNetPolicy, targets map[string][]s
 	})
 
 	out := map[string]model.NetPolicy{}
+	usedIDs := map[string]map[string]struct{}{}
 	for _, gp := range sorted {
 		if !gp.Enabled {
 			continue
@@ -62,11 +64,41 @@ func ExpandGroupPolicies(policies []model.GroupNetPolicy, targets map[string][]s
 					GroupDerived: true,
 				}
 			}
+			used := usedIDs[target]
+			if used == nil {
+				used = map[string]struct{}{}
+				usedIDs[target] = used
+			}
+			for i := range rules {
+				rules[i].ID = uniqueRuleID(rules[i].ID, gp.ID, used)
+			}
 			np.Rules = append(np.Rules, rules...)
 			out[target] = np
 		}
 	}
 	return out
+}
+
+// uniqueRuleID keeps a merged node policy free of duplicate rule ids, which
+// NormalizePolicy refuses. Policies authored apart reuse ids ("rule_001"), and
+// with selector targets several of them reach one node routinely. A rule
+// keeps its id unless an earlier policy on the node already used it; then it
+// takes its policy's id as a prefix. A node without a collision therefore
+// compiles exactly the ruleset it did before, since rule ids appear in the
+// nft comments.
+func uniqueRuleID(ruleID, policyID string, used map[string]struct{}) string {
+	candidate := ruleID
+	if _, taken := used[candidate]; taken {
+		candidate = policyID + ":" + ruleID
+		for n := 2; ; n++ {
+			if _, taken := used[candidate]; !taken {
+				break
+			}
+			candidate = fmt.Sprintf("%s:%s:%d", policyID, ruleID, n)
+		}
+	}
+	used[candidate] = struct{}{}
+	return candidate
 }
 
 // expandRulesForTarget turns one group policy's rules into concrete per-node

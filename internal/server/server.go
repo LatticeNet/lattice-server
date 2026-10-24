@@ -7342,6 +7342,16 @@ func (s *Server) handleNFTPlan(w http.ResponseWriter, r *http.Request, p princip
 	if !s.requireNodeScope(w, p, "network:plan", req.NodeID) {
 		return
 	}
+	// This route composes lattice_guard from NFTInputs and the request, and
+	// knows nothing of security groups. On a node NetGuard has adopted, the
+	// plan would replace the node's firewall with the legacy baseline and
+	// drop every bound group, so it is refused. An observe-only binding is
+	// only the record the port plan wrote; the legacy path still owns that
+	// node's table.
+	if binding, ok := s.store.NodeGuardBinding(req.NodeID); ok && binding.Managed {
+		writeError(w, http.StatusConflict, errors.New("node is managed by NetGuard: plan its firewall with /api/netguard/plan; this legacy route would rebuild lattice_guard without the node's security groups"))
+		return
+	}
 	planInput := req.NFTPlan
 	source := "request"
 	if !nftPlanRequestHasInputs(planInput) {
@@ -8906,6 +8916,19 @@ func (s *Server) approveApprovalCore(ctx context.Context, p principal, approval 
 	}
 	if isNetGuardApproval(approval) {
 		if err := s.requireCurrentNetGuardApproval(approval); err != nil {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
+		}
+	}
+	// A legacy Network Guard plan made before NetGuard adopted the node would
+	// replace the adopted firewall with the legacy baseline; the plan route
+	// refuses such a node, and so does the approve.
+	if approval.Plugin == "nft" && approval.Action == "apply-ruleset" {
+		if binding, ok := s.store.NodeGuardBinding(approval.NodeID); ok && binding.Managed {
+			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, "node is managed by NetGuard since this legacy plan was made; plan its firewall with /api/netguard/plan")}
+		}
+	}
+	if approval.Plugin == "selfdns" {
+		if err := s.requireCurrentSelfDNSFirewall(approval); err != nil {
 			return approval, &approvalDecisionError{status: http.StatusConflict, err: apiError(model.APIErrorApprovalStale, err.Error())}
 		}
 	}

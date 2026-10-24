@@ -217,29 +217,65 @@ func (s *Server) handleDNSPlan(w http.ResponseWriter, r *http.Request, p princip
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	planInput := network.NFTPlan{}
-	inputSource := "default"
-	if stored, ok := s.store.NFTInputs(dep.NodeID); ok {
-		planInput = nftPlanFromStoredInputs(stored)
-		inputSource = "stored"
-	}
-	ingressRules, err := s.composeNFTIngressPolicy(dep.NodeID, &planInput, p)
-	if err != nil {
-		if errors.Is(err, errNFTIngressPolicyReadRequired) || errors.Is(err, errUnreadableNodes) {
-			writeError(w, http.StatusForbidden, err)
+	var (
+		composed        network.NFTPlan
+		firewallSummary []string
+		inputSource     string
+		ingressRules    int
+	)
+	if binding, ok := s.store.NodeGuardBinding(dep.NodeID); ok && binding.Managed {
+		// NetGuard owns lattice_guard on an adopted node. Rebuilding the table
+		// from the legacy NFTInputs baseline here would drop every security
+		// group bound to the node, so the plan renders through the NetGuard
+		// compile with this deployment's listeners added, the way a beacon
+		// plan carries its companion. The ruleset shows the binding's rules,
+		// so reading it takes netguard:read as well.
+		if !s.requireNodeScope(w, p, "netguard:read", dep.NodeID) {
 			return
 		}
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	composed, firewallSummary, err := selfdns.ComposeFirewallPlan(dep, planInput)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	firewallSummary = append([]string{"nft inputs source: " + inputSource}, firewallSummary...)
-	if ingressRules > 0 {
-		firewallSummary = append(firewallSummary, "ingress netpolicy rules composed: "+strconv.Itoa(ingressRules))
+		input, resolver, err := s.compileInputFor(p, dep.NodeID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		input.DNS = s.dnsListenersFor(dep.NodeID, &dep)
+		compiled, err := netguard.Compile(input)
+		if s.writeRefusal(w, p, resolver) {
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		composed = compiled
+		inputSource = "netguard"
+		firewallSummary = append([]string{netGuardFirewallSummary(input.Groups)}, dnsListenerSummary(dep)...)
+	} else {
+		planInput := network.NFTPlan{}
+		inputSource = "default"
+		if stored, ok := s.store.NFTInputs(dep.NodeID); ok {
+			planInput = nftPlanFromStoredInputs(stored)
+			inputSource = "stored"
+		}
+		var err error
+		ingressRules, err = s.composeNFTIngressPolicy(dep.NodeID, &planInput, p)
+		if err != nil {
+			if errors.Is(err, errNFTIngressPolicyReadRequired) || errors.Is(err, errUnreadableNodes) {
+				writeError(w, http.StatusForbidden, err)
+				return
+			}
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		composed, firewallSummary, err = selfdns.ComposeFirewallPlan(dep, planInput)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		firewallSummary = append([]string{"nft inputs source: " + inputSource}, firewallSummary...)
+		if ingressRules > 0 {
+			firewallSummary = append(firewallSummary, "ingress netpolicy rules composed: "+strconv.Itoa(ingressRules))
+		}
 	}
 	// The DNS plan replaces the node's whole lattice_guard input chain, which is
 	// policy drop. Composed from an empty baseline (the "default" input source
@@ -357,6 +393,41 @@ func (s *Server) handleDNSPublish(w http.ResponseWriter, r *http.Request, p prin
 	})
 }
 
+// netGuardFirewallSummary names the NetGuard binding a DNS plan on an adopted
+// node renders through, with its security groups in binding order.
+func netGuardFirewallSummary(groups []model.SecurityGroup) string {
+	if len(groups) == 0 {
+		return "firewall: NetGuard binding (no security groups)"
+	}
+	names := make([]string, 0, len(groups))
+	for _, group := range groups {
+		name := group.Name
+		if name == "" {
+			name = group.ID
+		}
+		names = append(names, name)
+	}
+	return "firewall: NetGuard binding (security groups: " + strings.Join(names, ", ") + ")"
+}
+
+// dnsListenerSummary is the operator-facing line per listener a DNS plan adds
+// to a NetGuard compile, worded as selfdns.ComposeFirewallPlan words them.
+func dnsListenerSummary(dep model.DNSDeployment) []string {
+	listeners := dnsDeploymentListeners(dep)
+	if len(listeners) == 0 {
+		return []string{"no DNS listener ports added"}
+	}
+	out := make([]string, 0, len(listeners))
+	for _, l := range listeners {
+		if l.Mesh {
+			out = append(out, fmt.Sprintf("mesh %s/%d via WireGuard CIDR", strings.ToUpper(l.Protocol), l.Port))
+		} else {
+			out = append(out, fmt.Sprintf("public %s/%d", strings.ToUpper(l.Protocol), l.Port))
+		}
+	}
+	return out
+}
+
 func selfDNSApprovalAction(deploymentID string) string {
 	return selfDNSApplyActionPrefix + base64.RawURLEncoding.EncodeToString([]byte(deploymentID))
 }
@@ -398,6 +469,50 @@ func (s *Server) requireSelfDNSDeploymentForApproval(approval model.Approval) er
 	}
 	if dep.NodeID != approval.NodeID {
 		return fmt.Errorf("dns deployment %q no longer belongs to node %s; re-plan before applying", deploymentID, approval.NodeID)
+	}
+	return nil
+}
+
+// requireCurrentSelfDNSFirewall refuses a DNS approval whose lattice_guard
+// candidate is not what NetGuard would compile for the node now. On an
+// adopted node the DNS plan carries a NetGuard compile, and applying it after
+// a binding, security group, zone or another listener changed would roll the
+// node's firewall back to the intent the plan saw. The same check refuses a
+// plan composed from the legacy baseline before the node was adopted, which
+// would drop every bound group. A node NetGuard does not manage keeps the
+// legacy behaviour.
+func (s *Server) requireCurrentSelfDNSFirewall(approval model.Approval) error {
+	binding, ok := s.store.NodeGuardBinding(approval.NodeID)
+	if !ok || !binding.Managed {
+		return nil
+	}
+	deploymentID, err := selfDNSApprovalDeploymentID(approval.Action)
+	if err != nil {
+		return err
+	}
+	dep, ok := s.store.DNSDeployment(deploymentID)
+	if !ok {
+		return fmt.Errorf("dns deployment %q not found; re-plan before applying", deploymentID)
+	}
+	artifacts, err := selfdns.ParseApprovalPlan(approval.Plan)
+	if err != nil {
+		return fmt.Errorf("selfdns plan is no longer applyable: %w", err)
+	}
+	input, err := s.compileInputForSystem(approval.NodeID)
+	if err != nil {
+		return fmt.Errorf("current netguard intent cannot be compiled: %w", err)
+	}
+	input.DNS = s.dnsListenersFor(approval.NodeID, &dep)
+	compiled, err := netguard.Compile(input)
+	if err != nil {
+		return fmt.Errorf("current netguard intent cannot be compiled: %w", err)
+	}
+	ruleset, err := network.GenerateNFTPlan(compiled)
+	if err != nil {
+		return fmt.Errorf("current netguard intent cannot be rendered: %w", err)
+	}
+	if strings.TrimSpace(ruleset) != strings.TrimSpace(artifacts.NFTRuleset) {
+		return errors.New("the node's NetGuard intent changed since this DNS plan was made; re-plan before approving")
 	}
 	return nil
 }

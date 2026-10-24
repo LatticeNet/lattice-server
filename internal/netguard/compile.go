@@ -51,6 +51,21 @@ type CompileInput struct {
 	// through a node.beacon plan, never authored here, and every compile of
 	// the node keeps it so a later NetGuard plan cannot drop it.
 	Beacon *BeaconCompanion
+	// DNS is the self-host DNS listener set the node's deployments put in
+	// force (design 32 D7). Like the beacon companion it is approved through
+	// its own plan, never authored here, and every compile of the node keeps
+	// it so a later NetGuard plan cannot close a running resolver. The ports
+	// land in the end-of-chain public and WireGuard port lists, where the
+	// legacy DNS composer put them, so an operator deny still wins.
+	DNS []DNSListener
+}
+
+// DNSListener is one self-host DNS socket to admit: on the public zone's
+// interface, or from the WireGuard range when Mesh is set.
+type DNSListener struct {
+	Mesh     bool
+	Protocol string // tcp | udp
+	Port     int
 }
 
 // BeaconCompanion admits UDP Port from exactly Allow, ahead of every
@@ -147,10 +162,37 @@ func Compile(in CompileInput) (network.NFTPlan, error) {
 		}
 	}
 
+	for _, listener := range in.DNS {
+		if err := lowerDNSListener(&plan, listener); err != nil {
+			return network.NFTPlan{}, err
+		}
+	}
+
 	// NormalizeNFTPlan validates/canonicalizes everything and sorts+dedups the
 	// fast-path port lists, so two groups contributing the same port union
 	// cleanly.
 	return network.NormalizeNFTPlan(plan)
+}
+
+func lowerDNSListener(plan *network.NFTPlan, listener DNSListener) error {
+	if listener.Port < 1 || listener.Port > 65535 {
+		return fmt.Errorf("dns listener port %d out of range", listener.Port)
+	}
+	var bucket *[]int
+	switch {
+	case listener.Mesh && listener.Protocol == model.NetProtoUDP:
+		bucket = &plan.WireGuardUDP
+	case listener.Mesh && listener.Protocol == model.NetProtoTCP:
+		bucket = &plan.WireGuardTCP
+	case listener.Protocol == model.NetProtoUDP:
+		bucket = &plan.PublicUDP
+	case listener.Protocol == model.NetProtoTCP:
+		bucket = &plan.PublicTCP
+	default:
+		return fmt.Errorf("dns listener protocol %q is not tcp or udp", listener.Protocol)
+	}
+	*bucket = append(*bucket, listener.Port)
+	return nil
 }
 
 // CompileRuleset renders the final lattice_guard ruleset for a node.

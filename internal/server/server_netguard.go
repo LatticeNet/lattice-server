@@ -472,6 +472,7 @@ func (s *Server) compileInputSnapshotFor(p principal, nodeID string) (netguard.C
 		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
 		Resolve: resolver.Resolve,
 		Beacon:  s.beaconCompanionFor(nodeID),
+		DNS:     s.dnsListenersFor(nodeID, nil),
 	}, snapshot, resolver, nil
 }
 
@@ -485,6 +486,51 @@ func (s *Server) beaconCompanionFor(nodeID string) *netguard.BeaconCompanion {
 		return nil
 	}
 	return &netguard.BeaconCompanion{Bind: t.Companion.Bind, Port: t.Companion.Port, Allow: append([]string(nil), t.Companion.Allow...)}
+}
+
+// dnsListenersFor is the self-host DNS listener set in force on the node:
+// the listeners of every CoreDNS deployment on it that is not disabled and
+// has been approved (applying) or applied (running). Every NetGuard compile
+// of the node carries it, so a NetGuard plan keeps a running resolver's ports
+// open, and a deployment that was never approved opens nothing.
+//
+// planned, when set, is the deployment a DNS plan is being rendered for: it
+// contributes its current listeners whatever its status, replacing its stored
+// copy, so the plan opens the ports the plan itself starts. The approve that
+// follows moves it to applying, and from then on every compile agrees.
+func (s *Server) dnsListenersFor(nodeID string, planned *model.DNSDeployment) []netguard.DNSListener {
+	var out []netguard.DNSListener
+	for _, dep := range s.store.DNSDeploymentsForNode(nodeID) {
+		if planned != nil && dep.ID == planned.ID {
+			continue
+		}
+		if dep.Status != model.DNSStatusApplying && dep.Status != model.DNSStatusRunning {
+			continue
+		}
+		out = append(out, dnsDeploymentListeners(dep)...)
+	}
+	if planned != nil && planned.NodeID == nodeID {
+		out = append(out, dnsDeploymentListeners(*planned)...)
+	}
+	return out
+}
+
+// dnsDeploymentListeners maps a deployment onto the sockets NetGuard admits
+// for it. External engines are observations Lattice never renders, and a
+// disabled deployment opens nothing.
+func dnsDeploymentListeners(dep model.DNSDeployment) []netguard.DNSListener {
+	if dep.Engine != model.DNSEngineCoreDNS || dep.Disabled {
+		return nil
+	}
+	mesh := dep.Exposure == model.DNSExposureMesh
+	var out []netguard.DNSListener
+	if dep.EnableUDP {
+		out = append(out, netguard.DNSListener{Mesh: mesh, Protocol: model.NetProtoUDP, Port: dep.ListenPort})
+	}
+	if dep.EnableTCP {
+		out = append(out, netguard.DNSListener{Mesh: mesh, Protocol: model.NetProtoTCP, Port: dep.ListenPort})
+	}
+	return out
 }
 
 // compileInputForSystem is compileInputFor without a principal, for the
@@ -506,6 +552,7 @@ func (s *Server) compileInputForSystem(nodeID string) (netguard.CompileInput, er
 		Zones:   resolveNodeZonesFrom(snapshot.GuardZones, snapshot.NFTInputs, snapshot.HasNFTInput),
 		Resolve: resolver.Resolve,
 		Beacon:  s.beaconCompanionFor(nodeID),
+		DNS:     s.dnsListenersFor(nodeID, nil),
 	}, nil
 }
 

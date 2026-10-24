@@ -5248,18 +5248,41 @@ func (s *Store) DeleteGroup(id string) error {
 	return s.Save()
 }
 
-// UpsertGroupPolicy creates or updates a group-scoped network policy. The
-// policy ID is the key; callers mint it as "gnp_<id>" (see internal/id). Rules
-// (and their Ports) are deep-copied on store.
+// ErrGroupPolicyVersion is returned when an outbound policy save names a
+// version other than the stored one: the policy changed, or was deleted,
+// since the caller read it.
+var ErrGroupPolicyVersion = errors.New("outbound policy changed since it was read")
+
+// UpsertGroupPolicy creates or updates a group-scoped network policy without
+// a version check. The policy ID is the key; callers mint it as "gnp_<id>"
+// (see internal/id). Rules (and their Ports) are deep-copied on store.
 func (s *Store) UpsertGroupPolicy(p model.GroupNetPolicy) error {
+	_, err := s.SaveGroupPolicy(p, 0)
+	return err
+}
+
+// SaveGroupPolicy stores an outbound policy and returns it as stored. With
+// expected above zero the stored policy must exist at that version, or the
+// save is refused with ErrGroupPolicyVersion and nothing is written; zero
+// skips the check for clients that send no version. Every save moves the
+// version on by one.
+func (s *Store) SaveGroupPolicy(p model.GroupNetPolicy, expected int64) (model.GroupNetPolicy, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	prior, exists := s.state.GroupPolicies[p.ID]
+	if expected > 0 && (!exists || prior.Version != expected) {
+		return model.GroupNetPolicy{}, ErrGroupPolicyVersion
+	}
+	p.Version = prior.Version + 1
 	p.UpdatedAt = time.Now().UTC()
 	if p.CreatedAt.IsZero() {
 		p.CreatedAt = p.UpdatedAt
 	}
 	s.state.GroupPolicies[p.ID] = cloneGroupPolicy(p)
-	return s.Save()
+	if err := s.Save(); err != nil {
+		return model.GroupNetPolicy{}, err
+	}
+	return cloneGroupPolicy(p), nil
 }
 
 // GroupPolicy returns a group policy by id (deep-copied).

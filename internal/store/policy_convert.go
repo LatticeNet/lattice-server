@@ -29,6 +29,7 @@ func (s *Store) ConvertNetPolicy(nodeID string, gp model.GroupNetPolicy, derived
 	if gp.CreatedAt.IsZero() {
 		gp.CreatedAt = now
 	}
+	gp.Version = s.state.GroupPolicies[gp.ID].Version + 1
 	s.state.GroupPolicies[gp.ID] = cloneGroupPolicy(gp)
 	if derived == nil {
 		delete(s.state.NetPolicies, nodeID)

@@ -166,6 +166,9 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request, p prin
 		return
 	}
 	summary := newNodeDeleteSummary(req.NodeID, name, true, report)
+	// The node's check definition monitors go with it, and selectors that
+	// resolved to it shrink, now rather than at the next sweep.
+	s.resyncCheckDefinitions("node")
 
 	now := s.now()
 

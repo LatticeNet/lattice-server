@@ -120,6 +120,10 @@ type State struct {
 	// LatencyProbes is the operator's latency probe configuration
 	// (latency_probes.go), nil until one is saved. Written only on an edit.
 	LatencyProbes *model.LatencyProbeConfig `json:"latency_probes,omitempty"`
+	// CheckDefinitions are the operator's check definitions (design 32 D1,
+	// check_definitions.go), by id. Written only on an edit; the monitors
+	// they expand into live in Monitors.
+	CheckDefinitions map[string]model.CheckDefinition `json:"check_definitions,omitempty"`
 	// MonitorSettings is the operator's monitor history setting
 	// (monitor_settings.go), nil until one is saved. Written only on an edit.
 	MonitorSettings *model.MonitorSettings `json:"monitor_settings,omitempty"`
@@ -951,6 +955,7 @@ func emptyState() State {
 		NotifyChannels:          map[string]model.NotifyChannel{},
 		NotifyRules:             map[string]model.NotifyRule{},
 		NotifyRuleOptions:       map[string]NotifyRuleOptions{},
+		CheckDefinitions:        map[string]model.CheckDefinition{},
 		NotifyChannelOptions:    map[string]NotifyChannelOptions{},
 		ProbeTargets:            map[string]ProbeTarget{},
 		NotifyWebhooks:          map[string]NotifyWebhook{},
@@ -1087,6 +1092,9 @@ func (st *State) ensureMaps() {
 	}
 	if st.NotifyRuleOptions == nil {
 		st.NotifyRuleOptions = map[string]NotifyRuleOptions{}
+	}
+	if st.CheckDefinitions == nil {
+		st.CheckDefinitions = map[string]model.CheckDefinition{}
 	}
 	if st.ProbeTargets == nil {
 		st.ProbeTargets = map[string]ProbeTarget{}
@@ -5230,6 +5238,17 @@ func (s *Store) DeleteGroup(id string) error {
 	}
 	if err := groupInUse(id, all, policies); err != nil {
 		return err
+	}
+	defIDs := make([]string, 0, len(s.state.CheckDefinitions))
+	for defID := range s.state.CheckDefinitions {
+		defIDs = append(defIDs, defID)
+	}
+	sort.Strings(defIDs)
+	for _, defID := range defIDs {
+		def := s.state.CheckDefinitions[defID]
+		if slices.Contains(def.Sources.Groups, id) || slices.Contains(def.Targets.Groups, id) {
+			return fmt.Errorf("group %q is used by check definition %q (%s); take it out of that check first", id, def.ID, def.Name)
+		}
 	}
 	delete(s.state.Groups, id)
 	return s.Save()

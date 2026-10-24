@@ -1003,8 +1003,14 @@ func latencyIDList(ids []string) string {
 // the endpoint its monitor already had.
 func (s *Server) startLatencyProbeSync() {
 	s.runLatencyProbeSync(latencyProbeSyncInterval, func() {
-		if _, _, err := s.syncLatencyProbes(s.now()); err != nil {
+		now := s.now()
+		if _, _, err := s.syncLatencyProbes(now); err != nil {
 			s.logger.Printf("latency probes: %v", err)
+		}
+		// Check definitions follow on the same sweep, reusing the endpoint
+		// picks the path set just made (design 32 D1).
+		if _, err := s.syncCheckDefinitions(now, "sweep"); err != nil {
+			s.logger.Printf("check definitions: %v", err)
 		}
 	})
 }

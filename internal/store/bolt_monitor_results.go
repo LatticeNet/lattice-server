@@ -520,6 +520,26 @@ func (bs *BoltStateStore) DeleteMonitorResults(monitorID string) error {
 	})
 }
 
+// DeleteMonitorsResults removes the history of every monitor in ids in one
+// transaction, so deleting a definition's monitors is all or nothing in the
+// hot store and pays for one commit, not one per monitor.
+func (bs *BoltStateStore) DeleteMonitorsResults(ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	return bs.db.Update(func(tx *bolt.Tx) error {
+		if err := checkBoltVersion(tx); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if err := deleteMonitorResultsTx(tx, id); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // monitorPairsForNodeTx lists the pair keys whose node is nodeID, read off
 // the latest bucket: a pair with rows always has a latest record.
 func monitorPairsForNodeTx(tx *bolt.Tx, nodeID string, visit func(key string, latest MonitorLatest) error) error {

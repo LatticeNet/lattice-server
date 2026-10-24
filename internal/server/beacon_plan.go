@@ -651,6 +651,9 @@ func (s *Server) beaconApprove(ctx context.Context, p principal, approval model.
 	if _, _, err := s.syncLatencyProbes(now); err != nil {
 		s.logger.Printf("latency probes not synced after beacon approval %s: %v", approval.ID, err)
 	}
+	if _, err := s.syncCheckDefinitions(now, "beacon"); err != nil {
+		s.logger.Printf("check definitions not synced after beacon approval %s: %v", approval.ID, err)
+	}
 	s.syncBeaconReach(now)
 	if fresh, ok := s.store.Approval(approval.ID); ok {
 		approval = fresh

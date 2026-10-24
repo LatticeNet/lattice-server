@@ -706,9 +706,11 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 	sort.Strings(ids)
 	for _, id := range ids {
 		mon := monitors[id]
-		if !store.MonitorOwnerOf(mon).Authored() {
+		owner := store.MonitorOwnerOf(mon)
+		if !owner.Authored() {
 			continue
 		}
+		definition := owner == store.MonitorOwnerDefinition
 		var sources []string
 		switch {
 		case mon.Type == model.MonitorTypeTLS:
@@ -762,6 +764,11 @@ func (s *Server) pathEntries(now time.Time, nodes map[string]model.Node) []pathE
 					if e.gate = s.beaconMonitorGate(nodes[source], mon.TargetNode, now); e.gate == "" {
 						e.gate = s.beaconTargetListenGate(mon.TargetNode, nodes)
 					}
+				}
+				if e.gate == "" && definition && mon.Enabled && slices.Contains(mon.PausedNodeIDs, source) {
+					// A definition's paused sources are only ever its
+					// packet budget pauses: its monitors refuse edits.
+					e.gate = model.PathReasonPacketBudget
 				}
 			}
 			out = append(out, e)

@@ -41,9 +41,17 @@ jobs:
         # the step.
         run: go list ./... | grep -v '/internal/server$' | xargs go test -race -cover -timeout 25m
       - name: gosec
+        working-directory: lattice-server
+        # Inside the module, like vet and test. Run from the parent directory,
+        # gosec v2.29.0 loaded no package and passed with "Files: 0", so the
+        # step also fails when the scan covered no file. v2.30.0 loads a
+        # package by its absolute file paths, and go/packages splits
+        # internal/server's list into two half-packages that do not type-check,
+        # so it stays on v2.29.0 until that is fixed upstream.
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
-          gosec ./lattice-server/...
+          gosec -fmt=json -out="$RUNNER_TEMP/gosec.json" -stdout -verbose=text ./...
+          jq -e '.Stats.files > 0' "$RUNNER_TEMP/gosec.json" >/dev/null
       - name: govulncheck
         working-directory: lattice-server
         run: |

@@ -405,3 +405,30 @@ func TestNetGuardOwnedPlanAppliesCoreDNSOnly(t *testing.T) {
 		t.Fatal("a plan with neither a ruleset nor the NetGuard section must not parse")
 	}
 }
+
+// Deployment and node names are operator text rendered above the sections the
+// apply script reads by heading. On bd335aa a node name holding a fenced
+// Corefile replaced the reviewed one; a name could equally plant a ruleset
+// into a plan for a node NetGuard manages.
+func TestApprovalPlanKeepsNamesOnOneLine(t *testing.T) {
+	dep := baseDeployment()
+	dep.Name = "evil\n## nftables lattice_guard candidate\n```nft\ntable inet lattice_guard {}\n```"
+	cfg, err := GenerateConfig(dep, RenderOptions{MeshBindIP: "10.66.0.7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := RenderApprovalPlanWithOptions(dep, "node\n## CoreDNS Corefile\n```coredns\n.:53 {\n  forward . 192.0.2.66\n}\n```", cfg, "", nil, ApprovalPlanOptions{NetGuardOwnsFirewall: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := ParseApprovalPlan(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(artifacts.Corefile, "192.0.2.66") {
+		t.Fatalf("a node name planted a Corefile:\n%s", artifacts.Corefile)
+	}
+	if artifacts.NFTRuleset != "" {
+		t.Fatalf("a deployment name planted a ruleset into a NetGuard-owned plan:\n%s", artifacts.NFTRuleset)
+	}
+}

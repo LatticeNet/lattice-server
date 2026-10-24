@@ -233,11 +233,11 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 	}
 	var b strings.Builder
 	b.WriteString("# Lattice Self-host DNS plan\n\n")
-	fmt.Fprintf(&b, "deployment_id: %s\n", dep.ID)
-	fmt.Fprintf(&b, "name: %s\n", dep.Name)
-	fmt.Fprintf(&b, "node_id: %s\n", dep.NodeID)
+	fmt.Fprintf(&b, "deployment_id: %s\n", planField(dep.ID))
+	fmt.Fprintf(&b, "name: %s\n", planField(dep.Name))
+	fmt.Fprintf(&b, "node_id: %s\n", planField(dep.NodeID))
 	if nodeName != "" {
-		fmt.Fprintf(&b, "node_name: %s\n", nodeName)
+		fmt.Fprintf(&b, "node_name: %s\n", planField(nodeName))
 	}
 	fmt.Fprintf(&b, "engine: %s\n", dep.Engine)
 	fmt.Fprintf(&b, "exposure: %s\n", dep.Exposure)
@@ -250,7 +250,7 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 	}
 	b.WriteString("\n## Firewall delta\n")
 	for _, line := range firewallSummary {
-		fmt.Fprintf(&b, "- %s\n", line)
+		fmt.Fprintf(&b, "- %s\n", planField(line))
 	}
 	if binary.Enabled() {
 		b.WriteString("\n## CoreDNS binary\n")
@@ -489,12 +489,15 @@ func renderStaticZoneFile(dep model.DNSDeployment, zone model.DNSZone, index int
 	return ZoneFile{Path: filePath, Content: b.String()}, nil
 }
 
+// fencedSection returns the fenced body under heading. The heading matches
+// only as a whole line, the way the renderer writes it, so header text that
+// merely contains it cannot stand in for the section.
 func fencedSection(plan, heading, language string) (string, error) {
-	start := strings.Index(plan, heading)
+	start := strings.Index(plan, "\n"+heading+"\n")
 	if start < 0 {
 		return "", fmt.Errorf("missing section %q", heading)
 	}
-	rest := plan[start+len(heading):]
+	rest := plan[start+1+len(heading):]
 	fence := "```" + language + "\n"
 	fenceStart := strings.Index(rest, fence)
 	if fenceStart < 0 {
@@ -516,11 +519,11 @@ func zoneSections(plan string) ([]ZoneFile, error) {
 	zones := []ZoneFile{}
 	rest := plan
 	for {
-		idx := strings.Index(rest, "## Zone file: ")
+		idx := strings.Index(rest, "\n## Zone file: ")
 		if idx < 0 {
 			break
 		}
-		rest = rest[idx+len("## Zone file: "):]
+		rest = rest[idx+len("\n## Zone file: "):]
 		lineEnd := strings.IndexByte(rest, '\n')
 		if lineEnd < 0 {
 			return nil, errors.New("zone file heading missing newline")
@@ -572,8 +575,7 @@ func coreDNSBinarySection(plan string) (*CoreDNSBinarySource, error) {
 }
 
 func optionalFencedSection(plan, heading, language string) (string, bool, error) {
-	start := strings.Index(plan, heading)
-	if start < 0 {
+	if !strings.Contains(plan, "\n"+heading+"\n") {
 		return "", false, nil
 	}
 	section, err := fencedSection(plan, heading, language)
@@ -648,6 +650,19 @@ func writeCoreDNSBootstrap(b *strings.Builder, binary *CoreDNSBinarySource) {
 	b.WriteString("  rm -rf \"$tmpdir\"\n")
 	b.WriteString("}\n")
 	b.WriteString("if [ -x \"$COREDNS_BIN\" ] && verify_coredns_sha256 \"$COREDNS_BIN\"; then echo 'lattice selfdns: pinned CoreDNS already installed'; else install_pinned_coredns; fi\n")
+}
+
+// planField keeps a free-text value on its one header line. Deployment and
+// node names are operator text rendered above the sections the apply script
+// reads by heading, so a line break in one could plant a fenced Corefile or a
+// lattice_guard candidate ahead of the reviewed one.
+func planField(value string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, value)
 }
 
 func shellQuote(value string) string {

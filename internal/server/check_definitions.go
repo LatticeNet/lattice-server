@@ -99,6 +99,15 @@ func checkSelectorEmpty(sel model.TargetSelector) bool {
 	return !sel.All && len(sel.Nodes) == 0 && len(sel.Groups) == 0
 }
 
+// aCheck is "a tcp check", "an auto check": a method's check with its article.
+func aCheck(kind string) string {
+	switch kind {
+	case model.CheckMethodAuto, model.MonitorTypeICMP, model.MonitorTypeHTTP:
+		return "an " + kind + " check"
+	}
+	return "a " + kind + " check"
+}
+
 // checkKindTakesNodes and checkKindTakesAddresses say which targets a
 // method takes.
 func checkKindTakesNodes(kind string) bool {
@@ -217,7 +226,7 @@ func normalizeCheckAddress(kind, raw string) (string, error) {
 		}
 		return net.JoinHostPort(strings.ToLower(host), port), nil
 	}
-	return "", fmt.Errorf("a %s check takes no addresses", kind)
+	return "", fmt.Errorf("%s takes no addresses", aCheck(kind))
 }
 
 // normalizeCheckDefinition validates a save against the fleet now and
@@ -367,9 +376,9 @@ func (s *Server) normalizeCheckTargets(out *model.CheckDefinition, spec model.Ch
 	case !tls && checkSelectorEmpty(out.Sources):
 		return checkFieldf("sources", "sources selects no node: name nodes, groups or the whole fleet")
 	case !checkKindTakesNodes(out.Type) && (!checkSelectorEmpty(out.Targets) || len(out.Targets.Exclude) > 0):
-		return checkFieldf("targets", "a %s check takes addresses, not target nodes", out.Type)
+		return checkFieldf("targets", "%s takes addresses, not target nodes", aCheck(out.Type))
 	case !checkKindTakesAddresses(out.Type) && len(out.Addresses) > 0:
-		return checkFieldf("addresses", "a %s check names target nodes; it never takes an address", out.Type)
+		return checkFieldf("addresses", "%s names target nodes; it never takes an address", aCheck(out.Type))
 	case checkSelectorEmpty(out.Targets) && len(out.Addresses) == 0:
 		return checkFieldf("targets", "the check has no target: name target nodes or addresses")
 	}
@@ -386,7 +395,7 @@ func (s *Server) normalizeExcludedPairs(out *model.CheckDefinition, pairs []mode
 		return nil
 	}
 	if !checkKindTakesNodes(out.Type) {
-		return checkFieldf("excluded_pairs", "a %s check has no node pairs to exclude", out.Type)
+		return checkFieldf("excluded_pairs", "%s has no node pairs to exclude", aCheck(out.Type))
 	}
 	nodes := map[string]bool{}
 	for _, n := range s.store.Nodes() {

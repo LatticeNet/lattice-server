@@ -95,7 +95,7 @@ func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-	s.setOIDCBindingCookie(w, binding)
+	s.setOIDCBindingCookie(w, r, binding)
 	http.Redirect(w, r, authURL, http.StatusFound) // #nosec G710 -- authURL is the configured provider's endpoint; the request only picks an enabled one
 }
 
@@ -104,25 +104,32 @@ func (s *Server) handleOIDCStart(w http.ResponseWriter, r *http.Request) {
 // paths; HttpOnly so scripts cannot read it.
 const oidcBindingCookie = "lattice_oidc_bind"
 
-func (s *Server) setOIDCBindingCookie(w http.ResponseWriter, token string) {
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
+// cookieSecure reports whether a sign-in cookie carries Secure: always when
+// the browser reached this server over TLS it terminates itself, and behind a
+// TLS proxy, which the server cannot see, when -secure-cookies says so.
+func (s *Server) cookieSecure(r *http.Request) bool {
+	return s.secureCookies || r.TLS != nil
+}
+
+func (s *Server) setOIDCBindingCookie(w http.ResponseWriter, r *http.Request, token string) {
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
 		Name:     oidcBindingCookie,
 		Value:    token,
 		Path:     "/api/auth/oidc",
 		HttpOnly: true,
-		Secure:   s.secureCookies,
+		Secure:   s.cookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(oidcStateTTL.Seconds()),
 	})
 }
 
-func (s *Server) clearOIDCBindingCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
+func (s *Server) clearOIDCBindingCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
 		Name:     oidcBindingCookie,
 		Value:    "",
 		Path:     "/api/auth/oidc",
 		HttpOnly: true,
-		Secure:   s.secureCookies,
+		Secure:   s.cookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
@@ -165,25 +172,25 @@ func (s *Server) ssoChallengeFromCookie(r *http.Request) (auth.TOTPChallenge, bo
 	return challenge, true
 }
 
-func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, value string) {
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
+func (s *Server) setTOTPChallengeCookie(w http.ResponseWriter, r *http.Request, value string) {
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
 		Name:     totpChallengeCookie,
 		Value:    value,
 		Path:     "/api/login/totp",
 		HttpOnly: true,
-		Secure:   s.secureCookies,
+		Secure:   s.cookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   300,
 	})
 }
 
-func (s *Server) clearTOTPChallengeCookie(w http.ResponseWriter) {
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
+func (s *Server) clearTOTPChallengeCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
 		Name:     totpChallengeCookie,
 		Value:    "",
 		Path:     "/api/login/totp",
 		HttpOnly: true,
-		Secure:   s.secureCookies,
+		Secure:   s.cookieSecure(r),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   -1,
 	})
@@ -287,7 +294,7 @@ func (s *Server) handleCancelPendingSSOSecondFactor(w http.ResponseWriter, r *ht
 			return
 		}
 		s.recordRequestAudit(r, model.AuditEvent{ID: id.New("audit"), ActorID: challenge.UserID, Action: "login.oidc.second_factor_cancelled", Decision: "observe"})
-		s.clearTOTPChallengeCookie(w)
+		s.clearTOTPChallengeCookie(w, r)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -322,7 +329,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	// Browser-binding (login-CSRF defense): the callback must carry the cookie
 	// set at /start. This is the primary tie; the IP check is defense-in-depth.
-	s.clearOIDCBindingCookie(w)
+	s.clearOIDCBindingCookie(w, r)
 	bindCookie, _ := r.Cookie(oidcBindingCookie)
 	if bindCookie == nil || subtle.ConstantTimeCompare([]byte(auth.HashBindingToken(bindCookie.Value)), []byte(st.BindingHash)) != 1 {
 		s.oidcFail(w, r, st.RedirectAfter, "csrf", "")
@@ -495,7 +502,7 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		// binding secret the attacker does not have; handleLoginTOTP requires it
 		// for every SSO-issued challenge, so only the browser that completed SSO
 		// can finish 2FA. [C14]
-		s.setTOTPChallengeCookie(w, ssoChallengeCookieValue(challenge.ID, bindingSecret))
+		s.setTOTPChallengeCookie(w, r, ssoChallengeCookieValue(challenge.ID, bindingSecret))
 		s.oidcRedirect(w, r, st.RedirectAfter, "totp_challenge", challenge.ID)
 		return
 	}

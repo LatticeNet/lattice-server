@@ -2425,13 +2425,13 @@ func (s *Server) startSessionAudited(w http.ResponseWriter, r *http.Request, use
 	if err := s.store.PutSession(session); err != nil {
 		return auth.Session{}, err
 	}
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
 		Name:     "lattice_session",
 		Value:    session.ID,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   s.secureCookies,
+		Secure:   s.cookieSecure(r),
 		Expires:  session.ExpiresAt,
 	})
 	ev.ID, ev.ActorID, ev.Decision = id.New("audit"), user.ID, "allow"
@@ -2639,7 +2639,7 @@ func (s *Server) handleLoginTOTP(w http.ResponseWriter, r *http.Request) {
 	if ssoBrowser && !usedRecovery {
 		s.confirmSSOSecondFactor(r, challenge, user)
 	}
-	s.clearTOTPChallengeCookie(w)
+	s.clearTOTPChallengeCookie(w, r)
 	s.issueSession(w, r, user)
 }
 
@@ -2789,13 +2789,13 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, p principa
 		}
 	}
 	s.recordPrincipalAudit(p, model.AuditEvent{ID: id.New("audit"), Action: "logout", Decision: "allow"})
-	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure follows -secure-cookies, which the hardening guide and compose set
+	http.SetCookie(w, &http.Cookie{ // #nosec G124 -- Secure over direct TLS, else per -secure-cookies (startup warns when off)
 		Name:     "lattice_session",
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   s.secureCookies,
+		Secure:   s.cookieSecure(r),
 		MaxAge:   -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})

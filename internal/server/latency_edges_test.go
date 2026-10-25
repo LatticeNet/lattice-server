@@ -103,12 +103,12 @@ func TestLatencyEdgeCacheKeepsTheLastGoodAnswerForAWhile(t *testing.T) {
 	c := &latencyEdgeCache{lookup: r.lookup}
 	t0 := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
 	c.refresh([]string{"Edge.Example.Net", "other.example.net"}, t0)
-	if got := c.snapshot(); !slices.Equal(got["edge.example.net"], []string{"203.0.113.50"}) || len(got) != 2 {
+	if got, refreshed := c.snapshot(); !refreshed || !slices.Equal(got["edge.example.net"], []string{"203.0.113.50"}) || len(got) != 2 {
 		t.Fatalf("first refresh = %v", got)
 	}
 	r.fail("edge.example.net")
 	c.refresh([]string{"edge.example.net"}, t0.Add(latencyEdgeStale-time.Minute))
-	got := c.snapshot()
+	got, _ := c.snapshot()
 	if !slices.Equal(got["edge.example.net"], []string{"203.0.113.50"}) {
 		t.Fatalf("a failed lookup dropped a fresh answer: %v", got)
 	}
@@ -116,7 +116,7 @@ func TestLatencyEdgeCacheKeepsTheLastGoodAnswerForAWhile(t *testing.T) {
 		t.Fatalf("a name no inventory declares was kept: %v", got)
 	}
 	c.refresh([]string{"edge.example.net"}, t0.Add(latencyEdgeStale+time.Minute))
-	if got := c.snapshot(); len(got) != 0 {
+	if got, _ := c.snapshot(); len(got) != 0 {
 		t.Fatalf("an answer older than latencyEdgeStale was kept: %v", got)
 	}
 }
@@ -212,5 +212,49 @@ func TestLatencyLastKnownEndpointMustBeAnAddress(t *testing.T) {
 	if !latencyDialableTarget("203.0.113.3:443") || latencyDialableTarget("edge.example.net:50100") ||
 		latencyDialableTarget("10.0.0.1:443") || latencyDialableTarget("203.0.113.3") {
 		t.Fatal("latencyDialableTarget misjudged a target")
+	}
+}
+
+// KI-34: only the sweep resolves edge names, and its first run waits one
+// interval after a start, while agents report their inventories again within
+// seconds. Until that first refresh, a node whose lines sit behind an edge
+// name keeps the endpoint its checks dialled (an operator check that names
+// the node, a check definition, an agent's pull) instead of reading as
+// nothing to dial; from the first refresh on it is judged by the inventory
+// and the edge's answer again.
+func TestEdgeHostedEndpointStandsUntilTheFirstEdgeRefresh(t *testing.T) {
+	srv, _, _ := latencyFleet(t)
+	r := fakeEdgeResolver(map[string][]string{"edge.example.net": {"203.0.113.50"}})
+	const prior = "203.0.113.50:50100"
+	resolve := func() (string, string) {
+		t.Helper()
+		srv.monitorPaths.notePlan(latencyPlan{}, time.Time{})
+		return srv.monitorTargetsAt(srv.now()).resolve(model.MonitorTypeTCP, "node-us", prior)
+	}
+	sweep := func() {
+		t.Helper()
+		if _, _, err := srv.syncLatencyProbes(srv.now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A start: nothing resolved yet, and node-us has reported its lines.
+	srv.latencyEdges = latencyEdgeCache{lookup: r.lookup}
+	if target, reason := resolve(); target != prior || reason != "" {
+		t.Fatalf("before the first refresh = %q %q, want the last known %s", target, reason, prior)
+	}
+	r.set("edge.example.net", "203.0.113.51")
+	sweep()
+	if target, reason := resolve(); target != "203.0.113.51:50100" || reason != "" {
+		t.Fatalf("after the first refresh = %q %q, want the edge's new address", target, reason)
+	}
+
+	// A start whose first refresh cannot resolve the name: from then on the
+	// node is judged as before, with nothing to dial.
+	r.fail("edge.example.net")
+	srv.latencyEdges = latencyEdgeCache{lookup: r.lookup}
+	sweep()
+	if target, reason := resolve(); target != "" || reason == "" {
+		t.Fatalf("after a failed first refresh = %q %q, want nothing to dial", target, reason)
 	}
 }

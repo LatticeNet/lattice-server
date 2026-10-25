@@ -39,6 +39,9 @@ const (
 type latencyEdgeCache struct {
 	mu      sync.Mutex
 	entries map[string]latencyEdgeEntry
+	// refreshed says a refresh has run since the control plane started.
+	// Before it, a name with no entry is not resolved yet, not refused.
+	refreshed bool
 	// lookup resolves one name; nil uses net.DefaultResolver. Tests set it.
 	lookup func(ctx context.Context, host string) ([]net.IPAddr, error)
 }
@@ -134,13 +137,15 @@ func (c *latencyEdgeCache) refresh(hosts []string, now time.Time) {
 		}
 	}
 	c.mu.Lock()
-	c.entries = next
+	c.entries, c.refreshed = next, true
 	c.mu.Unlock()
 }
 
-// snapshot returns each cached name's accepted addresses. The slices are
-// shared and never written after a refresh publishes them.
-func (c *latencyEdgeCache) snapshot() map[string][]string {
+// snapshot returns each cached name's accepted addresses, and whether a
+// refresh has run since the start, so a missing name can be told apart from
+// one not resolved yet. The slices are shared and never written after a
+// refresh publishes them.
+func (c *latencyEdgeCache) snapshot() (map[string][]string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make(map[string][]string, len(c.entries))
@@ -149,5 +154,5 @@ func (c *latencyEdgeCache) snapshot() map[string][]string {
 			out[key] = entry.addrs
 		}
 	}
-	return out
+	return out, c.refreshed
 }

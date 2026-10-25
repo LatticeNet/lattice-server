@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,9 +40,10 @@ const (
 type latencyEdgeCache struct {
 	mu      sync.Mutex
 	entries map[string]latencyEdgeEntry
-	// refreshed says a refresh has run since the control plane started.
-	// Before it, a name with no entry is not resolved yet, not refused.
-	refreshed bool
+	// asked are the names the last refresh looked up. A name outside it
+	// (every name before the first refresh after a start) is not resolved
+	// yet, rather than refused or failing.
+	asked map[string]bool
 	// lookup resolves one name; nil uses net.DefaultResolver. Tests set it.
 	lookup func(ctx context.Context, host string) ([]net.IPAddr, error)
 }
@@ -137,15 +139,15 @@ func (c *latencyEdgeCache) refresh(hosts []string, now time.Time) {
 		}
 	}
 	c.mu.Lock()
-	c.entries, c.refreshed = next, true
+	c.entries, c.asked = next, keys
 	c.mu.Unlock()
 }
 
-// snapshot returns each cached name's accepted addresses, and whether a
-// refresh has run since the start, so a missing name can be told apart from
-// one not resolved yet. The slices are shared and never written after a
+// snapshot returns each cached name's accepted addresses, and the names the
+// last refresh looked up, so a missing name can be told apart from one not
+// resolved yet. The slices and the set are shared and never written after a
 // refresh publishes them.
-func (c *latencyEdgeCache) snapshot() (map[string][]string, bool) {
+func (c *latencyEdgeCache) snapshot() (map[string][]string, map[string]bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := make(map[string][]string, len(c.entries))
@@ -154,5 +156,20 @@ func (c *latencyEdgeCache) snapshot() (map[string][]string, bool) {
 			out[key] = entry.addrs
 		}
 	}
-	return out, c.refreshed
+	return out, c.asked
+}
+
+// latencyEdgePending says inv publishes a line on an edge host name the last
+// refresh did not look up, so that line has no address yet (KI-34).
+func latencyEdgePending(inv model.SingBoxInventory, asked map[string]bool) bool {
+	edge := strings.TrimSpace(inv.ProviderEdge)
+	if !latencyHostname(edge) || asked[latencyEdgeKey(edge)] {
+		return false
+	}
+	for _, line := range inv.Nodes {
+		if public, _ := strconv.Atoi(strings.TrimSpace(line.PublicPort)); public > 0 {
+			return true
+		}
+	}
+	return false
 }

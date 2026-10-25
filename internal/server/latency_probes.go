@@ -412,9 +412,11 @@ type latencyNodeEndpoints struct {
 	// lastKnown says no inventory is in memory for the node while it is
 	// online and its persisted sing-box record says running, received
 	// within beaconLastKnownFor: the window after a control-plane start
-	// before the agent reports again (KI-34). An already applied beacon
-	// endpoint keeps standing in it (beaconEndpointStands). A node that
-	// reports a failed inventory is not in it: its lines are in question.
+	// before the agent reports again (KI-34). An online node whose
+	// inventory publishes lines on an edge name no sweep has looked up yet
+	// is in it too. An already applied beacon endpoint keeps standing in
+	// it (beaconEndpointStands). A node that reports a failed inventory is
+	// not in it: its lines are in question.
 	lastKnown  bool
 	candidates []latencyEndpoint
 	note       string
@@ -718,7 +720,7 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 		inventories[inv.NodeID] = inv
 	}
 	approvals := s.store.Approvals()
-	edges := s.latencyEdges.snapshot()
+	edges, edgesAsked := s.latencyEdges.snapshot()
 	interval := cfg.IntervalSec
 	if interval <= 0 {
 		interval = model.LatencyProbeDefaultIntervalSec
@@ -742,6 +744,14 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 		inv, reported := inventories[n.ID]
 		switch {
 		case reported && (inv.Status == "" || inv.Status == "ok"):
+			if latencyEdgePending(inv, edgesAsked) {
+				// No sweep has looked up this node's edge name yet (after
+				// a start, or a name new since the last sweep), so its
+				// edge lines have no address: its checks keep what they
+				// dialled until the next sweep (KI-34).
+				info.lastKnown = n.Online
+				break
+			}
 			info.live = true
 			info.candidates, info.note = latencyEndpoints(n, inv, info.refused, edges)
 		case !reported && n.Online:

@@ -61,7 +61,12 @@ func resyncPaths(t *testing.T, srv *Server) {
 
 func noteSingBoxRunning(t *testing.T, srv *Server, st *store.Store, nodeID string) {
 	t.Helper()
-	if _, _, err := st.UpsertSingBoxLiveness(store.SingBoxLiveness{NodeID: nodeID, State: serviceStateRunning, StateSince: srv.now(), ReceivedAt: srv.now()}); err != nil {
+	noteSingBox(t, st, nodeID, serviceStateRunning, srv.now())
+}
+
+func noteSingBox(t *testing.T, st *store.Store, nodeID, state string, received time.Time) {
+	t.Helper()
+	if _, _, err := st.UpsertSingBoxLiveness(store.SingBoxLiveness{NodeID: nodeID, State: state, StateSince: received, ReceivedAt: received}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -90,10 +95,40 @@ func TestBeaconEdgeEndpointStandsUntilInventoryReturns(t *testing.T) {
 	}
 }
 
-// The last-known rule needs evidence the node reports line inventory at all:
-// without a sing-box record, or with the node offline, a missing inventory
-// leaves only the node's own addresses, as before.
-func TestBeaconEdgeEndpointNeedsARunningSingBoxAndAnOnlineNode(t *testing.T) {
+// The last-known rule needs evidence the node was reporting line inventory
+// lately: without a sing-box record, with one that is not running or is
+// older than the window, with the node offline, or with a failed inventory
+// reported, only the node's own addresses count, as before.
+func TestBeaconEdgeEndpointNeedsARecentRunningSingBoxAndAnOnlineNode(t *testing.T) {
+	gate := func(t *testing.T, srv *Server, st *store.Store) {
+		t.Helper()
+		resyncPaths(t, srv)
+		if reason := srv.beaconMonitorGate(nodeOf(t, st, "node-a"), "node-t", srv.now()); reason != model.PathReasonNotProbeable {
+			t.Fatalf("gate = %q", reason)
+		}
+	}
+	t.Run("a record older than the window", func(t *testing.T) {
+		srv, st := edgeBeaconFleet(t)
+		noteSingBox(t, st, "node-t", serviceStateRunning, srv.now().Add(-beaconLastKnownFor-time.Minute))
+		forgetInventory(srv)
+		gate(t, srv, st)
+	})
+	t.Run("a record that is not running", func(t *testing.T) {
+		srv, st := edgeBeaconFleet(t)
+		noteSingBox(t, st, "node-t", "down", srv.now())
+		forgetInventory(srv)
+		gate(t, srv, st)
+	})
+	t.Run("a failed inventory", func(t *testing.T) {
+		srv, st := edgeBeaconFleet(t)
+		noteSingBoxRunning(t, srv, st, "node-t")
+		srv.singboxInvMu.Lock()
+		inv := srv.singboxInv["node-t"]
+		inv.Status = "error"
+		srv.singboxInv["node-t"] = inv
+		srv.singboxInvMu.Unlock()
+		gate(t, srv, st)
+	})
 	t.Run("no sing-box record", func(t *testing.T) {
 		srv, st := edgeBeaconFleet(t)
 		forgetInventory(srv)

@@ -273,13 +273,13 @@ func beaconEndpointCurrent(n model.Node, endpoint string, endpoints map[string]l
 }
 
 // beaconEndpointStands reports whether sources may keep using an applied
-// endpoint: it is current, or the node has reported no line inventory since
-// this process started while its sing-box was last seen running and it is
-// online (latencyNodeEndpoints.lastKnown), so the endpoint the approved plan
-// checked stands until the inventory says otherwise, as a tcp prior does
+// endpoint: it is current, or the node's inventory is missing in the
+// bounded window latencyNodeEndpoints.lastKnown describes, so the endpoint
+// the approved plan checked stands until an inventory says otherwise
 // (KI-34). A node that moved and whose inventory has not arrived yet keeps
 // its old endpoint for that window. Plans are judged by
-// beaconEndpointCurrent alone.
+// beaconEndpointCurrent alone, so re-rendering an edge plan in the window is
+// refused until the inventory returns.
 func beaconEndpointStands(n model.Node, endpoint string, endpoints map[string]latencyNodeEndpoints) bool {
 	if beaconEndpointCurrent(n, endpoint, endpoints) {
 		return true

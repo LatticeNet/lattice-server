@@ -397,15 +397,24 @@ type latencyPlan struct {
 	beaconCandidates map[string][]string
 }
 
+// beaconLastKnownFor bounds latencyNodeEndpoints.lastKnown by the age of
+// the node's last sing-box report: a persisted report time is up to
+// store.ReportClockPersistInterval old after a start, plus the restart and
+// the agent's first report since. An agent that heartbeats but stops
+// reporting inventory leaves the window that long after its last report.
+const beaconLastKnownFor = store.ReportClockPersistInterval + 10*time.Minute
+
 // latencyNodeEndpoints is what the port rule found on one node: the
 // endpoints it accepted, best first, when the node's line inventory is
 // current, and the ports it refuses either way.
 type latencyNodeEndpoints struct {
 	live bool
-	// lastKnown says the node has reported no inventory to this process
-	// yet, while its sing-box was last seen running and the node is online:
-	// the window after a control-plane start (KI-34). An already applied
-	// beacon endpoint keeps standing in it (beaconEndpointStands).
+	// lastKnown says no inventory is in memory for the node while it is
+	// online and its persisted sing-box record says running, received
+	// within beaconLastKnownFor: the window after a control-plane start
+	// before the agent reports again (KI-34). An already applied beacon
+	// endpoint keeps standing in it (beaconEndpointStands). A node that
+	// reports a failed inventory is not in it: its lines are in question.
 	lastKnown  bool
 	candidates []latencyEndpoint
 	note       string
@@ -725,6 +734,7 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 		out.desired = append(out.desired, paused)
 	}
 
+	liveness := s.store.SingBoxLivenessAll()
 	for _, n := range nodes {
 		// Every node's tcp endpoints, target or not: an operator's check
 		// that names the node resolves against them.
@@ -735,8 +745,8 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 			info.live = true
 			info.candidates, info.note = latencyEndpoints(n, inv, info.refused, edges)
 		case !reported && n.Online:
-			rec, ok := s.store.SingBoxLivenessRecord(n.ID)
-			info.lastKnown = ok && rec.State == serviceStateRunning
+			rec, ok := liveness[n.ID]
+			info.lastKnown = ok && rec.State == serviceStateRunning && now.Sub(rec.ReceivedAt) <= beaconLastKnownFor
 		}
 		out.endpoints[n.ID] = info
 

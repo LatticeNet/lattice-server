@@ -36,7 +36,7 @@ type SingBoxLiveness struct {
 //
 // A record that differs from the stored one only in its clocks (received_at
 // and the probe's probed_at) replaces it in memory without a write, until the
-// copy on disk is reportClockPersistInterval old. Anything else, a state
+// copy on disk is ReportClockPersistInterval old. Anything else, a state
 // change, the incident bookkeeping, a restart counter or a probe error, is
 // written before this returns, so a restart always resumes from the latest
 // state, the open episode and whether it was already notified.

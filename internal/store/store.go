@@ -4859,6 +4859,11 @@ func (s *Store) DeleteNFTInputs(nodeID string) error {
 }
 
 // UpsertDNSDeployment stores a self-hosted DNS deployment intent record.
+//
+// CertMonitorIDs is not written here: LinkDNSCertMonitors owns it. A save
+// reads the record, edits it and writes it back, and keeping the stored list
+// means a link made in between survives the save, and a record cannot link
+// checks by carrying their ids.
 func (s *Store) UpsertDNSDeployment(dep model.DNSDeployment) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -4866,8 +4871,72 @@ func (s *Store) UpsertDNSDeployment(dep model.DNSDeployment) error {
 	if dep.CreatedAt.IsZero() {
 		dep.CreatedAt = dep.UpdatedAt
 	}
+	dep.CertMonitorIDs = nil
+	if current, ok := s.state.DNSDeployments[dep.ID]; ok {
+		dep.CertMonitorIDs = current.CertMonitorIDs
+	}
 	s.state.DNSDeployments[dep.ID] = dep
 	return s.Save()
+}
+
+var (
+	// ErrDNSDeploymentNotFound is a link to a deployment that is not stored.
+	ErrDNSDeploymentNotFound = errors.New("dns deployment not found")
+	// ErrDNSDeploymentNotExternal is a certificate link to a deployment
+	// Lattice renders: only an external engine records a certificate.
+	ErrDNSDeploymentNotExternal = errors.New("dns deployment is not an external engine")
+	// ErrDNSCertMonitorGone is a link to a check deleted in between.
+	ErrDNSCertMonitorGone = errors.New("a check to link was deleted")
+)
+
+// LinkDNSCertMonitors stores the checks in create and links them, with the
+// stored checks named in link, to the external deployment depID, in one write
+// (design 32 S5c). The deployment's list keeps its order, drops checks that
+// were deleted since, and adds each id once, so linking again is idempotent.
+// Nothing is written when the deployment is gone or not external, or a check
+// in link no longer exists.
+func (s *Store) LinkDNSCertMonitors(depID string, create []model.Monitor, link []string) (model.DNSDeployment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dep, ok := s.state.DNSDeployments[depID]
+	if !ok {
+		return model.DNSDeployment{}, ErrDNSDeploymentNotFound
+	}
+	if dep.Engine != model.DNSEngineExternal {
+		return model.DNSDeployment{}, ErrDNSDeploymentNotExternal
+	}
+	for _, id := range link {
+		if _, ok := s.state.Monitors[id]; !ok {
+			return model.DNSDeployment{}, fmt.Errorf("%w: %s", ErrDNSCertMonitorGone, id)
+		}
+	}
+	now := time.Now().UTC()
+	ids := make([]string, 0, len(dep.CertMonitorIDs)+len(link)+len(create))
+	add := func(id string) {
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range dep.CertMonitorIDs {
+		if _, ok := s.state.Monitors[id]; ok {
+			add(id)
+		}
+	}
+	for _, id := range link {
+		add(id)
+	}
+	for _, m := range create {
+		m.UpdatedAt = now
+		if m.CreatedAt.IsZero() {
+			m.CreatedAt = now
+		}
+		s.state.Monitors[m.ID] = m
+		add(m.ID)
+	}
+	dep.CertMonitorIDs = ids
+	dep.UpdatedAt = now
+	s.state.DNSDeployments[depID] = dep
+	return dep, s.Save()
 }
 
 // DNSPublishOutcome is what one publish of a DNS deployment's hostname

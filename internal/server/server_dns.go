@@ -69,6 +69,12 @@ type dnsDeploymentView struct {
 	Disabled         bool                `json:"disabled,omitempty"`
 	CreatedAt        time.Time           `json:"created_at"`
 	UpdatedAt        time.Time           `json:"updated_at"`
+
+	// CertChecks are an external engine's linked tls checks the caller may
+	// read, and CertExpiry the expiry its sheet shows: measured by one of
+	// them, or the typed CertNotAfter (design 32 S5c).
+	CertChecks []dnsCertCheckView `json:"cert_checks,omitempty"`
+	CertExpiry *dnsCertExpiryView `json:"cert_expiry,omitempty"`
 }
 
 func (s *Server) handleDNSDeployments(w http.ResponseWriter, r *http.Request, p principal) {
@@ -78,7 +84,7 @@ func (s *Server) handleDNSDeployments(w http.ResponseWriter, r *http.Request, p 
 		views := make([]dnsDeploymentView, 0, len(deployments))
 		for _, dep := range deployments {
 			if rbac.Allows(p.Principal, "dns:admin", dep.NodeID) {
-				views = append(views, s.toDNSDeploymentView(dep))
+				views = append(views, s.toDNSDeploymentView(p, dep))
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"deployments": views})
@@ -130,7 +136,7 @@ func (s *Server) handleDNSDeployments(w http.ResponseWriter, r *http.Request, p 
 				"exposure": dep.Exposure,
 			},
 		})
-		writeJSON(w, http.StatusOK, s.toDNSDeploymentView(dep))
+		writeJSON(w, http.StatusOK, s.toDNSDeploymentView(p, dep))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -581,7 +587,7 @@ func (s *Server) handleDNSPublish(w http.ResponseWriter, r *http.Request, p prin
 		"ok":         true,
 		"ipv4":       updated.LastIPv4,
 		"ipv6":       updated.LastIPv6,
-		"deployment": s.toDNSDeploymentView(updated),
+		"deployment": s.toDNSDeploymentView(p, updated),
 	})
 }
 
@@ -1145,7 +1151,7 @@ func normalizeDNSName(value string, trailingDot bool, allowRoot bool) (string, e
 	return v, nil
 }
 
-func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView {
+func (s *Server) toDNSDeploymentView(p principal, dep model.DNSDeployment) dnsDeploymentView {
 	nodeName := ""
 	if n, ok := s.store.Node(dep.NodeID); ok {
 		nodeName = n.Name
@@ -1164,6 +1170,7 @@ func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView 
 	if dep.Engine == model.DNSEngineExternal {
 		v.Listeners = dep.Listeners
 		v.CertNotAfter = dep.CertNotAfter
+		v.CertChecks, v.CertExpiry = s.dnsCertViews(p, dep)
 		v.Drift = s.dnsExternalDrift(dep, s.now())
 	}
 	return v

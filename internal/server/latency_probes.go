@@ -401,7 +401,12 @@ type latencyPlan struct {
 // endpoints it accepted, best first, when the node's line inventory is
 // current, and the ports it refuses either way.
 type latencyNodeEndpoints struct {
-	live       bool
+	live bool
+	// lastKnown says the node has reported no inventory to this process
+	// yet, while its sing-box was last seen running and the node is online:
+	// the window after a control-plane start (KI-34). An already applied
+	// beacon endpoint keeps standing in it (beaconEndpointStands).
+	lastKnown  bool
 	candidates []latencyEndpoint
 	note       string
 	refused    map[int]bool
@@ -527,7 +532,7 @@ func (s *Server) latencyTargetFactsOf(n model.Node, endpoints map[string]latency
 	}
 	facts := s.beaconFactsOf(n)
 	f.targetGate = beaconTargetGate(bt, btOK, facts)
-	if f.targetGate == "" && !beaconEndpointCurrent(n, f.beaconEndpoint, endpoints) {
+	if f.targetGate == "" && !beaconEndpointStands(n, f.beaconEndpoint, endpoints) {
 		// The node moved off the address its plan advertises.
 		f.targetGate = model.PathReasonNotProbeable
 	}
@@ -724,9 +729,14 @@ func (s *Server) planLatencyProbesFor(cfg model.LatencyProbeConfig, stored bool,
 		// Every node's tcp endpoints, target or not: an operator's check
 		// that names the node resolves against them.
 		info := latencyNodeEndpoints{refused: s.latencyRefusedPorts(n.ID, approvals)}
-		if inv, live := inventories[n.ID]; live && (inv.Status == "" || inv.Status == "ok") {
+		inv, reported := inventories[n.ID]
+		switch {
+		case reported && (inv.Status == "" || inv.Status == "ok"):
 			info.live = true
 			info.candidates, info.note = latencyEndpoints(n, inv, info.refused, edges)
+		case !reported && n.Online:
+			rec, ok := s.store.SingBoxLivenessRecord(n.ID)
+			info.lastKnown = ok && rec.State == serviceStateRunning
 		}
 		out.endpoints[n.ID] = info
 

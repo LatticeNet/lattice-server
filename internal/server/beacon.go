@@ -272,6 +272,24 @@ func beaconEndpointCurrent(n model.Node, endpoint string, endpoints map[string]l
 	return beaconNodeAddresses(n, endpoints)[ap.Addr().String()]
 }
 
+// beaconEndpointStands reports whether sources may keep using an applied
+// endpoint: it is current, or the node has reported no line inventory since
+// this process started while its sing-box was last seen running and it is
+// online (latencyNodeEndpoints.lastKnown), so the endpoint the approved plan
+// checked stands until the inventory says otherwise, as a tcp prior does
+// (KI-34). A node that moved and whose inventory has not arrived yet keeps
+// its old endpoint for that window. Plans are judged by
+// beaconEndpointCurrent alone.
+func beaconEndpointStands(n model.Node, endpoint string, endpoints map[string]latencyNodeEndpoints) bool {
+	if beaconEndpointCurrent(n, endpoint, endpoints) {
+		return true
+	}
+	if _, err := beacon.ParseEndpoint(endpoint); err != nil {
+		return false
+	}
+	return endpoints[n.ID].lastKnown
+}
+
 // beaconSourceGate is why source may not probe target by beacon, given the
 // target is usable: it must be in the applied plan's approved set.
 func beaconSourceGate(t store.BeaconTarget, sourceID string) string {
@@ -421,7 +439,7 @@ func (s *Server) agentBeaconConfig(node model.Node, now time.Time) *model.AgentB
 				continue
 			}
 			if beaconTargetGate(t, true, s.beaconFactsOf(tn)) != "" || beaconSourceGate(t, node.ID) != "" ||
-				!beaconEndpointCurrent(tn, t.Settings.Endpoint, planned.endpoints) {
+				!beaconEndpointStands(tn, t.Settings.Endpoint, planned.endpoints) {
 				continue
 			}
 			current := s.beaconCurrentSources(targetID, planned, monitors, nodes)
@@ -547,7 +565,7 @@ func (s *Server) beaconMonitorGate(source model.Node, target string, now time.Ti
 	if reason := beaconTargetGate(t, exists, s.beaconFactsOf(tn)); reason != "" {
 		return reason
 	}
-	if !beaconEndpointCurrent(tn, t.Settings.Endpoint, s.pathPlanned(now).endpoints) {
+	if !beaconEndpointStands(tn, t.Settings.Endpoint, s.pathPlanned(now).endpoints) {
 		return model.PathReasonNotProbeable
 	}
 	return beaconSourceGate(t, source.ID)

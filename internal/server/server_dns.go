@@ -41,6 +41,8 @@ type dnsDeploymentView struct {
 	EnableTCP  bool            `json:"enable_tcp"`
 	Exposure   string          `json:"exposure"`
 	Zones      []model.DNSZone `json:"zones"`
+	// AllowedClients are the client networks a CoreDNS deployment answers.
+	AllowedClients []string `json:"allowed_clients,omitempty"`
 	// OpenResolver flags a stored deployment with public exposure and a
 	// forward zone. New ones are refused; one stored before the refusal
 	// stays readable and carries the flag until it is reshaped or disabled.
@@ -892,12 +894,18 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 		return model.DNSDeployment{}, err
 	}
 	req.Zones = zones
+	clients, err := normalizeDNSAllowedClients(req.AllowedClients)
+	if err != nil {
+		return model.DNSDeployment{}, err
+	}
+	req.AllowedClients = clients
 	// Refused at save as well as at plan, so the operator hears it where the
 	// exposure is chosen. A disabled deployment may still be saved, so a
 	// stored open resolver can be switched off without first being reshaped.
+	// The refusal lands on allowed_clients, the field that answers it.
 	if !req.Disabled {
 		if err := selfdns.RefuseOpenResolver(req); err != nil {
-			return model.DNSDeployment{}, err
+			return model.DNSDeployment{}, fieldError("allowed_clients", err)
 		}
 	}
 
@@ -965,6 +973,17 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 		req.Status = model.DNSStatusPending
 	}
 	return req, nil
+}
+
+// normalizeDNSAllowedClients is selfdns.NormalizeAllowedClients with the
+// refusal naming the entry at fault, so the editor marks the line to fix.
+func normalizeDNSAllowedClients(input []string) ([]string, error) {
+	clients, err := selfdns.NormalizeAllowedClients(input)
+	var refusal *selfdns.AllowedClientsError
+	if errors.As(err, &refusal) && refusal.Index >= 0 {
+		return nil, fieldError(fieldIndex("allowed_clients", refusal.Index), err)
+	}
+	return clients, fieldError("allowed_clients", err)
 }
 
 func normalizeDNSZones(input []model.DNSZone) ([]model.DNSZone, error) {
@@ -1140,7 +1159,7 @@ func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView 
 		LastAppliedAt: dep.LastAppliedAt, LastError: dep.LastError,
 		LastPublishedAt: dep.LastPublishedAt, LastPublishError: dep.LastPublishError, Disabled: dep.Disabled,
 		CreatedAt: dep.CreatedAt, UpdatedAt: dep.UpdatedAt,
-		OpenResolver: selfdns.IsOpenResolver(dep),
+		OpenResolver: selfdns.IsOpenResolver(dep), AllowedClients: dep.AllowedClients,
 	}
 	if dep.Engine == model.DNSEngineExternal {
 		v.Listeners = dep.Listeners

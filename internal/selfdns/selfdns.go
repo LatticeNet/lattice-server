@@ -150,6 +150,11 @@ func GenerateConfig(dep model.DNSDeployment, opts RenderOptions) (ConfigBundle, 
 		bindIP = parsed
 	}
 
+	clients, err := NormalizeAllowedClients(dep.AllowedClients)
+	if err != nil {
+		return ConfigBundle{}, err
+	}
+
 	var core strings.Builder
 	zoneFiles := []ZoneFile{}
 	for i, zone := range dep.Zones {
@@ -167,6 +172,7 @@ func GenerateConfig(dep model.DNSDeployment, opts RenderOptions) (ConfigBundle, 
 		if bindIP != "" {
 			fmt.Fprintf(&core, "  bind %s\n", bindIP)
 		}
+		writeACL(&core, clients)
 		core.WriteString("  errors\n")
 		core.WriteString("  log\n")
 		core.WriteString("  loop\n")
@@ -193,6 +199,147 @@ func GenerateConfig(dep model.DNSDeployment, opts RenderOptions) (ConfigBundle, 
 	}
 	sort.Slice(zoneFiles, func(i, j int) bool { return zoneFiles[i].Path < zoneFiles[j].Path })
 	return ConfigBundle{Corefile: core.String(), ZoneFiles: zoneFiles}, nil
+}
+
+// writeACL renders the allowed client networks as the acl plugin: one allow
+// per network, then a bare block. The plugin's default action is allow, so
+// without the final block a query no rule matches would be answered, and
+// recursed for a forward zone; block answers it REFUSED instead. The plugin's
+// place in the chain is fixed when CoreDNS is built, ahead of cache and of
+// every zone plugin, so writing it first in the block only makes the block
+// read in the order it runs.
+func writeACL(core *strings.Builder, clients []string) {
+	if len(clients) == 0 {
+		return
+	}
+	core.WriteString("  acl {\n")
+	for _, network := range clients {
+		fmt.Fprintf(core, "    allow net %s\n", network)
+	}
+	core.WriteString("    block\n")
+	core.WriteString("  }\n")
+}
+
+// AllowedClientsError is a refused allowed_clients list. Index is the entry
+// at fault, or -1 when the list as a whole is.
+type AllowedClientsError struct {
+	Index  int
+	Reason string
+}
+
+func (e *AllowedClientsError) Error() string {
+	if e.Index < 0 {
+		return "allowed_clients: " + e.Reason
+	}
+	return fmt.Sprintf("allowed_clients entry %d: %s", e.Index+1, e.Reason)
+}
+
+// NormalizeAllowedClients validates the client networks a deployment answers
+// (design 32 S5b) and returns them in canonical form without duplicates, in
+// the order given. Each is a network in CIDR notation with no host bits set;
+// a network covering every address is refused, since it reopens the resolver
+// the list exists to close. An empty list is nil.
+func NormalizeAllowedClients(input []string) ([]string, error) {
+	if len(input) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(input))
+	seen := map[netip.Prefix]bool{}
+	for i, raw := range input {
+		value := strings.TrimSpace(raw)
+		refuse := func(format string, args ...any) error {
+			return &AllowedClientsError{Index: i, Reason: fmt.Sprintf(format, args...)}
+		}
+		if value == "" {
+			return nil, refuse("is empty")
+		}
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			if addr, addrErr := netip.ParseAddr(value); addrErr == nil {
+				return nil, refuse("%s is an address, not a network in CIDR notation; write %s/%d", value, addr, addr.BitLen())
+			}
+			return nil, refuse("%q is not a network in CIDR notation, such as 203.0.113.0/24 or 2001:db8::/32", value)
+		}
+		if prefix.Addr().Is4In6() {
+			return nil, refuse("%s is an IPv4 network written as IPv6; write the IPv4 network", prefix)
+		}
+		if prefix.Bits() == 0 {
+			return nil, refuse("%s is every address, which reopens the resolver to anyone; name the networks of its clients", prefix)
+		}
+		if masked := prefix.Masked(); masked != prefix {
+			return nil, refuse("%s has host bits set; the network is %s", prefix, masked)
+		}
+		if seen[prefix] {
+			continue
+		}
+		seen[prefix] = true
+		out = append(out, prefix.String())
+		if len(out) > model.DNSAllowedClientsMax {
+			return nil, &AllowedClientsError{Index: -1, Reason: fmt.Sprintf("at most %d networks", model.DNSAllowedClientsMax)}
+		}
+	}
+	prefixes := make([]netip.Prefix, 0, len(seen))
+	for prefix := range seen {
+		prefixes = append(prefixes, prefix)
+	}
+	for _, family := range []struct {
+		v4   bool
+		name string
+	}{{true, "IPv4"}, {false, "IPv6"}} {
+		if coversEveryAddress(prefixes, family.v4) {
+			return nil, &AllowedClientsError{Index: -1, Reason: fmt.Sprintf("together the networks cover every %s address, which reopens the resolver to anyone; name the networks of its clients", family.name)}
+		}
+	}
+	return out, nil
+}
+
+// coversEveryAddress reports whether the prefixes of one family together
+// cover the whole family, as 0.0.0.0/1 and 128.0.0.0/1 cover what 0.0.0.0/0
+// does.
+func coversEveryAddress(prefixes []netip.Prefix, v4 bool) bool {
+	type span struct{ lo, hi netip.Addr }
+	spans := []span{}
+	for _, p := range prefixes {
+		if p.Addr().Is4() == v4 {
+			spans = append(spans, span{p.Masked().Addr(), lastAddr(p)})
+		}
+	}
+	if len(spans) == 0 {
+		return false
+	}
+	sort.Slice(spans, func(i, j int) bool { return spans[i].lo.Less(spans[j].lo) })
+	first := netip.IPv6Unspecified()
+	if v4 {
+		first = netip.IPv4Unspecified()
+	}
+	if spans[0].lo != first {
+		return false
+	}
+	reach := spans[0].hi
+	for _, sp := range spans[1:] {
+		next := reach.Next()
+		if !next.IsValid() {
+			return true
+		}
+		if next.Less(sp.lo) {
+			return false
+		}
+		if reach.Less(sp.hi) {
+			reach = sp.hi
+		}
+	}
+	// Next is the zero Addr only past the family's last address.
+	return !reach.Next().IsValid()
+}
+
+// lastAddr is the highest address in p.
+func lastAddr(p netip.Prefix) netip.Addr {
+	b := p.Masked().Addr().AsSlice()
+	for i := p.Bits(); i < len(b)*8; i++ {
+		b[i/8] |= 1 << (7 - i%8)
+	}
+	last, _ := netip.AddrFromSlice(b)
+	return last
 }
 
 // ComposeFirewallPlan folds the DNS listener ports into the node's single
@@ -276,6 +423,13 @@ func RenderApprovalPlanWithOptions(dep model.DNSDeployment, nodeName string, cfg
 	b.WriteString("\n## Firewall delta\n")
 	for _, line := range firewallSummary {
 		fmt.Fprintf(&b, "- %s\n", planField(line))
+	}
+	if len(dep.AllowedClients) > 0 {
+		b.WriteString("\n## Allowed clients\n")
+		for _, network := range dep.AllowedClients {
+			fmt.Fprintf(&b, "- %s\n", planField(network))
+		}
+		b.WriteString("CoreDNS answers these networks and refuses every other client (acl, REFUSED). This limits who gets answers, not who can reach the port; the firewall decides that.\n")
 	}
 	if binary.Enabled() {
 		b.WriteString("\n## CoreDNS binary\n")
@@ -383,6 +537,13 @@ func ApplyScriptFromPlan(plan string) (string, error) {
 	b.WriteString("WATCHDOG_FIRED=/tmp/lattice-selfdns-watchdog.$$\n")
 	b.WriteString("UNIT=/etc/systemd/system/lattice-selfdns.service\n")
 	writeCoreDNSBootstrap(&b, artifacts.CoreDNSBinary)
+	if corefileUsesACL(artifacts.Corefile) {
+		// CoreDNS refuses to start on a directive it was built without, but
+		// only after the apply has replaced the config; asking first names
+		// the cause and changes nothing. -plugins lists the plugin as
+		// dns.acl, or bare as acl; either counts.
+		b.WriteString("\"$COREDNS_BIN\" -plugins | grep -Eq '^[[:space:]]*(dns\\.)?acl$' || { echo 'lattice selfdns: this coredns binary lacks the acl plugin (dns.acl), which the allowed client networks need; the running Corefile was not replaced' >&2; exit 1; }\n")
+	}
 	if firewall {
 		b.WriteString("command -v nft >/dev/null || { echo 'lattice selfdns: nft binary not found in PATH' >&2; exit 1; }\n")
 	}
@@ -736,6 +897,9 @@ func validateDeployment(dep model.DNSDeployment, opts RenderOptions) error {
 	if len(dep.Zones) == 0 {
 		return errors.New("at least one dns zone is required")
 	}
+	if _, err := NormalizeAllowedClients(dep.AllowedClients); err != nil {
+		return err
+	}
 	for i, zone := range dep.Zones {
 		if _, err := normalizeDNSName(zone.Suffix, true, true); err != nil {
 			return fmt.Errorf("zone %d suffix: %w", i+1, err)
@@ -774,10 +938,12 @@ func validateDeployment(dep model.DNSDeployment, opts RenderOptions) error {
 }
 
 // IsOpenResolver reports whether a deployment Lattice renders would recurse
-// for anyone who reaches it: public exposure with a forward zone. Such a
-// resolver is an open resolver and a reflection source (design 32 D7).
+// for anyone who reaches it: public exposure with a forward zone and no
+// allowed client networks. Such a resolver is an open resolver and a
+// reflection source (design 32 D7); naming its clients renders an acl that
+// refuses everyone else (S5b).
 func IsOpenResolver(dep model.DNSDeployment) bool {
-	if dep.Engine != model.DNSEngineCoreDNS || dep.Exposure != model.DNSExposurePublic {
+	if dep.Engine != model.DNSEngineCoreDNS || dep.Exposure != model.DNSExposurePublic || len(dep.AllowedClients) > 0 {
 		return false
 	}
 	for _, zone := range dep.Zones {
@@ -825,9 +991,10 @@ func ParsePlanHeader(plan string) (PlanHeader, error) {
 }
 
 // PlanIsOpenResolver reports whether a reviewed DNS plan would install an
-// open resolver: public exposure and a Corefile that forwards. It judges the
-// plan rather than the stored deployment, so a plan made before the refusal
-// is caught at approve even after the record changed.
+// open resolver: public exposure and a Corefile with a server block that
+// forwards without an acl ending in a bare block. It judges the plan rather
+// than the stored deployment, so a plan made before the refusal is caught at
+// approve even after the record changed.
 func PlanIsOpenResolver(plan string) (bool, error) {
 	header, err := ParsePlanHeader(plan)
 	if err != nil {
@@ -837,15 +1004,55 @@ func PlanIsOpenResolver(plan string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return header.Exposure == model.DNSExposurePublic && strings.Contains("\n"+artifacts.Corefile, "\n  forward . "), nil
+	return header.Exposure == model.DNSExposurePublic && corefileRecursesForAnyone(artifacts.Corefile), nil
+}
+
+// corefileUsesACL reports whether a rendered Corefile carries the acl plugin.
+func corefileUsesACL(corefile string) bool {
+	return strings.Contains("\n"+corefile, "\n  acl {\n")
+}
+
+// corefileRecursesForAnyone reports whether a server block of a rendered
+// Corefile forwards without an acl whose last rule is a bare block. It reads
+// the shape GenerateConfig writes: a server block opens at column zero and
+// closes with a lone "}", its plugins are indented two spaces, and an acl's
+// rules four.
+func corefileRecursesForAnyone(corefile string) bool {
+	inBlock, inACL, forwards, guarded, lastRule := false, false, false, false, ""
+	for _, line := range strings.Split(strings.ReplaceAll(corefile, "\r", ""), "\n") {
+		switch {
+		case !inBlock:
+			if strings.HasSuffix(line, "{") && !strings.HasPrefix(line, " ") {
+				inBlock, inACL, forwards, guarded = true, false, false, false
+			}
+		case line == "}":
+			if forwards && !guarded {
+				return true
+			}
+			inBlock = false
+		case line != "" && !strings.HasPrefix(line, " "):
+			// Not a shape GenerateConfig writes: a block that never
+			// closed, or a server block opened inside another. Judging
+			// it would be a guess, so it counts as open.
+			return true
+		case inACL && line == "  }":
+			inACL = false
+			guarded = guarded || lastRule == "block"
+		case inACL:
+			lastRule = strings.TrimSpace(line)
+		case line == "  acl {":
+			inACL, lastRule = true, ""
+		case strings.HasPrefix(line, "  forward . "):
+			forwards = true
+		}
+	}
+	return inBlock && forwards && !guarded
 }
 
 // ErrOpenResolver is the refusal for a deployment IsOpenResolver reports.
-var ErrOpenResolver = errors.New("public exposure with a forward zone would answer recursive queries from anyone, an open resolver; use mesh exposure, or expose only static and block zones publicly")
+var ErrOpenResolver = errors.New("public exposure with a forward zone would answer recursive queries from anyone, an open resolver; name the client networks it serves in allowed_clients, use mesh exposure, or expose only static and block zones publicly")
 
 // RefuseOpenResolver refuses a deployment that would be an open resolver.
-// Naming allowed client networks is design 32 D8 work and not an exception
-// here.
 func RefuseOpenResolver(dep model.DNSDeployment) error {
 	if IsOpenResolver(dep) {
 		return ErrOpenResolver

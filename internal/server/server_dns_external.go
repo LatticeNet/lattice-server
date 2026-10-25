@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -41,6 +42,9 @@ func (s *Server) normalizeExternalDNSDeployment(req, existing model.DNSDeploymen
 	if req.ID == "" {
 		req.ID = id.New("dns")
 	}
+	if len(req.AllowedClients) > 0 {
+		return model.DNSDeployment{}, fieldErrorf("allowed_clients", "an external engine takes no allowed_clients: Lattice renders nothing for it, so it has no acl to write; limit its clients in the engine's own configuration")
+	}
 	if req.Hostname == "" {
 		return model.DNSDeployment{}, errors.New("external dns engine requires the hostname it answers at")
 	}
@@ -50,6 +54,11 @@ func (s *Server) normalizeExternalDNSDeployment(req, existing model.DNSDeploymen
 	}
 	if !strings.Contains(host, ".") {
 		return model.DNSDeployment{}, errors.New("hostname must be a fully qualified domain")
+	}
+	// The hostname is what a measured certificate is held to (design 32
+	// S5c), and an address is not a name a certificate is issued for.
+	if _, err := netip.ParseAddr(host); err == nil {
+		return model.DNSDeployment{}, fieldErrorf("hostname", "hostname %s is an address; record the name the resolver answers at", host)
 	}
 	req.Hostname = host
 	// The record is an observation of a service Lattice does not own, so it

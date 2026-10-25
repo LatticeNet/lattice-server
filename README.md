@@ -549,6 +549,22 @@ Use the compose file and deployment guide in the umbrella repository:
   attributable to the right layer. Optional CoreDNS install is server-configured
   and plan-bound: the approval text contains the HTTPS URL and SHA-256, and the
   agent applies exactly that reviewed artifact metadata.
+  A CoreDNS deployment may name `allowed_clients` (at most 64 CIDRs, no host
+  bits, `0.0.0.0/0` and `::/0` refused), rendered as the `acl` plugin in every
+  server block with one `allow net` per network and a final `block`, so other
+  clients get REFUSED. A public deployment with a forward zone is refused
+  unless it names them. The ACL limits who gets answers, not who reaches the
+  port, and the plan says so; when the Corefile uses `acl`, the apply checks
+  that the node's CoreDNS binary lists the plugin before it writes anything.
+  `/api/dns/measure-cert` (`dns:admin` on the node plus `monitor:admin` on a
+  token with no node allowlist) turns the DoT and DoH listeners an operator
+  names on an external engine into server-evaluated tls checks at
+  `hostname:port`, linking an authored tls check already on that endpoint
+  instead of duplicating it, and links them to the deployment in the same
+  write (`cert_monitor_ids`, which a save never writes). The deployment view
+  lists the linked checks the caller may read (`cert_checks`) and the expiry
+  the sheet shows (`cert_expiry`): the soonest one an enabled linked check
+  measured, or the typed `cert_not_after`, with its `source`.
 - Proxy-core state currently exists as a persistence/model foundation plus a
   narrow server-side sing-box renderer, scoped CRUD/read APIs, a redacted
   reviewed plan endpoint, reviewed queue/apply, public subscription serving,

@@ -194,10 +194,18 @@ func (s *Server) expiringFor(p principal, now time.Time, within int) expiringRes
 	}
 
 	for _, mon := range s.store.Monitors() {
-		if !readable[expiringKindTLS] || mon.Type != model.MonitorTypeTLS || !mon.Enabled || !monitorVisibleToPrincipal(p, "monitor:read", mon) {
+		certified := mon.Type == model.MonitorTypeTLS || store.MonitorReadsCertificate(mon)
+		if !readable[expiringKindTLS] || !certified || !mon.Enabled || !monitorVisibleToPrincipal(p, "monitor:read", mon) {
 			continue
 		}
-		notAfter, ok := s.latestCertNotAfter(mon.ID)
+		// A DoH or DoT check reads the resolver's certificate from each of
+		// its sources (design 32 S5a).
+		notAfter, ok := time.Time{}, false
+		if mon.Type == model.MonitorTypeTLS {
+			notAfter, ok = s.latestCertNotAfter(mon.ID)
+		} else {
+			notAfter, ok = s.dnsCertNotAfter(mon)
+		}
 		if !ok {
 			continue
 		}

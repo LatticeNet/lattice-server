@@ -385,5 +385,8 @@ func managedMonitorCompared(mon model.Monitor) model.Monitor {
 	if len(mon.Headers) == 0 {
 		mon.Headers = nil
 	}
+	if len(mon.DNSExpect) == 0 {
+		mon.DNSExpect = nil
+	}
 	return mon
 }

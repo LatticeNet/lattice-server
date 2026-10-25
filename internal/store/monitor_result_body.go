@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -31,14 +32,17 @@ var monitorReasonPattern = regexp.MustCompile(`^[a-z0-9_]{1,40}$`)
 // within sent, one RTT per echo that came back, at most
 // model.MonitorPacketsMax); its success and latency are derived from the
 // packets, so the rollups never count a run the packets contradict. Other
-// kinds carry no packets.
+// kinds carry no packets. A dns result keeps its response code and answers
+// within their bounds (boundDNSResult); every other kind's are dropped.
 func normalizeMonitorResultBody(kind string, r model.MonitorResult) (model.MonitorResult, bool) {
+	r.DNSRcode, r.DNSAnswers = boundDNSResult(kind, r.DNSRcode, r.DNSAnswers)
 	if r.Reason != "" {
 		if !monitorReasonPattern.MatchString(r.Reason) {
 			return r, false
 		}
 		r.Success, r.LatencyMs = false, 0
 		r.Sent, r.Lost, r.RTTsMs = 0, 0, nil
+		r.DNSRcode, r.DNSAnswers = "", nil
 		return r, true
 	}
 	if math.IsNaN(r.LatencyMs) || math.IsInf(r.LatencyMs, 0) || r.LatencyMs < 0 || r.LatencyMs > monitorRTTMaxMs {
@@ -67,6 +71,49 @@ func normalizeMonitorResultBody(kind string, r model.MonitorResult) (model.Monit
 		r.LatencyMs = medianMs(r.RTTsMs)
 	}
 	return r, true
+}
+
+// monitorDNSRcodePattern is the shape of a response code's mnemonic
+// (NOERROR, SERVFAIL, RCODE23).
+var monitorDNSRcodePattern = regexp.MustCompile(`^[A-Z0-9]{1,16}$`)
+
+// boundDNSResult is what a result keeps of a dns run's answer: nothing on
+// another kind; on a dns check a code of the mnemonic's shape, and at most
+// model.MonitorDNSAnswersMax answers of at most model.MonitorDNSValueMax
+// bytes each. The answer is shown, never judged here, so an agent that
+// sends more is cut to the bounds rather than refused.
+func boundDNSResult(kind, rcode string, answers []string) (string, []string) {
+	if kind != model.MonitorTypeDNS {
+		return "", nil
+	}
+	if !monitorDNSRcodePattern.MatchString(rcode) {
+		rcode = ""
+	}
+	if len(answers) == 0 {
+		return rcode, nil
+	}
+	out := make([]string, 0, min(len(answers), model.MonitorDNSAnswersMax))
+	for _, v := range answers[:min(len(answers), model.MonitorDNSAnswersMax)] {
+		out = append(out, truncateUTF8(strings.ToValidUTF8(v, ""), model.MonitorDNSValueMax))
+	}
+	return rcode, out
+}
+
+// MonitorReadsCertificate reports whether an agent's result for mon may
+// carry a certificate expiry: a dns check whose resolver is DoH or DoT.
+func MonitorReadsCertificate(mon model.Monitor) bool {
+	if mon.Type != model.MonitorTypeDNS {
+		return false
+	}
+	r, err := model.ParseDNSResolver(mon.Target)
+	return err == nil && r.Encrypted()
+}
+
+// plausibleCertExpiry reports whether t could be a certificate's
+// not-after as an agent reads it at receivedAt: this century, and less
+// than 50 years ahead.
+func plausibleCertExpiry(t, receivedAt time.Time) bool {
+	return t.Year() >= 2000 && t.Before(receivedAt.AddDate(50, 0, 0))
 }
 
 // medianMs is the median of values, the mean of the two middle ones when

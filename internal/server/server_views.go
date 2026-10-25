@@ -195,6 +195,12 @@ type monitorView struct {
 	Headers []model.MonitorHeader `json:"headers,omitempty"`
 	// SecretsOrigin is the origin the secret headers are bound to.
 	SecretsOrigin string `json:"secrets_origin,omitempty"`
+	// DNSName, DNSType, DNSExpect and DNSExpectRcode are a dns check's
+	// question and judgement (design 32 S5a).
+	DNSName        string   `json:"dns_name,omitempty"`
+	DNSType        string   `json:"dns_type,omitempty"`
+	DNSExpect      []string `json:"dns_expect,omitempty"`
+	DNSExpectRcode string   `json:"dns_expect_rcode,omitempty"`
 	// ManagedBy names the configuration that generates the monitor
 	// ("latency"); empty for a monitor an operator made. The console hides
 	// generated monitors from the operator's list and its failing count.
@@ -245,6 +251,9 @@ type monitorLatestView struct {
 	Sent   int       `json:"sent,omitempty"`
 	Lost   int       `json:"lost,omitempty"`
 	RTTsMs []float64 `json:"rtts_ms,omitempty"`
+	// DNSRcode and DNSAnswers are what a dns run got back.
+	DNSRcode   string   `json:"dns_rcode,omitempty"`
+	DNSAnswers []string `json:"dns_answers,omitempty"`
 	// Reason is set when the newest run measured nothing (icmp not
 	// permitted, a refused destination, an agent too old for the kind):
 	// the pair reads unknown, and the fields above are its last real
@@ -259,6 +268,7 @@ func toMonitorLatestView(l store.MonitorLatest) monitorLatestView {
 		Error: l.Error, CertNotAfter: l.CertNotAfter, ReceivedAt: l.ReceivedAt,
 		FailStreak: l.FailStreak, Since: l.Since,
 		Sent: l.Sent, Lost: l.Lost, RTTsMs: l.RTTsMs,
+		DNSRcode: l.DNSRcode, DNSAnswers: l.DNSAnswers,
 	}
 	if l.Unknown != nil {
 		v.Reason, v.ReasonAt = l.Unknown.Reason, l.Unknown.At
@@ -287,6 +297,7 @@ func toMonitorViews(in []model.Monitor) []monitorView {
 			NodeIDs: m.NodeIDs, ThresholdDays: m.ThresholdDays,
 			TargetNode: m.TargetNode, Packets: m.Packets, ExpectStatus: m.ExpectStatus,
 			Headers: redactMonitorHeaders(m.Headers), SecretsOrigin: m.SecretsOrigin,
+			DNSName: m.DNSName, DNSType: m.DNSType, DNSExpect: m.DNSExpect, DNSExpectRcode: m.DNSExpectRcode,
 			Enabled: m.Enabled, ManagedBy: m.ManagedBy, PausedNodeIDs: m.PausedNodeIDs,
 			Alert: monitorAlertOf(m), AlertAfter: store.MonitorAlertAfter(m), Degraded: m.Degraded, Version: m.Version,
 			CreatedAt: m.CreatedAt, UpdatedAt: m.UpdatedAt,

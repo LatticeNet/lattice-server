@@ -39,6 +39,8 @@ type monitorResultRow struct {
 	Lost         int       `json:"lost,omitempty"`
 	RTTsMs       []float64 `json:"rtts_ms,omitempty"`
 	Reason       string    `json:"reason,omitempty"`
+	DNSRcode     string    `json:"dns_rcode,omitempty"`
+	DNSAnswers   []string  `json:"dns_answers,omitempty"`
 }
 
 func monitorRowFromRecord(rec MonitorResultRecord) monitorResultRow {
@@ -52,6 +54,8 @@ func monitorRowFromRecord(rec MonitorResultRecord) monitorResultRow {
 		Lost:         rec.Lost,
 		RTTsMs:       rec.RTTsMs,
 		Reason:       rec.Reason,
+		DNSRcode:     rec.DNSRcode,
+		DNSAnswers:   rec.DNSAnswers,
 	}
 }
 
@@ -72,6 +76,7 @@ func decodeMonitorResultRow(k, v []byte) (MonitorResultRecord, error) {
 	rec.MonitorID, rec.NodeID, rec.At = monitorID, nodeID, at
 	rec.Success, rec.LatencyMs, rec.Error, rec.CertNotAfter = row.Success, row.LatencyMs, row.Error, row.CertNotAfter
 	rec.Sent, rec.Lost, rec.RTTsMs, rec.Reason = row.Sent, row.Lost, row.RTTsMs, row.Reason
+	rec.DNSRcode, rec.DNSAnswers = row.DNSRcode, row.DNSAnswers
 	return rec, nil
 }
 

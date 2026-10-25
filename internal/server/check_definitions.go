@@ -185,8 +185,8 @@ func normalizeCheckSelector(field string, in model.TargetSelector, prior *model.
 
 // normalizeCheckAddress is one external target in canonical form, which is
 // also what its monitor id hashes: an http URL with its scheme and host in
-// lower case and no fragment, host:port for tcp and tls, and an IPv4
-// address for icmp. It applies the same rules a single check's create does.
+// lower case and no fragment, host:port for tcp and tls, an IPv4 address
+// for icmp, and a resolver endpoint for dns (model.DNSResolver.String). It applies the same rules a single check's create does.
 func normalizeCheckAddress(kind, raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	switch kind {
@@ -225,6 +225,12 @@ func normalizeCheckAddress(kind, raw string) (string, error) {
 			return "", fmt.Errorf("address %q: %w", raw, err)
 		}
 		return net.JoinHostPort(strings.ToLower(host), port), nil
+	case model.MonitorTypeDNS:
+		target, err := normalizeDNSTarget(raw, true)
+		if err != nil {
+			return "", fmt.Errorf("address %q: %w", raw, err)
+		}
+		return target, nil
 	}
 	return "", fmt.Errorf("%s takes no addresses", aCheck(kind))
 }
@@ -250,9 +256,9 @@ func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinition
 	}
 	out.Type = strings.TrimSpace(spec.Type)
 	switch out.Type {
-	case model.MonitorTypeTCP, model.MonitorTypeICMP, model.MonitorTypeBeacon, model.MonitorTypeHTTP, model.MonitorTypeTLS, model.CheckMethodAuto:
+	case model.MonitorTypeTCP, model.MonitorTypeICMP, model.MonitorTypeBeacon, model.MonitorTypeHTTP, model.MonitorTypeTLS, model.MonitorTypeDNS, model.CheckMethodAuto:
 	default:
-		return out, checkFieldf("type", "type must be tcp, icmp, beacon, http, tls or auto")
+		return out, checkFieldf("type", "type must be tcp, icmp, beacon, http, tls, dns or auto")
 	}
 	if failure := checkDefinitionScope(p, out.Type, spec.Sources, spec.Targets, spec.ExcludedPairs); failure != nil {
 		return out, failure
@@ -271,6 +277,9 @@ func (s *Server) normalizeCheckDefinition(p principal, req model.CheckDefinition
 		return out, failure
 	}
 	if failure := normalizeCheckHTTP(&out, req, prior); failure != nil {
+		return out, failure
+	}
+	if failure := normalizeCheckDNS(&out, spec); failure != nil {
 		return out, failure
 	}
 	out.Alert = strings.TrimSpace(spec.Alert)
@@ -566,6 +575,23 @@ func normalizeCheckHTTP(out *model.CheckDefinition, req model.CheckDefinitionSav
 	if err := checkSecretsRebound(prior, out.SecretsOrigins, req.Headers); err != nil {
 		return checkFieldRefusal("headers", err)
 	}
+	return nil
+}
+
+// normalizeCheckDNS checks a dns definition's question and judgement, which
+// every expanded monitor carries, and refuses them on another method.
+func normalizeCheckDNS(out *model.CheckDefinition, spec model.CheckDefinitionSpec) *checkDefinitionError {
+	probe := model.Monitor{Type: out.Type, DNSName: spec.DNSName, DNSType: spec.DNSType, DNSExpect: spec.DNSExpect, DNSExpectRcode: spec.DNSExpectRcode}
+	if out.Type != model.MonitorTypeDNS {
+		if err := refuseDNSFields(probe); err != nil {
+			return &checkDefinitionError{status: http.StatusBadRequest, err: err}
+		}
+		return nil
+	}
+	if err := normalizeDNSQuestion(&probe); err != nil {
+		return &checkDefinitionError{status: http.StatusBadRequest, err: err}
+	}
+	out.DNSName, out.DNSType, out.DNSExpect, out.DNSExpectRcode = probe.DNSName, probe.DNSType, probe.DNSExpect, probe.DNSExpectRcode
 	return nil
 }
 
@@ -925,21 +951,25 @@ func (c *checkPlanContext) plan(def model.CheckDefinition) checkDefinitionPlan {
 			continue
 		}
 		mon := model.Monitor{
-			ID:            e.monitorID,
-			Type:          e.kind,
-			Target:        target,
-			TargetNode:    e.targetNode,
-			IntervalSec:   def.IntervalSec,
-			TimeoutSec:    def.TimeoutSec,
-			ThresholdDays: def.ThresholdDays,
-			ExpectStatus:  def.ExpectStatus,
-			Headers:       slices.Clone(def.Headers),
-			Alert:         def.Alert,
-			AlertAfter:    def.AlertAfter,
-			Degraded:      def.Degraded,
-			NodeIDs:       sources,
-			Enabled:       def.Enabled && runs,
-			ManagedBy:     owner,
+			ID:             e.monitorID,
+			Type:           e.kind,
+			Target:         target,
+			TargetNode:     e.targetNode,
+			IntervalSec:    def.IntervalSec,
+			TimeoutSec:     def.TimeoutSec,
+			ThresholdDays:  def.ThresholdDays,
+			ExpectStatus:   def.ExpectStatus,
+			Headers:        slices.Clone(def.Headers),
+			DNSName:        def.DNSName,
+			DNSType:        def.DNSType,
+			DNSExpect:      slices.Clone(def.DNSExpect),
+			DNSExpectRcode: def.DNSExpectRcode,
+			Alert:          def.Alert,
+			AlertAfter:     def.AlertAfter,
+			Degraded:       def.Degraded,
+			NodeIDs:        sources,
+			Enabled:        def.Enabled && runs,
+			ManagedBy:      owner,
 		}
 		if model.MonitorKindSendsPackets(e.kind) {
 			mon.Packets = def.Packets

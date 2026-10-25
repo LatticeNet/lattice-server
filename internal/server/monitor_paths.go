@@ -966,6 +966,13 @@ func pathTargetHost(mon model.Monitor) string {
 		}
 		return u.Hostname()
 	}
+	if mon.Type == model.MonitorTypeDNS {
+		r, err := model.ParseDNSResolver(target)
+		if err != nil {
+			return ""
+		}
+		return r.Host
+	}
 	if host, _, err := net.SplitHostPort(target); err == nil {
 		return host
 	}

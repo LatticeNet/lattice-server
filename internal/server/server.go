@@ -5573,7 +5573,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 		req.PausedNodeIDs = nil
 		req.SecretsOrigin = ""
 		switch req.Type {
-		case model.MonitorTypeTCP, model.MonitorTypeHTTP, model.MonitorTypeICMP, model.MonitorTypeBeacon:
+		case model.MonitorTypeTCP, model.MonitorTypeHTTP, model.MonitorTypeICMP, model.MonitorTypeBeacon, model.MonitorTypeDNS:
 			if !req.AssignAll && len(req.NodeIDs) == 0 {
 				writeError(w, http.StatusBadRequest, fieldErrorf("node_ids", "set assign_all or provide node_ids"))
 				return
@@ -5600,12 +5600,18 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			}
 			targets := s.monitorTargetsAt(s.now())
 			var err error
-			switch req.Type {
-			case model.MonitorTypeHTTP:
+			if req.Type != model.MonitorTypeDNS {
+				err = refuseDNSFields(req)
+			}
+			switch {
+			case err != nil:
+			case req.Type == model.MonitorTypeDNS:
+				err = normalizeDNSMonitor(&req, true)
+			case req.Type == model.MonitorTypeHTTP:
 				err = normalizeHTTPMonitor(&req, true)
-			case model.MonitorTypeICMP:
+			case req.Type == model.MonitorTypeICMP:
 				err = targets.normalizeICMPMonitor(&req)
-			case model.MonitorTypeBeacon:
+			case req.Type == model.MonitorTypeBeacon:
 				err = targets.normalizeBeaconMonitor(&req)
 			default:
 				err = targets.normalizeTCPMonitor(&req)
@@ -5633,6 +5639,10 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 				writeError(w, http.StatusBadRequest, fieldErrorf("type", "a tls check takes a host:port target and a warning window; target_node, packets, expect_status and headers do not apply"))
 				return
 			}
+			if err := refuseDNSFields(req); err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
 			// A tls monitor has no node to be restricted to, so a token that
 			// may only touch some nodes may not create one.
 			if principalHasNodeRestriction(p) {
@@ -5646,7 +5656,7 @@ func (s *Server) handleMonitors(w http.ResponseWriter, r *http.Request, p princi
 			}
 			req = normalized
 		default:
-			writeError(w, http.StatusBadRequest, fieldErrorf("type", "only tcp, http, icmp, beacon and tls monitors are supported"))
+			writeError(w, http.StatusBadRequest, fieldError("type", errors.New(monitorCreateKinds)))
 			return
 		}
 		if err := validMonitorTiming(req.IntervalSec, req.TimeoutSec); err != nil {

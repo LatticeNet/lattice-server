@@ -268,6 +268,11 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 				target = net.JoinHostPort(host, port)
 			}
 		}
+		if mon.Type == model.MonitorTypeDNS {
+			if canonical, err := normalizeDNSTarget(target, false); err == nil {
+				target = canonical
+			}
+		}
 		if target != mon.Target {
 			return model.Monitor{}, nil, false, fieldError("target", errMonitorMethodChange("target"))
 		}
@@ -328,6 +333,9 @@ func (s *Server) applyMonitorUpdate(w http.ResponseWriter, p principal, mon mode
 		}
 		note("expect_status", next.ExpectStatus != canonicalMonitorExpectStatus(mon.ExpectStatus))
 		note("headers", !monitorHeadersEqual(next.Headers, mon.Headers))
+	}
+	if err := applyDNSUpdate(mon, &next, req, note); err != nil {
+		return model.Monitor{}, nil, false, err
 	}
 	if req.ThresholdDays != nil {
 		if !tls {

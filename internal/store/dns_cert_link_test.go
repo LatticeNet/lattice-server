@@ -4,6 +4,7 @@ import (
 	"errors"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -28,7 +29,8 @@ func TestLinkDNSCertMonitorsCreatesAndLinksInOneWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, err := s.LinkDNSCertMonitors("d1", []model.Monitor{tlsCheck("mon_new", "dns.example.com:8443")}, []string{"mon_old"})
+	read, _ := s.DNSDeployment("d1")
+	got, err := s.LinkDNSCertMonitors("d1", read.UpdatedAt, []model.Monitor{tlsCheck("mon_new", "dns.example.com:8443")}, []string{"mon_old"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +64,8 @@ func TestLinkDNSCertMonitorsCreatesAndLinksInOneWrite(t *testing.T) {
 	if err := s.DeleteMonitor("mon_old"); err != nil {
 		t.Fatal(err)
 	}
-	got, err = s.LinkDNSCertMonitors("d1", nil, []string{"mon_new"})
+	read, _ = s.DNSDeployment("d1")
+	got, err = s.LinkDNSCertMonitors("d1", read.UpdatedAt, nil, []string{"mon_new"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +75,8 @@ func TestLinkDNSCertMonitorsCreatesAndLinksInOneWrite(t *testing.T) {
 }
 
 // Nothing is written when the deployment is gone, is not an external
-// engine, or a check to link was deleted in between.
+// engine, was saved since the caller read it, or a check to link was deleted
+// in between.
 func TestLinkDNSCertMonitorsWritesNothingOnRefusal(t *testing.T) {
 	s, err := Open("")
 	if err != nil {
@@ -85,16 +89,20 @@ func TestLinkDNSCertMonitorsWritesNothingOnRefusal(t *testing.T) {
 		t.Fatal(err)
 	}
 	create := []model.Monitor{tlsCheck("mon_x", "dns.example.com:853")}
+	ext, _ := s.DNSDeployment("ext")
+	core, _ := s.DNSDeployment("core")
 	for _, tc := range []struct {
-		dep  string
-		link []string
-		want error
+		dep    string
+		readAt time.Time
+		link   []string
+		want   error
 	}{
-		{"gone", nil, ErrDNSDeploymentNotFound},
-		{"core", nil, ErrDNSDeploymentNotExternal},
-		{"ext", []string{"mon_missing"}, ErrDNSCertMonitorGone},
+		{"gone", ext.UpdatedAt, nil, ErrDNSDeploymentNotFound},
+		{"core", core.UpdatedAt, nil, ErrDNSDeploymentNotExternal},
+		{"ext", ext.UpdatedAt, []string{"mon_missing"}, ErrDNSCertMonitorGone},
+		{"ext", ext.UpdatedAt.Add(-time.Second), nil, ErrDNSDeploymentChanged},
 	} {
-		if _, err := s.LinkDNSCertMonitors(tc.dep, create, tc.link); !errors.Is(err, tc.want) {
+		if _, err := s.LinkDNSCertMonitors(tc.dep, tc.readAt, create, tc.link); !errors.Is(err, tc.want) {
 			t.Fatalf("%s: got %v, want %v", tc.dep, err, tc.want)
 		}
 		if _, ok := s.Monitor("mon_x"); ok {

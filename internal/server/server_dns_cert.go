@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -58,15 +59,24 @@ type dnsCertExpiryView struct {
 }
 
 // dnsCertViews reads the linked checks the caller may read and the expiry the
-// sheet shows. A check deleted since it was linked is skipped. A caller who
-// cannot read the checks gets the typed date, which is what the sheet then
-// says it shows.
+// sheet shows. A check is skipped when it was deleted since it was linked, or
+// no longer dials an endpoint the record lists (its hostname on a recorded tcp
+// port): after the hostname or the listeners change, or someone edits the
+// check's target, its reading is of another endpoint. Such a check stays an
+// ordinary check under Monitoring. A caller who cannot read the checks gets
+// the typed date, which is what the sheet then says it shows.
 func (s *Server) dnsCertViews(p principal, dep model.DNSDeployment) ([]dnsCertCheckView, *dnsCertExpiryView) {
+	endpoints := map[string]bool{}
+	for _, l := range dep.Listeners {
+		if l.Protocol == "tcp" && dep.Hostname != "" {
+			endpoints[strings.ToLower(net.JoinHostPort(dep.Hostname, strconv.Itoa(l.Port)))] = true
+		}
+	}
 	var checks []dnsCertCheckView
 	var expiry *dnsCertExpiryView
 	for _, monitorID := range dep.CertMonitorIDs {
 		mon, ok := s.store.Monitor(monitorID)
-		if !ok || mon.Type != model.MonitorTypeTLS || !monitorVisibleToPrincipal(p, "monitor:read", mon) {
+		if !ok || mon.Type != model.MonitorTypeTLS || !endpoints[strings.ToLower(mon.Target)] || !monitorVisibleToPrincipal(p, "monitor:read", mon) {
 			continue
 		}
 		view := dnsCertCheckView{MonitorID: mon.ID, Name: mon.Name, Target: mon.Target, ThresholdDays: mon.ThresholdDays, Enabled: mon.Enabled}
@@ -107,6 +117,12 @@ type dnsMeasureCertRequest struct {
 // write. An authored tls check on exactly that endpoint is linked rather than
 // duplicated, so measuring again, or after a write that failed, creates
 // nothing twice.
+//
+// It writes both a monitor and a deployment, so it takes what each write takes
+// on its own: dns:admin on the deployment's node, as a save does, and the rule
+// for creating a tls check by hand, monitor:admin on a token with no node
+// allowlist. The checks dial the record's hostname, never an address, so SNI
+// asks for that name and the probe holds the certificate to it.
 func (s *Server) handleDNSMeasureCert(w http.ResponseWriter, r *http.Request, p principal) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
@@ -139,6 +155,10 @@ func (s *Server) handleDNSMeasureCert(w http.ResponseWriter, r *http.Request, p 
 		writeError(w, http.StatusBadRequest, fieldErrorf("id", "%s is a CoreDNS deployment, which serves no DoT or DoH: only an external engine's certificate is measured", dep.Name))
 		return
 	}
+	if err := dnsCertHostname(dep); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
 	ports, err := dnsCertPorts(dep, req.Ports)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -163,7 +183,9 @@ func (s *Server) handleDNSMeasureCert(w http.ResponseWriter, r *http.Request, p 
 			ThresholdDays: req.ThresholdDays,
 		})
 		if err != nil {
-			writeError(w, http.StatusBadRequest, fieldError("threshold_days", err))
+			// A threshold refusal names its field; the target is the
+			// record's hostname on a port the request named.
+			writeError(w, http.StatusBadRequest, fieldError("ports", err))
 			return
 		}
 		mon.ID = id.New("mon")
@@ -172,12 +194,15 @@ func (s *Server) handleDNSMeasureCert(w http.ResponseWriter, r *http.Request, p 
 		mon.Alert = model.MonitorAlertDown
 		create = append(create, mon)
 	}
-	updated, err := s.store.LinkDNSCertMonitors(dep.ID, create, link)
+	// The record the checks were built from and authorized against must be
+	// the one linked: a save in between could have moved it to another node
+	// or hostname.
+	updated, err := s.store.LinkDNSCertMonitors(dep.ID, dep.UpdatedAt, create, link)
 	switch {
 	case errors.Is(err, store.ErrDNSDeploymentNotFound):
 		writeError(w, http.StatusNotFound, errors.New("dns deployment not found"))
 		return
-	case errors.Is(err, store.ErrDNSDeploymentNotExternal), errors.Is(err, store.ErrDNSCertMonitorGone):
+	case errors.Is(err, store.ErrDNSDeploymentNotExternal), errors.Is(err, store.ErrDNSDeploymentChanged), errors.Is(err, store.ErrDNSCertMonitorGone):
 		writeError(w, http.StatusConflict, fmt.Errorf("the deployment or a check changed while measuring; measure again: %w", err))
 		return
 	case err != nil:
@@ -203,6 +228,20 @@ func (s *Server) handleDNSMeasureCert(w http.ResponseWriter, r *http.Request, p 
 		"created":    created,
 		"linked":     link,
 	})
+}
+
+// dnsCertHostname refuses a record whose certificate cannot be held to a
+// name: one with no hostname, or with an address in its place. A save
+// requires a hostname, so this is a record stored some other way.
+func dnsCertHostname(dep model.DNSDeployment) error {
+	host := strings.TrimSpace(dep.Hostname)
+	if host == "" {
+		return fmt.Errorf("%s records no hostname: a certificate is checked against the name the resolver answers at, so set hostname on the record first", dep.Name)
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return fmt.Errorf("%s records the address %s as its hostname: a certificate is checked against a name, so set hostname to the name the resolver answers at", dep.Name, host)
+	}
+	return nil
 }
 
 // dnsCertPorts checks the requested ports against the recorded tcp

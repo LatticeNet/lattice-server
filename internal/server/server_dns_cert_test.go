@@ -109,6 +109,25 @@ func TestDNSMeasureCertCreatesOneTLSCheckPerListener(t *testing.T) {
 		t.Fatalf("the edit dropped the link: %+v", view.CertChecks)
 	}
 
+	// A link holds only while the check dials an endpoint the record lists:
+	// with tcp/8443 no longer recorded, the measured check is another
+	// endpoint's and the sheet falls back to the typed date.
+	moved := strings.Replace(edit, `,
+		{"protocol":"tcp","port":8443}`, ``, 1)
+	if moved == edit {
+		t.Fatal("test edit did not apply")
+	}
+	if code, body := postBody(t, handler, "/api/dns/deployments", moved, cookies, csrf); code != http.StatusOK {
+		t.Fatalf("drop 8443: %d %s", code, body)
+	}
+	view = externalView(t, handler, cookies, csrf, dep.ID)
+	if len(view.CertChecks) != 1 || view.CertChecks[0].MonitorID != byHand.ID || view.CertExpiry == nil || view.CertExpiry.Source != dnsCertSourceTyped {
+		t.Fatalf("a check on an endpoint the record no longer lists still counts: %+v %+v", view.CertChecks, view.CertExpiry)
+	}
+	if code, body := postBody(t, handler, "/api/dns/deployments", edit, cookies, csrf); code != http.StatusOK {
+		t.Fatalf("restore 8443: %d %s", code, body)
+	}
+
 	// Deleting a check unlinks it.
 	if code, body := postBody(t, handler, "/api/monitors/delete", `{"id":"`+created.ID+`"}`, cookies, csrf); code != http.StatusOK {
 		t.Fatalf("delete: %d %s", code, body)
@@ -176,13 +195,57 @@ func TestDNSMeasureCertRefusals(t *testing.T) {
 		}
 	}
 
-	token := createPAT(t, handler, cookies, csrf, []string{"dns:admin", "monitor:admin", "monitor:read"}, []string{"n1"})
-	res := doBearerJSON(t, handler, http.MethodPost, "/api/dns/measure-cert", `{"id":"`+dep.ID+`","ports":[8443]}`, token)
-	res.Body.Close()
-	if res.StatusCode != http.StatusForbidden {
-		t.Fatalf("a node-confined token = %d, want 403", res.StatusCode)
+	// The action writes a monitor and a deployment, so it takes what each
+	// write takes on its own: a token holding only one of the two is
+	// refused, and so is a node-confined one, which may not create a
+	// server-evaluated check.
+	for _, tc := range []struct {
+		name   string
+		scopes []string
+		nodes  []string
+	}{
+		{"dns:admin without monitor:admin", []string{"dns:admin", "monitor:read"}, nil},
+		{"monitor:admin without dns:admin", []string{"monitor:admin", "monitor:read"}, nil},
+		{"node-confined", []string{"dns:admin", "monitor:admin", "monitor:read"}, []string{"n1"}},
+	} {
+		token := createPAT(t, handler, cookies, csrf, tc.scopes, tc.nodes)
+		res := doBearerJSON(t, handler, http.MethodPost, "/api/dns/measure-cert", `{"id":"`+dep.ID+`","ports":[8443]}`, token)
+		res.Body.Close()
+		if res.StatusCode != http.StatusForbidden {
+			t.Fatalf("%s = %d, want 403", tc.name, res.StatusCode)
+		}
 	}
 	if n := len(tlsMonitorsOf(st)); n != 0 {
 		t.Fatalf("a refused measure created %d checks", n)
+	}
+	if stored, _ := st.DNSDeployment(dep.ID); len(stored.CertMonitorIDs) != 0 {
+		t.Fatalf("a refused measure linked checks: %v", stored.CertMonitorIDs)
+	}
+}
+
+// A certificate is held to the name the resolver answers at, never an
+// address: a record without a hostname, or with an address in its place, is
+// refused with a sentence that names the field, and a save refuses the
+// address in the first place.
+func TestDNSMeasureCertNeedsAHostname(t *testing.T) {
+	_, handler, st := newDNSServer(t)
+	cookies, csrf := loginSession(t, handler)
+	listeners := []model.DNSListener{{Protocol: "tcp", Port: 8443}}
+	for id, host := range map[string]string{"dns_nohost": "", "dns_addr": "203.0.113.5"} {
+		if err := st.UpsertDNSDeployment(model.DNSDeployment{ID: id, Name: id, NodeID: "n1", Engine: model.DNSEngineExternal, Hostname: host, Listeners: listeners, Status: model.DNSStatusObserved}); err != nil {
+			t.Fatal(err)
+		}
+		code, body := postBody(t, handler, "/api/dns/measure-cert", `{"id":"`+id+`","ports":[8443]}`, cookies, csrf)
+		if refusal := apiErrorOf(t, body); code != http.StatusBadRequest || !strings.Contains(refusal.Message, "hostname") {
+			t.Fatalf("%s = %d %s, want 400 naming hostname", id, code, body)
+		}
+	}
+	if n := len(tlsMonitorsOf(st)); n != 0 {
+		t.Fatalf("a refused measure created %d checks", n)
+	}
+	address := strings.Replace(externalDNSBody, `"hostname":"dns.roobli.org"`, `"hostname":"203.0.113.5"`, 1)
+	code, body := postBody(t, handler, "/api/dns/deployments", address, cookies, csrf)
+	if refusal := apiErrorOf(t, body); code != http.StatusBadRequest || refusal.Field != "hostname" {
+		t.Fatalf("an external engine with an address for a hostname = %d %s, want 400 on hostname", code, body)
 	}
 }

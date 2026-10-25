@@ -4887,15 +4887,19 @@ var (
 	ErrDNSDeploymentNotExternal = errors.New("dns deployment is not an external engine")
 	// ErrDNSCertMonitorGone is a link to a check deleted in between.
 	ErrDNSCertMonitorGone = errors.New("a check to link was deleted")
+	// ErrDNSDeploymentChanged is a link to a deployment saved since the
+	// caller read it: the checks were built from what it held then.
+	ErrDNSDeploymentChanged = errors.New("dns deployment changed since it was read")
 )
 
 // LinkDNSCertMonitors stores the checks in create and links them, with the
 // stored checks named in link, to the external deployment depID, in one write
-// (design 32 S5c). The deployment's list keeps its order, drops checks that
-// were deleted since, and adds each id once, so linking again is idempotent.
-// Nothing is written when the deployment is gone or not external, or a check
-// in link no longer exists.
-func (s *Store) LinkDNSCertMonitors(depID string, create []model.Monitor, link []string) (model.DNSDeployment, error) {
+// (design 32 S5c). readAt is the UpdatedAt of the record the caller built the
+// checks from and authorized against. The deployment's list keeps its order,
+// drops checks that were deleted since, and adds each id once, so linking
+// again is idempotent. Nothing is written when the deployment is gone, not
+// external or saved since readAt, or a check in link no longer exists.
+func (s *Store) LinkDNSCertMonitors(depID string, readAt time.Time, create []model.Monitor, link []string) (model.DNSDeployment, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dep, ok := s.state.DNSDeployments[depID]
@@ -4904,6 +4908,9 @@ func (s *Store) LinkDNSCertMonitors(depID string, create []model.Monitor, link [
 	}
 	if dep.Engine != model.DNSEngineExternal {
 		return model.DNSDeployment{}, ErrDNSDeploymentNotExternal
+	}
+	if !dep.UpdatedAt.Equal(readAt) {
+		return model.DNSDeployment{}, ErrDNSDeploymentChanged
 	}
 	for _, id := range link {
 		if _, ok := s.state.Monitors[id]; !ok {

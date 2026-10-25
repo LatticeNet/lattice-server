@@ -329,3 +329,29 @@ func TestTLSMonitorIsDeletable(t *testing.T) {
 		t.Fatalf("monitor %s survived its delete", mon.ID)
 	}
 }
+
+// A tls check on a host name holds the certificate to that name: one for
+// another name is not this endpoint's certificate, so the run fails and
+// records no expiry (design 32 S5c). A check on an address is not
+// name-checked, as before.
+func TestTLSMonitorHoldsTheCertificateToTheTargetName(t *testing.T) {
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	addr := ""
+	srv, handler, _ := newTLSMonitorServer(t, &addr, now)
+	cookies, csrf := loginSession(t, handler)
+	addr = tlsTestListener(t, now.Add(60*24*time.Hour)) // a certificate for dns.test.invalid
+
+	other := createTLSMonitor(t, handler, cookies, csrf, `{"name":"wrong name","type":"tls","target":"other.test.invalid:8443"}`)
+	byAddress := createTLSMonitor(t, handler, cookies, csrf, `{"name":"by address","type":"tls","target":"203.0.113.9:8443"}`)
+	if probed := sweepAndFlush(srv); probed != 2 {
+		t.Fatalf("probed = %d, want 2", probed)
+	}
+	wrong := storedMonitorResults(t, srv.store, other.ID)
+	if len(wrong) != 1 || wrong[0].Success || !strings.Contains(wrong[0].Error, "does not cover other.test.invalid") || !wrong[0].CertNotAfter.IsZero() {
+		t.Fatalf("a certificate for another name must fail and record no expiry: %+v", wrong)
+	}
+	plain := storedMonitorResults(t, srv.store, byAddress.ID)
+	if len(plain) != 1 || !plain[0].Success || plain[0].CertNotAfter.IsZero() {
+		t.Fatalf("an address target reads the expiry without a name check: %+v", plain)
+	}
+}

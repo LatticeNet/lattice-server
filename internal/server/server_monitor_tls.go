@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
@@ -140,8 +141,14 @@ func (s *Server) runTLSMonitor(ctx context.Context, mon model.Monitor) error {
 
 // evaluateTLSMonitor dials the target, reads the leaf certificate and judges
 // its not-after against the monitor's threshold. A handshake that never
-// completed is a failure with the dial error; a handshake that completed
-// always records CertNotAfter, whether or not the threshold passed.
+// completed is a failure with the dial error. On a target named by host name
+// the leaf must cover that name (SNI already asks for it): a certificate for
+// another name is not this endpoint's certificate, so the run fails and
+// records no expiry, and the last reading of the right certificate stays the
+// newest one Expiring and a DNS deployment's sheet read. Otherwise a
+// completed handshake always records CertNotAfter, whether or not the
+// threshold passed. A target named by IP address is not name-checked, as
+// before: most certificates carry no address.
 func (s *Server) evaluateTLSMonitor(ctx context.Context, mon model.Monitor) model.MonitorResult {
 	now := s.now()
 	result := model.MonitorResult{MonitorID: mon.ID, At: now}
@@ -153,12 +160,19 @@ func (s *Server) evaluateTLSMonitor(ctx context.Context, mon model.Monitor) mode
 	defer cancel()
 
 	started := time.Now()
-	notAfter, err := s.readTLSLeafNotAfter(dialCtx, mon.Target)
+	leaf, err := s.readTLSLeaf(dialCtx, mon.Target)
 	result.LatencyMs = float64(time.Since(started).Microseconds()) / 1000
 	if err != nil {
 		result.Error = err.Error()
 		return result
 	}
+	if host, _, err := splitTLSTarget(mon.Target); err == nil && net.ParseIP(host) == nil {
+		if err := leaf.VerifyHostname(host); err != nil {
+			result.Error = fmt.Sprintf("the certificate presented does not cover %s: %v", host, err)
+			return result
+		}
+	}
+	notAfter := leaf.NotAfter
 	result.CertNotAfter = notAfter.UTC()
 	threshold := mon.ThresholdDays
 	if threshold <= 0 {
@@ -184,23 +198,23 @@ func humanizeCertRemaining(remaining time.Duration) string {
 	return fmt.Sprintf("in %d days", days)
 }
 
-// readTLSLeafNotAfter dials the target and returns the leaf certificate's
-// not-after.
+// readTLSLeaf dials the target and returns the leaf certificate.
 //
 // The handshake deliberately does not verify the chain (InsecureSkipVerify).
 // This probe exists to read an expiry, and a verifying handshake refuses in
 // exactly the cases the operator most needs the number for: a certificate that
 // has already expired, or one whose chain is incomplete. Nothing is sent over
 // this connection and nothing read from it is trusted; the only value taken is
-// the leaf's not-after, which the operator then compares against a threshold.
-func (s *Server) readTLSLeafNotAfter(ctx context.Context, target string) (time.Time, error) {
+// the leaf's not-after, which the operator then compares against a threshold,
+// and its names, which evaluateTLSMonitor holds against the target's host.
+func (s *Server) readTLSLeaf(ctx context.Context, target string) (*x509.Certificate, error) {
 	host, port, err := splitTLSTarget(target)
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
 	addrs, err := s.tlsMonitorTargets(ctx, host, port)
 	if err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
 	var lastErr error
 	dialer := &net.Dialer{}
@@ -228,12 +242,12 @@ func (s *Server) readTLSLeafNotAfter(ctx context.Context, target string) (time.T
 			lastErr = errors.New("handshake presented no certificate")
 			continue
 		}
-		return chain[0].NotAfter, nil
+		return chain[0], nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no address for %q", host)
 	}
-	return time.Time{}, lastErr
+	return nil, lastErr
 }
 
 // defaultTLSMonitorTargets is the production address policy: the same classes

@@ -1507,6 +1507,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/dns/deployments/delete", s.withAuth("dns:admin", s.handleDeleteDNSDeployment))
 	mux.HandleFunc("/api/dns/plan", s.withAuth("dns:admin", s.handleDNSPlan))
 	mux.HandleFunc("/api/dns/publish", s.withAuth("dns:admin", s.handleDNSPublish))
+	mux.HandleFunc("/api/dns/measure-cert", s.withAuth("dns:admin", s.handleDNSMeasureCert))
 	mux.HandleFunc("/api/geo-routing", s.withAuth("", s.handleGeoRoutings))
 	mux.HandleFunc("/api/geo-routing/delete", s.withAuth("geo:admin", s.handleDeleteGeoRouting))
 	mux.HandleFunc("/api/geo-routing/plan", s.withAuth("geo:read", s.handleGeoRoutingPlan))

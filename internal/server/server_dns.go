@@ -41,6 +41,8 @@ type dnsDeploymentView struct {
 	EnableTCP  bool            `json:"enable_tcp"`
 	Exposure   string          `json:"exposure"`
 	Zones      []model.DNSZone `json:"zones"`
+	// AllowedClients are the client networks a CoreDNS deployment answers.
+	AllowedClients []string `json:"allowed_clients,omitempty"`
 	// OpenResolver flags a stored deployment with public exposure and a
 	// forward zone. New ones are refused; one stored before the refusal
 	// stays readable and carries the flag until it is reshaped or disabled.
@@ -67,6 +69,12 @@ type dnsDeploymentView struct {
 	Disabled         bool                `json:"disabled,omitempty"`
 	CreatedAt        time.Time           `json:"created_at"`
 	UpdatedAt        time.Time           `json:"updated_at"`
+
+	// CertChecks are an external engine's linked tls checks the caller may
+	// read, and CertExpiry the expiry its sheet shows: measured by one of
+	// them, or the typed CertNotAfter (design 32 S5c).
+	CertChecks []dnsCertCheckView `json:"cert_checks,omitempty"`
+	CertExpiry *dnsCertExpiryView `json:"cert_expiry,omitempty"`
 }
 
 func (s *Server) handleDNSDeployments(w http.ResponseWriter, r *http.Request, p principal) {
@@ -76,7 +84,7 @@ func (s *Server) handleDNSDeployments(w http.ResponseWriter, r *http.Request, p 
 		views := make([]dnsDeploymentView, 0, len(deployments))
 		for _, dep := range deployments {
 			if rbac.Allows(p.Principal, "dns:admin", dep.NodeID) {
-				views = append(views, s.toDNSDeploymentView(dep))
+				views = append(views, s.toDNSDeploymentView(p, dep))
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"deployments": views})
@@ -128,7 +136,7 @@ func (s *Server) handleDNSDeployments(w http.ResponseWriter, r *http.Request, p 
 				"exposure": dep.Exposure,
 			},
 		})
-		writeJSON(w, http.StatusOK, s.toDNSDeploymentView(dep))
+		writeJSON(w, http.StatusOK, s.toDNSDeploymentView(p, dep))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
@@ -579,7 +587,7 @@ func (s *Server) handleDNSPublish(w http.ResponseWriter, r *http.Request, p prin
 		"ok":         true,
 		"ipv4":       updated.LastIPv4,
 		"ipv6":       updated.LastIPv6,
-		"deployment": s.toDNSDeploymentView(updated),
+		"deployment": s.toDNSDeploymentView(p, updated),
 	})
 }
 
@@ -892,12 +900,18 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 		return model.DNSDeployment{}, err
 	}
 	req.Zones = zones
+	clients, err := normalizeDNSAllowedClients(req.AllowedClients)
+	if err != nil {
+		return model.DNSDeployment{}, err
+	}
+	req.AllowedClients = clients
 	// Refused at save as well as at plan, so the operator hears it where the
 	// exposure is chosen. A disabled deployment may still be saved, so a
 	// stored open resolver can be switched off without first being reshaped.
+	// The refusal lands on allowed_clients, the field that answers it.
 	if !req.Disabled {
 		if err := selfdns.RefuseOpenResolver(req); err != nil {
-			return model.DNSDeployment{}, err
+			return model.DNSDeployment{}, fieldError("allowed_clients", err)
 		}
 	}
 
@@ -965,6 +979,17 @@ func (s *Server) normalizeDNSDeployment(req, existing model.DNSDeployment, hadEx
 		req.Status = model.DNSStatusPending
 	}
 	return req, nil
+}
+
+// normalizeDNSAllowedClients is selfdns.NormalizeAllowedClients with the
+// refusal naming the entry at fault, so the editor marks the line to fix.
+func normalizeDNSAllowedClients(input []string) ([]string, error) {
+	clients, err := selfdns.NormalizeAllowedClients(input)
+	var refusal *selfdns.AllowedClientsError
+	if errors.As(err, &refusal) && refusal.Index >= 0 {
+		return nil, fieldError(fieldIndex("allowed_clients", refusal.Index), err)
+	}
+	return clients, fieldError("allowed_clients", err)
 }
 
 func normalizeDNSZones(input []model.DNSZone) ([]model.DNSZone, error) {
@@ -1126,7 +1151,7 @@ func normalizeDNSName(value string, trailingDot bool, allowRoot bool) (string, e
 	return v, nil
 }
 
-func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView {
+func (s *Server) toDNSDeploymentView(p principal, dep model.DNSDeployment) dnsDeploymentView {
 	nodeName := ""
 	if n, ok := s.store.Node(dep.NodeID); ok {
 		nodeName = n.Name
@@ -1140,11 +1165,12 @@ func (s *Server) toDNSDeploymentView(dep model.DNSDeployment) dnsDeploymentView 
 		LastAppliedAt: dep.LastAppliedAt, LastError: dep.LastError,
 		LastPublishedAt: dep.LastPublishedAt, LastPublishError: dep.LastPublishError, Disabled: dep.Disabled,
 		CreatedAt: dep.CreatedAt, UpdatedAt: dep.UpdatedAt,
-		OpenResolver: selfdns.IsOpenResolver(dep),
+		OpenResolver: selfdns.IsOpenResolver(dep), AllowedClients: dep.AllowedClients,
 	}
 	if dep.Engine == model.DNSEngineExternal {
 		v.Listeners = dep.Listeners
 		v.CertNotAfter = dep.CertNotAfter
+		v.CertChecks, v.CertExpiry = s.dnsCertViews(p, dep)
 		v.Drift = s.dnsExternalDrift(dep, s.now())
 	}
 	return v

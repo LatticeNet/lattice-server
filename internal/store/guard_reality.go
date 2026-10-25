@@ -59,7 +59,7 @@ var ErrGuardRealityDurabilityDegraded = errors.New("guard reality committed with
 // A newer snapshot that reports the same facts as the stored one, differing
 // only in collected_at, the sshd observation time and its ephemeral sockets,
 // replaces it in memory without a write until the copy on disk is
-// reportClockPersistInterval old.
+// ReportClockPersistInterval old.
 // Agents report every ten seconds and the facts rarely move; freshness is
 // judged against guardRealityStaleAfter, which is hours, so a restart that
 // resumes from a copy a few minutes old reads the same.

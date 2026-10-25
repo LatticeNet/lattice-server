@@ -59,13 +59,13 @@ const tokenUseRidesWithin = time.Minute
 // only without the hot store, which writes every result at record level.
 const monitorResultPersistenceInterval = 5 * time.Minute
 
-// reportClockPersistInterval bounds how stale the received clocks of the
+// ReportClockPersistInterval bounds how stale the received clocks of the
 // per-node agent reports (sing-box liveness, guard reality) may get on disk.
 // A report that only moves its clocks updates memory; it is written when
 // something durable changes, or when the copy on disk is this old. Every node
 // reports every ten seconds, and writing each report rewrote the whole state
 // file several times a second on a 34-node fleet.
-const reportClockPersistInterval = 15 * time.Minute
+const ReportClockPersistInterval = 15 * time.Minute
 
 var errStoreDurabilityDegraded = errors.New("store durability degraded: parent directory sync not confirmed")
 
@@ -1319,7 +1319,7 @@ func (s *Store) persistState(st State) (committed bool, err error) {
 // clock-throttled report domains: node heartbeats, sing-box liveness and guard
 // reality. Every JSON write carries the whole in-memory copy of all three, so
 // a write made for any reason also flushes their clocks and restarts
-// metricsPersistenceInterval and reportClockPersistInterval for every node.
+// metricsPersistenceInterval and ReportClockPersistInterval for every node.
 func (s *Store) noteReportClocksOnDisk(st State) {
 	// Capped at the write's own clock: after the clock steps back, a
 	// LastSeen from before the step would otherwise look newer than now to
@@ -1365,7 +1365,7 @@ func (s *Store) reportClocksUnflushedLocked() bool {
 }
 
 // reportClockDue reports whether a clock-only update must still be written
-// because the copy on disk is older than reportClockPersistInterval, or there
+// because the copy on disk is older than ReportClockPersistInterval, or there
 // is no copy on disk at all.
 func (s *Store) reportClockDueLocked(onDisk map[string]time.Time, nodeID string, receivedAt time.Time) bool {
 	written, ok := onDisk[nodeID]
@@ -1383,7 +1383,7 @@ func (s *Store) reportClockDueLocked(onDisk map[string]time.Time, nodeID string,
 	// once and restart the interval from there, instead of leaving the copy
 	// on disk to age until the clock catches up.
 	d := receivedAt.Sub(written)
-	return d < 0 || d >= reportClockPersistInterval
+	return d < 0 || d >= ReportClockPersistInterval
 }
 
 func (s *Store) jsonPersistState() State {
@@ -3412,7 +3412,7 @@ func (s *Store) Close() error {
 	var closeErr error
 	// Reports and heartbeats that only moved their clocks wait in memory for
 	// the next write. A clean shutdown writes them, so a restart resumes from
-	// the newest report rather than from one up to reportClockPersistInterval
+	// the newest report rather than from one up to ReportClockPersistInterval
 	// old.
 	if s.clocksUnflushed || s.reportClocksUnflushedLocked() {
 		closeErr = s.Save()

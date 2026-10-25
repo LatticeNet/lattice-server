@@ -140,15 +140,14 @@ func (s *Server) runTLSMonitor(ctx context.Context, mon model.Monitor) error {
 }
 
 // evaluateTLSMonitor dials the target, reads the leaf certificate and judges
-// its not-after against the monitor's threshold. A handshake that never
-// completed is a failure with the dial error. On a target named by host name
-// the leaf must cover that name (SNI already asks for it): a certificate for
-// another name is not this endpoint's certificate, so the run fails and
-// records no expiry, and the last reading of the right certificate stays the
-// newest one Expiring and a DNS deployment's sheet read. Otherwise a
-// completed handshake always records CertNotAfter, whether or not the
-// threshold passed. A target named by IP address is not name-checked, as
-// before: most certificates carry no address.
+// it. A handshake that never completed is a failure with the dial error. A
+// completed handshake always records CertNotAfter, whatever the verdict, since
+// reading the expiry is what the probe is for. The run then fails when the
+// target is a host name the leaf does not cover (SNI already asked for that
+// name; the reason names the host and the names the certificate carries), and
+// when fewer than the threshold's days remain, an expired certificate
+// included. A target named by IP address is not name-checked: most
+// certificates carry no address.
 func (s *Server) evaluateTLSMonitor(ctx context.Context, mon model.Monitor) model.MonitorResult {
 	now := s.now()
 	result := model.MonitorResult{MonitorID: mon.ID, At: now}
@@ -166,26 +165,45 @@ func (s *Server) evaluateTLSMonitor(ctx context.Context, mon model.Monitor) mode
 		result.Error = err.Error()
 		return result
 	}
-	if host, _, err := splitTLSTarget(mon.Target); err == nil && net.ParseIP(host) == nil {
-		if err := leaf.VerifyHostname(host); err != nil {
-			result.Error = fmt.Sprintf("the certificate presented does not cover %s: %v", host, err)
-			return result
-		}
-	}
 	notAfter := leaf.NotAfter
 	result.CertNotAfter = notAfter.UTC()
+	var problems []string
+	if host, _, err := splitTLSTarget(mon.Target); err == nil && net.ParseIP(host) == nil {
+		if leaf.VerifyHostname(host) != nil {
+			problems = append(problems, fmt.Sprintf("the certificate does not cover %s (it names %s)", host, certificateNames(leaf)))
+		}
+	}
 	threshold := mon.ThresholdDays
 	if threshold <= 0 {
 		threshold = tlsMonitorDefaultThresholdDays
 	}
 	remaining := notAfter.Sub(now)
 	if remaining < time.Duration(threshold)*24*time.Hour {
-		result.Error = fmt.Sprintf("certificate expires %s, %s (threshold %d days)",
-			notAfter.UTC().Format(time.RFC3339), humanizeCertRemaining(remaining), threshold)
+		problems = append(problems, fmt.Sprintf("certificate expires %s, %s (threshold %d days)",
+			notAfter.UTC().Format(time.RFC3339), humanizeCertRemaining(remaining), threshold))
+	}
+	if len(problems) > 0 {
+		result.Error = strings.Join(problems, "; ")
 		return result
 	}
 	result.Success = true
 	return result
+}
+
+// certificateNamesShown bounds how many of a certificate's DNS names a failure
+// lists, so a certificate for hundreds of names does not fill the result.
+const certificateNamesShown = 5
+
+// certificateNames lists the leaf's DNS names for a failure reason.
+func certificateNames(leaf *x509.Certificate) string {
+	names := leaf.DNSNames
+	if len(names) == 0 {
+		return "no DNS names"
+	}
+	if len(names) <= certificateNamesShown {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:certificateNamesShown], ", "), len(names)-certificateNamesShown)
 }
 
 // humanizeCertRemaining says how far the expiry is in whole days, in the
@@ -204,9 +222,10 @@ func humanizeCertRemaining(remaining time.Duration) string {
 // This probe exists to read an expiry, and a verifying handshake refuses in
 // exactly the cases the operator most needs the number for: a certificate that
 // has already expired, or one whose chain is incomplete. Nothing is sent over
-// this connection and nothing read from it is trusted; the only value taken is
-// the leaf's not-after, which the operator then compares against a threshold,
-// and its names, which evaluateTLSMonitor holds against the target's host.
+// this connection and nothing read from it is trusted. The probe asserts two
+// things about the leaf, after the handshake and without refusing it: its
+// not-after against the operator's threshold, and, on a host-name target, that
+// it names that host. Neither stops the expiry being read.
 func (s *Server) readTLSLeaf(ctx context.Context, target string) (*x509.Certificate, error) {
 	host, port, err := splitTLSTarget(target)
 	if err != nil {

@@ -23,16 +23,22 @@ import (
 // returns the address it listens on.
 func tlsTestListener(t *testing.T, notAfter time.Time) string {
 	t.Helper()
+	return tlsTestListenerFor(t, notAfter, "dns.test.invalid")
+}
+
+// tlsTestListenerFor serves a self-signed certificate carrying names.
+func tlsTestListenerFor(t *testing.T, notAfter time.Time, names ...string) string {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "dns.test.invalid"},
+		Subject:      pkix.Name{CommonName: names[0]},
 		NotBefore:    notAfter.Add(-90 * 24 * time.Hour),
 		NotAfter:     notAfter,
-		DNSNames:     []string{"dns.test.invalid"},
+		DNSNames:     names,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -330,16 +336,18 @@ func TestTLSMonitorIsDeletable(t *testing.T) {
 	}
 }
 
-// A tls check on a host name holds the certificate to that name: one for
-// another name is not this endpoint's certificate, so the run fails and
-// records no expiry (design 32 S5c). A check on an address is not
-// name-checked, as before.
+// A tls check on a host name holds the certificate to that name (design 32
+// S5c): a certificate for another name fails the run with a reason naming the
+// host and what the certificate names, and its expiry is still recorded,
+// since reading it is what the probe is for. A wildcard that covers the name
+// passes, and a check on an address is not name-checked.
 func TestTLSMonitorHoldsTheCertificateToTheTargetName(t *testing.T) {
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	notAfter := now.Add(60 * 24 * time.Hour)
 	addr := ""
 	srv, handler, _ := newTLSMonitorServer(t, &addr, now)
 	cookies, csrf := loginSession(t, handler)
-	addr = tlsTestListener(t, now.Add(60*24*time.Hour)) // a certificate for dns.test.invalid
+	addr = tlsTestListener(t, notAfter) // a certificate for dns.test.invalid
 
 	other := createTLSMonitor(t, handler, cookies, csrf, `{"name":"wrong name","type":"tls","target":"other.test.invalid:8443"}`)
 	byAddress := createTLSMonitor(t, handler, cookies, csrf, `{"name":"by address","type":"tls","target":"203.0.113.9:8443"}`)
@@ -347,11 +355,37 @@ func TestTLSMonitorHoldsTheCertificateToTheTargetName(t *testing.T) {
 		t.Fatalf("probed = %d, want 2", probed)
 	}
 	wrong := storedMonitorResults(t, srv.store, other.ID)
-	if len(wrong) != 1 || wrong[0].Success || !strings.Contains(wrong[0].Error, "does not cover other.test.invalid") || !wrong[0].CertNotAfter.IsZero() {
-		t.Fatalf("a certificate for another name must fail and record no expiry: %+v", wrong)
+	if len(wrong) != 1 || wrong[0].Success || !wrong[0].CertNotAfter.Equal(notAfter) ||
+		!strings.Contains(wrong[0].Error, "does not cover other.test.invalid (it names dns.test.invalid)") {
+		t.Fatalf("a certificate for another name fails with the names and still records its expiry: %+v", wrong)
 	}
 	plain := storedMonitorResults(t, srv.store, byAddress.ID)
-	if len(plain) != 1 || !plain[0].Success || plain[0].CertNotAfter.IsZero() {
+	if len(plain) != 1 || !plain[0].Success || !plain[0].CertNotAfter.Equal(notAfter) {
 		t.Fatalf("an address target reads the expiry without a name check: %+v", plain)
+	}
+
+	// A wildcard covering the name passes; one level deeper it does not.
+	srv2, handler2, _ := newTLSMonitorServer(t, &addr, now)
+	cookies2, csrf2 := loginSession(t, handler2)
+	addr = tlsTestListenerFor(t, notAfter, "*.test.invalid")
+	covered := createTLSMonitor(t, handler2, cookies2, csrf2, `{"name":"wildcard","type":"tls","target":"dns.test.invalid:8443"}`)
+	deeper := createTLSMonitor(t, handler2, cookies2, csrf2, `{"name":"too deep","type":"tls","target":"a.dns.test.invalid:8443"}`)
+	sweepAndFlush(srv2)
+	if got := storedMonitorResults(t, srv2.store, covered.ID); len(got) != 1 || !got[0].Success {
+		t.Fatalf("a matching wildcard passes: %+v", got)
+	}
+	if got := storedMonitorResults(t, srv2.store, deeper.ID); len(got) != 1 || got[0].Success || !strings.Contains(got[0].Error, "(it names *.test.invalid)") || got[0].CertNotAfter.IsZero() {
+		t.Fatalf("a wildcard does not cover two labels: %+v", got)
+	}
+}
+
+// The names a failure lists are bounded.
+func TestCertificateNamesAreTruncated(t *testing.T) {
+	leaf := &x509.Certificate{DNSNames: []string{"a.example", "b.example", "c.example", "d.example", "e.example", "f.example", "g.example"}}
+	if got := certificateNames(leaf); got != "a.example, b.example, c.example, d.example, e.example and 2 more" {
+		t.Fatalf("names = %q", got)
+	}
+	if got := certificateNames(&x509.Certificate{}); got != "no DNS names" {
+		t.Fatalf("names = %q", got)
 	}
 }

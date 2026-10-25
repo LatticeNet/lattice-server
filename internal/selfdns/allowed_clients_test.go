@@ -124,6 +124,10 @@ func TestNormalizeAllowedClients(t *testing.T) {
 		// The renderer writes each entry onto a Corefile line, so nothing
 		// that is not a parsed network may reach it.
 		{[]string{"10.0.0.0/8\n  forward . 8.8.8.8"}, 0, "CIDR"},
+		// Two halves rebuild what /0 covers, overlapping or not.
+		{[]string{"0.0.0.0/1", "128.0.0.0/1"}, -1, "every IPv4 address"},
+		{[]string{"128.0.0.0/2", "0.0.0.0/1", "64.0.0.0/2", "192.0.0.0/2", "10.0.0.0/8"}, -1, "every IPv4 address"},
+		{[]string{"::/1", "8000::/1"}, -1, "every IPv6 address"},
 	} {
 		_, err := NormalizeAllowedClients(tc.input)
 		var refusal *AllowedClientsError
@@ -138,6 +142,10 @@ func TestNormalizeAllowedClients(t *testing.T) {
 	many := make([]string, 0, model.DNSAllowedClientsMax+1)
 	for i := range model.DNSAllowedClientsMax + 1 {
 		many = append(many, fmt.Sprintf("10.%d.0.0/16", i))
+	}
+	// Most of a family is not all of it.
+	if _, err := NormalizeAllowedClients([]string{"0.0.0.0/1", "192.0.0.0/2", "::/1"}); err != nil {
+		t.Fatalf("a list that leaves addresses out is allowed: %v", err)
 	}
 	if _, err := NormalizeAllowedClients(many[:model.DNSAllowedClientsMax]); err != nil {
 		t.Fatalf("%d networks are allowed: %v", model.DNSAllowedClientsMax, err)
@@ -236,6 +244,21 @@ func TestPlanIsOpenResolverReadsTheACL(t *testing.T) {
 	if open, err := PlanIsOpenResolver(bare); err != nil || !open {
 		t.Fatalf("a forwarding block without an acl is an open resolver: %v %v", open, err)
 	}
+
+	// A shape the renderer never writes is judged open, not guessed at:
+	// CRLF line ends must not carry a guarded block's verdict into the next,
+	// and a block that never closes is not a guarded one.
+	guarded := "a.example:53 {\n  acl {\n    allow net 203.0.113.0/24\n    block\n  }\n  file /z a.example.\n}\n"
+	unguarded := ".:53 {\n  forward . 1.1.1.1\n}\n"
+	if !corefileRecursesForAnyone(strings.ReplaceAll(guarded+unguarded, "\n", "\r\n")) {
+		t.Fatal("CRLF line ends hid an unguarded forwarding block")
+	}
+	if !corefileRecursesForAnyone(".:53 {\n  acl {\n    allow net 203.0.113.0/24\n    block\n  }\n  forward . 1.1.1.1\n.:54 {\n  forward . 1.1.1.1\n}\n") {
+		t.Fatal("a block opened inside another is not judged guarded")
+	}
+	if corefileRecursesForAnyone(guarded) {
+		t.Fatal("a guarded static block is not open")
+	}
 }
 
 // Whatever binary the node runs, the apply refuses before it writes anything
@@ -257,8 +280,8 @@ func TestApplyScriptChecksTheBinaryHasACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	at := strings.Index(script, check)
-	if at < 0 {
-		t.Fatalf("apply script does not check for the acl plugin:\n%s", script)
+	if at < 0 || !strings.Contains(script, "lacks the acl plugin (dns.acl)") {
+		t.Fatalf("apply script does not check for the acl plugin by name:\n%s", script)
 	}
 	if write := strings.Index(script, "mkdir -p \"$SELF_DNS_DIR\""); write < 0 || at > write {
 		t.Fatalf("the acl check must run before the apply writes anything:\n%s", script)

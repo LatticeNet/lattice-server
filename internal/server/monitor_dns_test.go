@@ -364,6 +364,22 @@ func TestDNSResultIngestionBounds(t *testing.T) {
 		t.Fatalf("latest view = %s", raw)
 	}
 	_ = srv
+
+	// A certificate on a run that measured nothing, or one no certificate
+	// carries, is dropped before it can reach Expiring.
+	later := []model.MonitorResult{
+		{MonitorID: "mon-doh", At: at.Add(time.Second), Reason: model.PathReasonDestinationRefused, Error: "refused", CertNotAfter: cert},
+		{MonitorID: "mon-doh", At: at.Add(2 * time.Second), Success: true, CertNotAfter: time.Date(1999, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{MonitorID: "mon-doh", At: at.Add(3 * time.Second), Success: true, CertNotAfter: at.AddDate(60, 0, 0)},
+	}
+	if _, err := st.IngestAgentMonitorResults("node-dns", later, at.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range storedMonitorResults(t, st, "mon-doh") {
+		if !r.At.Equal(at) && !r.CertNotAfter.IsZero() {
+			t.Fatalf("an unknown run or an implausible expiry was kept: %+v", r)
+		}
+	}
 }
 
 // A DoH or DoT check feeds Expiring with the soonest of its sources' newest
@@ -375,9 +391,10 @@ func TestExpiringListsADNSResolverCertificate(t *testing.T) {
 	upsertNodes(t, st,
 		model.Node{ID: "node-a", Name: "a", ProbeMethods: dnsMethods},
 		model.Node{ID: "node-b", Name: "b", ProbeMethods: dnsMethods},
+		model.Node{ID: "node-c", Name: "c", ProbeMethods: dnsMethods},
 	)
 	for _, mon := range []model.Monitor{
-		{ID: "mon_dot", Name: "Resolver DoT", Type: model.MonitorTypeDNS, Target: "tls://dns.example.org", DNSName: "example.org", DNSType: "A", NodeIDs: []string{"node-a", "node-b"}, IntervalSec: 300, TimeoutSec: 3, Enabled: true},
+		{ID: "mon_dot", Name: "Resolver DoT", Type: model.MonitorTypeDNS, Target: "tls://dns.example.org", DNSName: "example.org", DNSType: "A", NodeIDs: []string{"node-a", "node-b", "node-c"}, IntervalSec: 300, TimeoutSec: 3, Enabled: true},
 		{ID: "mon_udp", Name: "Resolver UDP", Type: model.MonitorTypeDNS, Target: "udp://9.9.9.9", DNSName: "example.org", DNSType: "A", NodeIDs: []string{"node-a"}, IntervalSec: 300, TimeoutSec: 3, Enabled: true},
 	} {
 		if err := st.UpsertMonitor(mon); err != nil {
@@ -398,6 +415,10 @@ func TestExpiringListsADNSResolverCertificate(t *testing.T) {
 	ingest("node-b", now.Add(-2*time.Hour), model.MonitorResult{MonitorID: "mon_dot", Success: true, CertNotAfter: soon})
 	ingest("node-b", now.Add(-time.Hour), model.MonitorResult{MonitorID: "mon_dot", Error: "dns_transport: no answer before the check's timeout"})
 	ingest("node-a", now.Add(-time.Hour), model.MonitorResult{MonitorID: "mon_udp", Success: true, CertNotAfter: soon})
+	// node-c last read a certificate nine days before the others and has
+	// failed since: its stale reading no longer holds the resolver.
+	ingest("node-c", now.Add(-9*24*time.Hour), model.MonitorResult{MonitorID: "mon_dot", Success: true, CertNotAfter: now.Add(24 * time.Hour)})
+	ingest("node-c", now.Add(-time.Hour), model.MonitorResult{MonitorID: "mon_dot", Error: "dns_transport: tls: handshake failure"})
 
 	cookies, _ := loginSession(t, handler)
 	req := httptest.NewRequest(http.MethodGet, "/api/expiring", nil)
@@ -417,7 +438,7 @@ func TestExpiringListsADNSResolverCertificate(t *testing.T) {
 
 	// Once node-b is no longer a source, its reading no longer counts.
 	mon, _ := st.Monitor("mon_dot")
-	mon.NodeIDs = []string{"node-a"}
+	mon.NodeIDs = []string{"node-a", "node-c"}
 	if err := st.UpsertMonitor(mon); err != nil {
 		t.Fatal(err)
 	}

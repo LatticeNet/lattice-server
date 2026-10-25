@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/LatticeNet/lattice-sdk/model"
 )
@@ -106,6 +107,13 @@ func MonitorReadsCertificate(mon model.Monitor) bool {
 	}
 	r, err := model.ParseDNSResolver(mon.Target)
 	return err == nil && r.Encrypted()
+}
+
+// plausibleCertExpiry reports whether t could be a certificate's
+// not-after as an agent reads it at receivedAt: this century, and less
+// than 50 years ahead.
+func plausibleCertExpiry(t, receivedAt time.Time) bool {
+	return t.Year() >= 2000 && t.Before(receivedAt.AddDate(50, 0, 0))
 }
 
 // medianMs is the median of values, the mean of the two middle ones when

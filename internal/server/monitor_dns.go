@@ -170,9 +170,15 @@ func applyDNSUpdate(mon model.Monitor, next *model.Monitor, req model.MonitorUpd
 	return nil
 }
 
+// dnsCertStaleAfter is how much older than the newest reading a source's
+// reading may be and still count: a source that stopped reaching the
+// resolver a week before the others no longer holds its certificate.
+const dnsCertStaleAfter = 7 * 24 * time.Hour
+
 // dnsCertNotAfter is the certificate expiry a DoH or DoT check reads now:
 // the soonest of each running source's newest reading, so a resolver whose
-// certificate one vantage point still sees unrenewed reads as expiring.
+// certificate one vantage point still sees unrenewed reads as expiring. A
+// reading more than dnsCertStaleAfter older than the newest is left out.
 func (s *Server) dnsCertNotAfter(mon model.Monitor) (time.Time, bool) {
 	var sources []string
 	if mon.AssignAll {
@@ -182,7 +188,8 @@ func (s *Server) dnsCertNotAfter(mon model.Monitor) (time.Time, bool) {
 	} else {
 		sources = mon.NodeIDs
 	}
-	var soonest time.Time
+	var readings []store.MonitorResultRecord
+	var newest time.Time
 	for _, nodeID := range sources {
 		if !monitorPairAssigned(mon, nodeID) {
 			continue
@@ -191,6 +198,16 @@ func (s *Server) dnsCertNotAfter(mon model.Monitor) (time.Time, bool) {
 			return !r.CertNotAfter.IsZero()
 		})
 		if err != nil || !ok {
+			continue
+		}
+		readings = append(readings, rec)
+		if rec.At.After(newest) {
+			newest = rec.At
+		}
+	}
+	var soonest time.Time
+	for _, rec := range readings {
+		if rec.At.Before(newest.Add(-dnsCertStaleAfter)) {
 			continue
 		}
 		if soonest.IsZero() || rec.CertNotAfter.Before(soonest) {

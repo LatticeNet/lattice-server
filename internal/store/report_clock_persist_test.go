@@ -180,11 +180,11 @@ func TestSingBoxLivenessClockFlushesOnInterval(t *testing.T) {
 	}
 
 	before := s.testPersistCalls
-	report(s, base.Add(reportClockPersistInterval-time.Second))
+	report(s, base.Add(ReportClockPersistInterval-time.Second))
 	if calls := s.testPersistCalls - before; calls != 0 {
 		t.Fatalf("clock-only report inside the interval persisted %d times", calls)
 	}
-	due := base.Add(reportClockPersistInterval)
+	due := base.Add(ReportClockPersistInterval)
 	report(s, due)
 	if calls := s.testPersistCalls - before; calls != 1 {
 		t.Fatalf("report at the interval persisted %d times, want 1", calls)
@@ -207,7 +207,7 @@ func TestSingBoxLivenessClockFlushesOnInterval(t *testing.T) {
 		t.Fatalf("the unrelated write put received_at %s on disk, want %s", written, flushedAt)
 	}
 	before = s.testPersistCalls
-	report(s, flushedAt.Add(reportClockPersistInterval-time.Second))
+	report(s, flushedAt.Add(ReportClockPersistInterval-time.Second))
 	if calls := s.testPersistCalls - before; calls != 0 {
 		t.Fatalf("the unrelated write did not restart the interval: %d writes", calls)
 	}
@@ -423,14 +423,14 @@ func TestGuardRealityClockFlushesOnInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := s.testPersistCalls
-	inside := steadyGuardReality(first, base.Add(reportClockPersistInterval-2*time.Second))
+	inside := steadyGuardReality(first, base.Add(ReportClockPersistInterval-2*time.Second))
 	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", inside); err != nil {
 		t.Fatal(err)
 	}
 	if calls := s.testPersistCalls - before; calls != 0 {
 		t.Fatalf("clock-only report inside the interval persisted %d times", calls)
 	}
-	due := steadyGuardReality(first, base.Add(reportClockPersistInterval))
+	due := steadyGuardReality(first, base.Add(ReportClockPersistInterval))
 	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", due); err != nil {
 		t.Fatal(err)
 	}
@@ -641,11 +641,11 @@ func TestFailedReportWriteLeavesMarkersAndRetries(t *testing.T) {
 		t.Fatal("a durable change that could not be written reported success")
 	}
 	due := running
-	due.ReceivedAt, due.Runtime.ProbedAt = base.Add(reportClockPersistInterval), base.Add(reportClockPersistInterval)
+	due.ReceivedAt, due.Runtime.ProbedAt = base.Add(ReportClockPersistInterval), base.Add(ReportClockPersistInterval)
 	if _, _, err := s.UpsertSingBoxLiveness(due); err == nil {
 		t.Fatal("a due clock flush that could not be written reported success")
 	}
-	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", steadyGuardReality(reality, base.Add(reportClockPersistInterval))); err == nil {
+	if _, _, err := s.UpsertGuardRealitySnapshot("generation-a", steadyGuardReality(reality, base.Add(ReportClockPersistInterval))); err == nil {
 		t.Fatal("a due guard reality flush that could not be written reported success")
 	}
 	if got := s.livenessOnDisk["node-a"]; !got.Equal(livenessMark) {
@@ -661,7 +661,7 @@ func TestFailedReportWriteLeavesMarkersAndRetries(t *testing.T) {
 	if err := os.RemoveAll(path + ".tmp"); err != nil {
 		t.Fatal(err)
 	}
-	retryAt := base.Add(reportClockPersistInterval + 10*time.Second)
+	retryAt := base.Add(ReportClockPersistInterval + 10*time.Second)
 	before := s.testPersistCalls
 	retry := running
 	retry.ReceivedAt, retry.Runtime.ProbedAt = retryAt, retryAt
